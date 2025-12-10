@@ -1,0 +1,119 @@
+services:
+  # Redis service for artifact storage
+  redis:
+    image: bitnamisecure/redis:latest
+    environment:
+      - REDIS_PASSWORD=redispassword
+      - REDIS_AOF_ENABLED=no
+    volumes:
+      - redis_data:/bitnami/redis/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 30G
+        reservations:
+          memory: 30G
+
+  # PostgreSQL database for API
+  postgresql:
+    image: bitnamisecure/postgresql:latest
+    environment:
+      - POSTGRES_PASSWORD=postgrespassword
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=postgres
+    volumes:
+      - postgresql_data:/bitnami/postgresql
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  # API Service - REST API for cluster management
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    command: ["/bin/sh", "-c", "/api"]
+    environment:
+      - API_GRPC_ADDR=0.0.0.0:50051
+      - API_HTTP_ADDR=0.0.0.0:3000
+      - API_AUTO_MIGRATE=true
+      - API_DATABASE_URL=postgresql://postgres:postgrespassword@postgresql:5432/postgres
+      - API_REDIS_NODES=redis://:redispassword@redis:6379/0
+      - API_REDIS_POOL_SIZE=16
+    ports:
+      - "0.0.0.0:3000:3000"    # HTTP API (artifacts upload/download)
+      - "0.0.0.0:3001:50051"   # gRPC API (proof requests)
+    depends_on:
+      - postgresql
+      - redis
+
+  # Coordinator Service - manages task and worker coordination
+  coordinator:
+    image: ghcr.io/succinctlabs/sp1-cluster:base-v1.0.4
+    environment:
+      - COORDINATOR_CLUSTER_RPC=http://api:50051
+      - COORDINATOR_METRICS_ADDR=0.0.0.0:9090
+      - COORDINATOR_ADDR=0.0.0.0:50051
+    command: ["/bin/sh", "-c", "/coordinator"]
+    ports:
+      - "127.0.0.1:50052:50051"
+      - "127.0.0.1:9091:9090"
+    depends_on:
+      - api
+
+  # CPU Node - CPU worker for proof generation
+  cpu-node:
+    image: ghcr.io/succinctlabs/sp1-cluster:base-v1.0.4
+    environment:
+      - NODE_COORDINATOR_RPC=http://coordinator:50051
+      - WORKER_MAX_WEIGHT_OVERRIDE=32
+      - NODE_ARTIFACT_STORE=redis
+      - NODE_REDIS_NODES=redis://:redispassword@redis:6379/0
+      - WORKER_TYPE=CPU
+    volumes:
+      - ${HOME}/.sp1/circuits:/root/.sp1/circuits
+    command: ["/bin/sh", "-c", "/node"]
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 32G
+        reservations:
+          cpus: '4'
+          memory: 32G
+    depends_on:
+      - coordinator
+      - redis
+
+  # Single GPU Node - GPU worker for proof generation
+  gpu0:
+    image: ghcr.io/succinctlabs/sp1-cluster:node-gpu-v1.0.4
+    environment:
+      - NODE_COORDINATOR_RPC=http://coordinator:50051
+      - WORKER_MAX_WEIGHT_OVERRIDE=64
+      - NODE_ARTIFACT_STORE=redis
+      - NODE_REDIS_NODES=redis://:redispassword@redis:6379/0
+      - WORKER_TYPE=GPU
+      - RUST_LOG=info,moongate_core=off
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ${HOME}/.sp1/circuits:/root/.sp1/circuits
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 70G
+        reservations:
+          cpus: '4'
+          memory: 64G
+    depends_on:
+      - coordinator
+      - redis
+      - cpu-node
+    runtime: nvidia
+
+volumes:
+  redis_data:
+  postgresql_data:
+

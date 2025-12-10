@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sp1-cluster-common = { workspace = true }
+sp1-cluster-artifact = { workspace = true }
 
 alloy.workspace = true
 async-trait.workspace = true

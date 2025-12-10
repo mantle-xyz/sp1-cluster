@@ -7283,6 +7283,7 @@ dependencies = [
  "dotenv",
  "opentelemetry_sdk",
  "serde",
+ "sp1-cluster-artifact",
  "sp1-cluster-common",
  "sqlx",
  "time",
