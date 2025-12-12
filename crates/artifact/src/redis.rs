@@ -150,22 +150,58 @@ impl RedisArtifactClient {
         let mut conn = self.get_redis_connection(key).await?;
         let now = std::time::Instant::now();
         let key = key.to_string();
+        let original_size = serialized.len();
+        
+        tracing::info!(
+            "Starting upload: key={}, original_size={}MB, type={:?}",
+            key,
+            original_size as f64 / 1024.0 / 1024.0,
+            artifact_type
+        );
+        
         // TODO: only compress if it's larger than some threshold.
+        let compress_start = std::time::Instant::now();
         let serialized =
             zstd::encode_all(serialized, 0).map_err(|e| backoff::Error::permanent(e.into()))?;
         let size = serialized.len();
+        let compress_ratio = (size as f64 / original_size as f64) * 100.0;
+        
+        tracing::info!(
+            "Compression completed: key={}, compressed_size={}MB, ratio={:.1}%, elapsed={:?}",
+            key,
+            size as f64 / 1024.0 / 1024.0,
+            compress_ratio,
+            compress_start.elapsed()
+        );
 
         if serialized.len() <= CHUNK_SIZE {
+            tracing::info!("Uploading as single key: key={}, size={}MB", key, size as f64 / 1024.0 / 1024.0);
+            
             let mut options = SetOptions::default();
             if !matches!(artifact_type, ArtifactType::Program) {
                 options = options.with_expiration(SetExpiry::EX(ARTIFACT_TIMEOUT_SECONDS));
             }
 
-            conn.set_options::<_, _, ()>(key, serialized, options)
+            conn.set_options::<_, _, ()>(key.clone(), serialized, options)
                 .await
-                .map_err(|e| backoff::Error::transient(e.into()))?;
+                .map_err(|e| {
+                    tracing::error!("Failed to upload single key: key={}, error={:?}", key, e);
+                    backoff::Error::transient(e.into())
+                })?;
+            
+            tracing::info!("Single key upload completed: key={}, elapsed={:?}", key, now.elapsed());
         } else {
             drop(conn);
+            let total_chunks = (serialized.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            
+            tracing::info!(
+                "Uploading as chunked data: key={}, total_size={}MB, chunk_size={}MB, total_chunks={}",
+                key,
+                size as f64 / 1024.0 / 1024.0,
+                CHUNK_SIZE as f64 / 1024.0 / 1024.0,
+                total_chunks
+            );
+            
             let chunks = serialized.chunks(CHUNK_SIZE);
             let mut join_set = JoinSet::new();
 
@@ -174,8 +210,10 @@ impl RedisArtifactClient {
                 let key = key.clone();
                 let id_clone = key.to_string();
                 let chunk = chunk.to_vec();
+                let chunk_size = chunk.len();
                 let mut conn = self.get_redis_connection(&id_clone).await?;
                 join_set.spawn(async move {
+                    let chunk_start = std::time::Instant::now();
                     let mut options = HashFieldExpirationOptions::default();
                     if !matches!(artifact_type, ArtifactType::Program) {
                         options = options.set_expiration(SetExpiry::EX(ARTIFACT_TIMEOUT_SECONDS));
@@ -183,20 +221,58 @@ impl RedisArtifactClient {
 
                     let _: usize = conn
                         .hset_ex(format!("{}:chunks", key), &options, &[(chunk_idx, chunk)])
-                        .await?;
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(
+                                "Failed to upload chunk: key={}, chunk_idx={}, size={}MB, error={:?}",
+                                key,
+                                chunk_idx,
+                                chunk_size as f64 / 1024.0 / 1024.0,
+                                e
+                            );
+                            e
+                        })?;
+                    
+                    tracing::info!(
+                        "Chunk uploaded: key={}, chunk_idx={}/{}, size={}MB, elapsed={:?}",
+                        key,
+                        chunk_idx,
+                        total_chunks - 1,
+                        chunk_size as f64 / 1024.0 / 1024.0,
+                        chunk_start.elapsed()
+                    );
+                    
                     Ok::<(), anyhow::Error>(())
                 });
             }
             tracing::debug!("spawned all chunks, elapsed: {:?}", now.elapsed());
 
             // Wait for all uploads to complete
+            let mut completed_chunks = 0;
             while let Some(res) = join_set.join_next().await {
-                res.map_err(|e| backoff::Error::transient(e.into()))??;
-                tracing::debug!("joined chunk, elapsed: {:?}", now.elapsed());
+                res.map_err(|e| {
+                    tracing::error!("Chunk upload task panicked: key={}, error={:?}", key, e);
+                    backoff::Error::transient(e.into())
+                })??;
+                completed_chunks += 1;
+                tracing::debug!("joined chunk {}/{}, elapsed: {:?}", completed_chunks, total_chunks, now.elapsed());
             }
+            
+            tracing::info!(
+                "All chunks uploaded: key={}, total_chunks={}, elapsed={:?}",
+                key,
+                total_chunks,
+                now.elapsed()
+            );
         }
 
-        tracing::debug!("upload took {:?}, size: {}", now.elapsed(), size);
+        tracing::info!(
+            "Upload completed: key={}, original_size={}MB, compressed_size={}MB, total_elapsed={:?}",
+            key,
+            original_size as f64 / 1024.0 / 1024.0,
+            size as f64 / 1024.0 / 1024.0,
+            now.elapsed()
+        );
         Ok(())
     }
 }
