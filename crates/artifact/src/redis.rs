@@ -79,25 +79,74 @@ impl RedisArtifactClient {
         let now = std::time::Instant::now();
         let key = key.to_string();
 
+        tracing::info!("Starting download: key={}", key);
+
         // Check if it's a hash (chunked) or regular key
+        let check_start = std::time::Instant::now();
         let total_chunks: usize = conn
             .hlen(format!("{}:chunks", key))
             .await
-            .map_err(|e| backoff::Error::transient(e.into()))?;
+            .map_err(|e| {
+                tracing::error!("Failed to check chunks: key={}, error={:?}", key, e);
+                backoff::Error::transient(e.into())
+            })?;
+        tracing::debug!("Chunk check completed: key={}, total_chunks={}, elapsed={:?}", key, total_chunks, check_start.elapsed());
 
         if total_chunks == 0 {
+            tracing::info!("Downloading as single key: key={}", key);
+            
+            let download_start = std::time::Instant::now();
             let result = conn
-                .get::<_, Vec<u8>>(key)
+                .get::<_, Vec<u8>>(key.clone())
                 .await
-                .map_err(|e| backoff::Error::transient(e.into()))?;
-            let result = zstd::decode_all(result.as_slice()).unwrap();
-            tracing::debug!("download took {:?}, size: {}", now.elapsed(), result.len());
+                .map_err(|e| {
+                    tracing::error!("Failed to download single key: key={}, error={:?}", key, e);
+                    backoff::Error::transient(e.into())
+                })?;
+            
+            let compressed_size = result.len();
+            tracing::info!(
+                "Single key downloaded: key={}, compressed_size={}MB, elapsed={:?}",
+                key,
+                compressed_size as f64 / 1024.0 / 1024.0,
+                download_start.elapsed()
+            );
+            
+            let decompress_start = std::time::Instant::now();
+            let result = zstd::decode_all(result.as_slice())
+                .map_err(|e| {
+                    tracing::error!("Failed to decompress single key: key={}, compressed_size={}MB, error={:?}", 
+                        key, compressed_size as f64 / 1024.0 / 1024.0, e);
+                    backoff::Error::permanent(anyhow::anyhow!("Failed to decompress: {}", e))
+                })?;
+            
+            let decompressed_size = result.len();
+            let decompress_ratio = (compressed_size as f64 / decompressed_size as f64) * 100.0;
+            tracing::info!(
+                "Decompression completed: key={}, decompressed_size={}MB, ratio={:.1}%, elapsed={:?}",
+                key,
+                decompressed_size as f64 / 1024.0 / 1024.0,
+                decompress_ratio,
+                decompress_start.elapsed()
+            );
+            
+            tracing::info!(
+                "Download completed: key={}, size={}MB, total_elapsed={:?}",
+                key,
+                decompressed_size as f64 / 1024.0 / 1024.0,
+                now.elapsed()
+            );
             return Ok(result);
         }
 
         // Get total chunks
+        tracing::info!(
+            "Downloading as chunked data: key={}, total_chunks={}",
+            key,
+            total_chunks
+        );
+        
         let mut result = Vec::new();
-
         let mut join_set = JoinSet::new();
 
         // Download chunks in parallel
@@ -106,38 +155,111 @@ impl RedisArtifactClient {
             let id_clone = key.to_string();
             let mut conn = self.get_redis_connection(&id_clone).await?;
             join_set.spawn(async move {
-                let chunk: Vec<u8> = conn.hget(format!("{}:chunks", key), chunk_idx).await?;
+                let chunk_start = std::time::Instant::now();
+                let chunk: Vec<u8> = conn
+                    .hget(format!("{}:chunks", key), chunk_idx)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to download chunk: key={}, chunk_idx={}, error={:?}",
+                            key,
+                            chunk_idx,
+                            e
+                        );
+                        e
+                    })?;
+                
+                let chunk_size = chunk.len();
+                tracing::info!(
+                    "Chunk downloaded: key={}, chunk_idx={}/{}, size={}MB, elapsed={:?}",
+                    key,
+                    chunk_idx,
+                    total_chunks - 1,
+                    chunk_size as f64 / 1024.0 / 1024.0,
+                    chunk_start.elapsed()
+                );
+                
                 Ok::<(usize, Vec<u8>), anyhow::Error>((chunk_idx, chunk))
             });
         }
 
         tracing::debug!(
-            "total_chunks: {}, elapsed: {:?}",
+            "Spawned all chunk downloads: key={}, total_chunks={}, elapsed={:?}",
+            key,
             total_chunks,
             now.elapsed()
         );
 
         // Collect chunks in order
         let mut chunks = vec![Vec::new(); total_chunks];
+        let mut downloaded_chunks = 0;
         while let Some(res) = join_set.join_next().await {
-            let (idx, chunk) = res.map_err(|e| backoff::Error::transient(e.into()))??;
+            let (idx, chunk) = res.map_err(|e| {
+                tracing::error!("Chunk download task panicked: key={}, error={:?}", key, e);
+                backoff::Error::transient(e.into())
+            })??;
+            
+            downloaded_chunks += 1;
             tracing::debug!(
-                "idx: {}, chunk: {}, elapsed: {:?}",
+                "Joined chunk: key={}, idx={}, size={}MB, progress={}/{}, elapsed={:?}",
+                key,
                 idx,
-                chunk.len(),
+                chunk.len() as f64 / 1024.0 / 1024.0,
+                downloaded_chunks,
+                total_chunks,
                 now.elapsed()
             );
             chunks[idx] = chunk;
         }
 
+        tracing::info!(
+            "All chunks downloaded: key={}, total_chunks={}, elapsed={:?}",
+            key,
+            total_chunks,
+            now.elapsed()
+        );
+
         // Combine chunks
+        let combine_start = std::time::Instant::now();
         result.extend(chunks.into_iter().flatten());
-        let decoded = tracing::info_span!("decoding").in_scope(|| {
-            let decoded = zstd::decode_all(result.as_slice()).unwrap();
-            tracing::debug!("decoded size: {}", decoded.len());
-            decoded
-        });
-        tracing::debug!("download took {:?}, size: {}", now.elapsed(), decoded.len());
+        let compressed_size = result.len();
+        tracing::info!(
+            "Chunks combined: key={}, compressed_size={}MB, elapsed={:?}",
+            key,
+            compressed_size as f64 / 1024.0 / 1024.0,
+            combine_start.elapsed()
+        );
+        
+        let decompress_start = std::time::Instant::now();
+        let decoded = zstd::decode_all(result.as_slice())
+            .map_err(|e| {
+                tracing::error!(
+                    "Failed to decompress chunked data: key={}, compressed_size={}MB, total_chunks={}, error={:?}",
+                    key,
+                    compressed_size as f64 / 1024.0 / 1024.0,
+                    total_chunks,
+                    e
+                );
+                backoff::Error::permanent(anyhow::anyhow!("Failed to decompress chunked data: {}", e))
+            })?;
+        
+        let decompressed_size = decoded.len();
+        let decompress_ratio = (compressed_size as f64 / decompressed_size as f64) * 100.0;
+        tracing::info!(
+            "Decompression completed: key={}, decompressed_size={}MB, ratio={:.1}%, elapsed={:?}",
+            key,
+            decompressed_size as f64 / 1024.0 / 1024.0,
+            decompress_ratio,
+            decompress_start.elapsed()
+        );
+        
+        tracing::info!(
+            "Download completed: key={}, total_chunks={}, size={}MB, total_elapsed={:?}",
+            key,
+            total_chunks,
+            decompressed_size as f64 / 1024.0 / 1024.0,
+            now.elapsed()
+        );
         Ok(decoded)
     }
 
