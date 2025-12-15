@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
-use deadpool_redis::redis::{AsyncCommands, HashFieldExpirationOptions, SetExpiry, SetOptions};
+use deadpool_redis::redis::{AsyncCommands, SetExpiry, SetOptions};
 use deadpool_redis::{Config, Connection as RedisConnection, Pool, PoolConfig, Runtime};
 use sp1_cluster_common::util::backoff_retry;
 use tokio::task::JoinSet;
@@ -214,13 +214,10 @@ impl RedisArtifactClient {
                 let mut conn = self.get_redis_connection(&id_clone).await?;
                 join_set.spawn(async move {
                     let chunk_start = std::time::Instant::now();
-                    let mut options = HashFieldExpirationOptions::default();
-                    if !matches!(artifact_type, ArtifactType::Program) {
-                        options = options.set_expiration(SetExpiry::EX(ARTIFACT_TIMEOUT_SECONDS));
-                    }
 
-                    let _: usize = conn
-                        .hset_ex(format!("{}:chunks", key), &options, &[(chunk_idx, chunk)])
+                    // Use regular HSET - more reliable and compatible
+                    let _: bool = conn
+                        .hset(format!("{}:chunks", key), chunk_idx, chunk)
                         .await
                         .map_err(|e| {
                             tracing::error!(
@@ -264,6 +261,19 @@ impl RedisArtifactClient {
                 total_chunks,
                 now.elapsed()
             );
+            
+            // Set expiration on the entire hash after all chunks are uploaded
+            if !matches!(artifact_type, ArtifactType::Program) {
+                let mut conn = self.get_redis_connection(&key).await?;
+                let _: bool = conn
+                    .expire(format!("{}:chunks", key), ARTIFACT_TIMEOUT_SECONDS as i64)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Failed to set expiration: key={}, error={:?}", key, e);
+                        backoff::Error::transient(e.into())
+                    })?;
+                tracing::info!("Set expiration: key={}, ttl={}s", key, ARTIFACT_TIMEOUT_SECONDS);
+            }
         }
 
         tracing::info!(
