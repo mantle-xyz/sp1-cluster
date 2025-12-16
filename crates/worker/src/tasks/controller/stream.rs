@@ -279,9 +279,12 @@ impl<W: WorkerService, A: ArtifactClient> SP1Worker<W, A> {
         let total_shards = {
             let mut precompile_sender = Some(precompile_sender);
 
-            let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<(ShardEventData, bool)>(1);
+            // Increased channel capacity to handle network latency in distributed environments.
+            // In a local setup, API calls are fast (<1ms), but in K8S cluster, they can take 5-20ms each.
+            // For 340 shards, we need enough buffer to avoid blocking the upload pipeline.
+            let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<(ShardEventData, bool)>(100);
             let (map_tx, map_rx) =
-                tokio::sync::mpsc::channel::<(usize, (Artifact, ShardType, bool))>(1);
+                tokio::sync::mpsc::channel::<(usize, (Artifact, ShardType, bool))>(100);
             // prove_task, proof_artifact, (deferred_artifact, deferred_marker_task), last
             let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel::<(
                 usize,
