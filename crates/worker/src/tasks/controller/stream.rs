@@ -186,6 +186,7 @@ impl<W: WorkerService, A: ArtifactClient> SP1Worker<W, A> {
         sender: Sender<(usize, (Artifact, ShardType, bool))>,
         final_tx: UnboundedSender<Result<Artifact, TaskError>>,
     ) -> Result<(), TaskError> {
+        tracing::info!("upload_data task started, waiting for data");
         let mut sent = 0;
         // Limit the number of memory records that can be uploaded at once. This is done because
         // the bottleneck is in the network part of upload, and with no lock too many records are
@@ -193,6 +194,9 @@ impl<W: WorkerService, A: ArtifactClient> SP1Worker<W, A> {
         let memory_record_lock = Arc::new(Semaphore::new(MEMORY_RECORD_CAPACITY));
         let mut set = JoinSet::new();
         while let Some((item, last)) = receiver.recv().await {
+            if sent % 100 == 0 || last {
+                tracing::info!("upload_data received item {}, last={}", sent, last);
+            }
             let sender = sender.clone();
             let final_sender = final_tx.clone();
             let self_arc = self.clone();
@@ -231,7 +235,9 @@ impl<W: WorkerService, A: ArtifactClient> SP1Worker<W, A> {
             );
             sent += 1;
         }
+        tracing::info!("upload_data: receiver closed, spawned {} upload tasks, waiting for completion", sent);
         set.join_all().await;
+        tracing::info!("upload_data: all {} upload tasks completed", sent);
 
         Ok(())
     }
@@ -296,11 +302,13 @@ impl<W: WorkerService, A: ArtifactClient> SP1Worker<W, A> {
             )>();
 
             // Upload inputs
+            tracing::info!("Spawning upload_data task");
             join_set.spawn(
                 self.clone()
                     .upload_data(upload_rx, map_tx, final_tx.clone())
                     .instrument(info_span!("upload_data")),
             );
+            tracing::info!("upload_data task spawned");
 
             // Create prove tasks
             let self_clone = self.clone();
@@ -505,8 +513,15 @@ impl<W: WorkerService, A: ArtifactClient> SP1Worker<W, A> {
                 }
 
                 // Send to upload thread.
+                if state.shard % 100 == 0 {
+                    tracing::info!("Main loop: sending shard {} to upload_tx, last={}", state.shard, last);
+                }
                 upload_tx.send((data, last)).await.unwrap();
+                if state.shard % 100 == 0 {
+                    tracing::info!("Main loop: shard {} sent successfully", state.shard);
+                }
             }
+            tracing::info!("Main loop exited, total shards: {}", state.shard + num_deferred_leaves as u32);
             state.shard + num_deferred_leaves as u32
         };
         tracing::info!("total shards: {}", total_shards);
