@@ -113,7 +113,7 @@ where
             .unwrap_or_else(|e| warn!("gRPC server error: {e}"));
     });
 
-    let http_state = Arc::new(ArtifactHttpState { client });
+    let http_state = Arc::new(ArtifactHttpState::new(client));
     let app = Router::new()
         .route("/", get(|| async { "OK" }))
         .route("/healthz", get(|| async { "OK" }))

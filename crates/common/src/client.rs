@@ -87,6 +87,26 @@ impl ClusterServiceClient {
         Ok(())
     }
 
+    /// Cancel a proof request and surface the underlying `tonic::Status` to the
+    /// caller without retry or error-type flattening.
+    ///
+    /// Use this when the caller needs to distinguish `NOT_FOUND` (request
+    /// already past the cancellable window) from a transport failure —
+    /// downstream services like the proof-router's TimeoutWatcher react
+    /// differently to each (NOT_FOUND is a successful "already gone"; a
+    /// transport failure still proceeds with local cleanup but is logged as
+    /// a degraded outcome).
+    pub async fn cancel_proof_request_with_status(
+        &self,
+        request: ProofRequestCancelRequest,
+    ) -> std::result::Result<(), tonic::Status> {
+        self.rpc
+            .clone()
+            .proof_request_cancel(request)
+            .await
+            .map(|_| ())
+    }
+
     pub async fn get_proof_requests(
         &self,
         request: ProofRequestListRequest,
