@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -12,7 +12,38 @@ use tokio::sync::{Mutex, OnceCell, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{instrument, Instrument};
 
-const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+/// Default bytes per Redis chunk. Small on purpose: each chunk is uploaded on
+/// its own pooled connection, so more chunks = more parallel TCP streams. On a
+/// high-BDP WAN link (AWS gateway ↔ on-prem Redis) a single stream is
+/// window-limited to a few MB/s regardless of provisioned bandwidth; parallel
+/// streams aggregate that up, though only up to `pool_max_size` connections —
+/// beyond that the spawn loop below blocks waiting for a free connection. This
+/// is the only lever that works purely in-process, without host TCP tuning.
+/// Override via `PROVE_ARTIFACT_CHUNK_BYTES`.
+const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Reject overrides below this: one chunk = one spawned task + one HSET
+/// round-trip, so a fat-fingered tiny value (e.g. `4` meaning "4 MB" but read
+/// as 4 bytes) would fan a single artifact into millions of tasks. 1 MB also
+/// tracks the point below which chunks stop paying off on this WAN link — at
+/// ~80ms RTT a single stream moves only ~200KB per round-trip, so sub-MB chunks
+/// are RTT-dominated. Below the floor we fall back to the default.
+const MIN_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Resolve the chunk size from an optional raw env value. Split out from the
+/// `LazyLock` init so it can be unit-tested without touching process env
+/// (which `LazyLock` reads exactly once per process). Values below
+/// [`MIN_CHUNK_SIZE`] (including 0, which would panic `slice::chunks`) fall
+/// back to the default.
+fn resolve_chunk_size(raw: Option<String>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= MIN_CHUNK_SIZE)
+        .unwrap_or(DEFAULT_CHUNK_SIZE)
+}
+
+static CHUNK_SIZE: LazyLock<usize> =
+    LazyLock::new(|| resolve_chunk_size(std::env::var("PROVE_ARTIFACT_CHUNK_BYTES").ok()));
+
 const ARTIFACT_TIMEOUT_SECONDS: u64 = 4 * 60 * 60; // 4 hours
 
 /// Conservative cap on a single shard artifact. Override via `PROVE_SHARD_MAX_BYTES`.
@@ -381,7 +412,7 @@ impl RedisArtifactClient {
         let key = key.to_string();
         let size = serialized.len();
 
-        if serialized.len() <= CHUNK_SIZE {
+        if serialized.len() <= *CHUNK_SIZE {
             let mut options = SetOptions::default();
             if !matches!(artifact_type, ArtifactType::Program) {
                 options = options.with_expiration(SetExpiry::EX(ARTIFACT_TIMEOUT_SECONDS));
@@ -392,7 +423,7 @@ impl RedisArtifactClient {
                 .map_err(|e| backoff::Error::transient(e.into()))?;
         } else {
             drop(conn);
-            let chunks = serialized.chunks(CHUNK_SIZE);
+            let chunks = serialized.chunks(*CHUNK_SIZE);
             let mut join_set = JoinSet::new();
 
             // HSET + EXPIRE because HSETEX isn't available on managed Redis.
@@ -428,6 +459,23 @@ impl RedisArtifactClient {
 
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Floor throughput used to scale the per-attempt upload timeout by payload
+/// size. A large artifact over a slow WAN link needs more than the flat
+/// [`TRANSFER_TIMEOUT`]; without this a still-progressing upload trips the
+/// timeout and fails outright (the `backoff` here has `max_elapsed_time` of 1s,
+/// so a 60s+ attempt is never retried — the single attempt must be given enough
+/// time to land).
+const MIN_UPLOAD_BYTES_PER_SEC: u64 = 512 * 1024; // 0.5 MB/s
+
+/// Per-attempt timeout for an upload of `len` bytes: the flat floor, or the
+/// time to move `len` at [`MIN_UPLOAD_BYTES_PER_SEC`], whichever is larger.
+fn upload_attempt_timeout(len: u64) -> Duration {
+    std::cmp::max(
+        TRANSFER_TIMEOUT,
+        Duration::from_secs(len / MIN_UPLOAD_BYTES_PER_SEC),
+    )
+}
+
 impl RedisArtifactClient {
     /// Admit (block on backpressure), then backoff+timeout the actual write.
     /// Admission sits outside `TRANSFER_TIMEOUT` so block-waits don't trip
@@ -442,9 +490,11 @@ impl RedisArtifactClient {
         // for the full duration of the upload, not just the admission call.
         let _guard = self.check_admission(artifact_id, data.len() as u64).await?;
 
+        let attempt_timeout = upload_attempt_timeout(data.len() as u64);
+
         backoff_retry(self.backoff.clone(), || async {
             match tokio::time::timeout(
-                TRANSFER_TIMEOUT,
+                attempt_timeout,
                 self.par_upload_file(artifact_type, artifact_id, data),
             )
             .await
@@ -470,7 +520,7 @@ impl RedisArtifactClient {
                 anyhow!(
                     "Upload operation timed out after all retries for artifact: {} (timeout: {:?} per attempt)",
                     artifact_id,
-                    TRANSFER_TIMEOUT
+                    attempt_timeout
                 )
             } else {
                 anyhow!("Upload failed for artifact {}: {}", artifact_id, e)
@@ -705,5 +755,76 @@ impl crate::CompressedUpload for RedisArtifactClient {
         // Data is already zstd-compressed, write directly to transport layer
         self.upload_to_transport(artifact_type, artifact.id(), &data)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Number of chunks a payload of `len` splits into for a given chunk size —
+    /// mirrors `serialized.chunks(*CHUNK_SIZE)` in `par_upload_file`. Each chunk
+    /// is one parallel TCP stream to Redis.
+    fn chunk_count(len: usize, chunk: usize) -> usize {
+        len.div_ceil(chunk)
+    }
+
+    #[test]
+    fn resolve_chunk_size_defaults_when_unset() {
+        assert_eq!(resolve_chunk_size(None), DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn resolve_chunk_size_rejects_zero_and_garbage() {
+        // Malformed or zero values fall back to the default rather than
+        // producing a 0-sized chunk (which would panic `slice::chunks`).
+        assert_eq!(resolve_chunk_size(Some("0".into())), DEFAULT_CHUNK_SIZE);
+        assert_eq!(
+            resolve_chunk_size(Some("not-a-number".into())),
+            DEFAULT_CHUNK_SIZE
+        );
+        assert_eq!(resolve_chunk_size(Some(String::new())), DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn resolve_chunk_size_rejects_below_floor() {
+        // A fat-fingered "4" (meant as 4 MB, read as 4 bytes) would fan an
+        // artifact into millions of tasks; anything under the floor falls back.
+        assert_eq!(resolve_chunk_size(Some("4".into())), DEFAULT_CHUNK_SIZE);
+        assert_eq!(
+            resolve_chunk_size(Some((MIN_CHUNK_SIZE - 1).to_string())),
+            DEFAULT_CHUNK_SIZE
+        );
+        // Exactly at the floor is accepted.
+        assert_eq!(
+            resolve_chunk_size(Some(MIN_CHUNK_SIZE.to_string())),
+            MIN_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn resolve_chunk_size_honors_valid_override() {
+        assert_eq!(resolve_chunk_size(Some("8388608".into())), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn smaller_chunks_yield_more_parallel_streams() {
+        // ~40 MB artifact, matching the op-succinct stdin sizes in the logs.
+        let len = 42_116_826usize;
+        // The old 32 MiB chunk left only 2 streams (one carrying 32 MiB).
+        assert_eq!(chunk_count(len, 32 * 1024 * 1024), 2);
+        // The new 4 MiB default fans out to 11 — an order of magnitude more
+        // aggregate WAN throughput without any host TCP tuning.
+        assert_eq!(chunk_count(len, DEFAULT_CHUNK_SIZE), 11);
+    }
+
+    #[test]
+    fn upload_attempt_timeout_scales_with_size() {
+        // Small payloads keep the flat floor.
+        assert_eq!(upload_attempt_timeout(1024), TRANSFER_TIMEOUT);
+        // A 40 MB artifact at the 0.5 MB/s floor needs > 60s, so it scales up.
+        let big = upload_attempt_timeout(42_116_826);
+        assert!(big > TRANSFER_TIMEOUT);
+        assert_eq!(big, Duration::from_secs(42_116_826 / (512 * 1024)));
     }
 }
