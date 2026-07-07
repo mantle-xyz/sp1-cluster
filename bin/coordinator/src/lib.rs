@@ -21,7 +21,7 @@ use sp1_cluster_common::proto::{
 use sp1_sdk::SP1_CIRCUIT_VERSION;
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, OwnedRwLockWriteGuard, RwLock};
@@ -69,7 +69,18 @@ fn enable_proof_fail(task_type: TaskType) -> bool {
 const MAX_TASK_RETRIES: u8 = 3;
 
 /// The number of seconds a worker can be inactive before it is considered dead.
-const WORKER_HEARTBEAT_TIMEOUT: u64 = 30;
+///
+/// Overridable via the `WORKER_HEARTBEAT_TIMEOUT` env var (seconds); defaults to 30.
+/// Raise this when the worker<->coordinator link is bandwidth-contended (e.g. artifact
+/// traffic saturating a WAN link) so slow-but-alive workers aren't falsely evicted and
+/// their in-flight tasks needlessly reassigned.
+static WORKER_HEARTBEAT_TIMEOUT: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("WORKER_HEARTBEAT_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(30)
+});
 
 /// The default weight of a GPU instance
 pub const DEFAULT_GPU_INSTANCE_WEIGHT: u32 = 24;
@@ -736,7 +747,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                 .as_secs();
             let mut dead_workers = vec![];
             for (id, worker) in &state.workers {
-                if worker.last_heartbeat + WORKER_HEARTBEAT_TIMEOUT < now {
+                if worker.last_heartbeat + *WORKER_HEARTBEAT_TIMEOUT < now {
                     tracing::warn!("worker {} has timed out", id);
                     dead_workers.push(id.clone());
                 }
