@@ -411,20 +411,10 @@ impl WorkerClient for WorkerServiceClient {
                                 }
                                 Err(e) => {
                                     tracing::error!("Connection error: {:?}", e);
-                                    // Re-declare the tasks we're still waiting on so the coordinator
-                                    // replays results for any that completed while the stream was
-                                    // down. Reconnecting with empty task_ids loses those completions
-                                    // and can deadlock the caller that's blocked on them.
-                                    let resub = {
-                                        let mut r = request.clone();
-                                        r.task_ids =
-                                            tasks_set.lock().await.iter().cloned().collect();
-                                        r
-                                    };
                                     match backoff::future::retry(retry::infinite(), || async {
                                         connection
                                             .clone()
-                                            .open_sub(resub.clone())
+                                            .open_sub(request.clone())
                                             .await
                                             .map_err(status_to_backoff_error)
                                     })
@@ -451,17 +441,10 @@ impl WorkerClient for WorkerServiceClient {
                         _ = interval.tick() => {
                             if last_heartbeat.elapsed().unwrap_or_default() > Duration::from_secs(10) {
                                 tracing::warn!("No heartbeats received from subscriber {}, reconnecting", sub_id);
-                                // Re-declare in-flight tasks on reconnect (see note above) so the
-                                // coordinator replays any completions missed while disconnected.
-                                let resub = {
-                                    let mut r = request.clone();
-                                    r.task_ids = tasks_set.lock().await.iter().cloned().collect();
-                                    r
-                                };
                                 match backoff::future::retry(retry::infinite(), || async {
                                     connection
                                         .clone()
-                                        .open_sub(resub.clone())
+                                        .open_sub(request.clone())
                                         .await
                                         .map_err(status_to_backoff_error)
                                 })
