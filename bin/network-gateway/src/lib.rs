@@ -93,10 +93,8 @@ where
     ))
     .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
     .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
-    // NOTE: reaper scheduling + /metrics exposure land in a follow-up task;
-    // this only builds the controller so the gate is live (enforce/dry-run
-    // per GATEWAY_ADMISSION_ENFORCE).
-    let admission = Arc::new(build_admission(&cfg)?);
+    let admission_metrics = Arc::new(crate::admission::AdmissionMetrics::new());
+    let admission = Arc::new(build_admission(&cfg)?.with_metrics(admission_metrics.clone()));
     let prover_network = ProverNetworkServer::new(ProverNetworkImpl::new(
         client.clone(),
         cluster,
@@ -104,7 +102,7 @@ where
         balance_amount,
         auth,
         program_store,
-        admission,
+        admission.clone(),
     ))
     .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
     .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
@@ -120,10 +118,31 @@ where
             .unwrap_or_else(|e| warn!("gRPC server error: {e}"));
     });
 
+    // Reclaim admission slots whose terminal release was lost (client dropped,
+    // crash) — the enforce path relies on this to not leak capacity.
+    let reaper = admission.clone();
+    let reap_period = std::time::Duration::from_secs(cfg.admission_reap_period_secs);
+    let reaper_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(reap_period);
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            reaper.reap();
+        }
+    });
+
+    let metrics_for_http = admission_metrics.clone();
     let http_state = Arc::new(ArtifactHttpState { client });
     let app = Router::new()
         .route("/", get(|| async { "OK" }))
         .route("/healthz", get(|| async { "OK" }))
+        .route(
+            "/metrics",
+            get(move || {
+                let m = metrics_for_http.clone();
+                async move { m.render() }
+            }),
+        )
         .merge(artifact_http::router(http_state));
 
     let http_listener = tokio::net::TcpListener::bind(&cfg.http_addr)
@@ -136,6 +155,7 @@ where
         .await?;
 
     grpc_task.await.ok();
+    reaper_task.abort();
     info!("network-gateway shut down cleanly");
     Ok(())
 }
