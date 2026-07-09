@@ -30,9 +30,11 @@ pub struct ProverNetworkImpl<A> {
     auth: Auth,
     program_store: Arc<dyn ProgramStore>,
     nonces: DashMap<Vec<u8>, AtomicU64>,
+    admission: Arc<crate::admission::AdmissionController>,
 }
 
 impl<A> ProverNetworkImpl<A> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: A,
         cluster: ClusterServiceClient,
@@ -40,6 +42,7 @@ impl<A> ProverNetworkImpl<A> {
         balance_amount: String,
         auth: Auth,
         program_store: Arc<dyn ProgramStore>,
+        admission: Arc<crate::admission::AdmissionController>,
     ) -> Self {
         Self {
             client,
@@ -49,6 +52,7 @@ impl<A> ProverNetworkImpl<A> {
             auth,
             program_store,
             nonces: DashMap::new(),
+            admission,
         }
     }
 
@@ -210,6 +214,22 @@ where
 
         let request_id = mint_request_id();
         let proof_id = proof_id_from_request_id(&request_id);
+
+        // Admission gate: shed overflow before it reaches the shared cluster.
+        // Keyed by the proof_id we just minted (single-phase — the id is known
+        // before the cluster create). Ungated requests take no slot.
+        if let Err(rej) = self
+            .admission
+            .try_acquire(&proof_id, body.mode, &body.vk_hash)
+        {
+            let scope = if rej.global {
+                "self-hosted backend at global capacity".to_string()
+            } else {
+                format!("self-hosted {} proof pool at capacity", rej.pool.label())
+            };
+            return Err(Status::unavailable(format!("{scope}; retry shortly")));
+        }
+
         let proof_artifact = self
             .client
             .create_artifact()
@@ -228,10 +248,12 @@ where
             gas_limit: body.gas_limit,
             scheduled_by: None,
         };
-        self.cluster
-            .create_proof_request(create)
-            .await
-            .map_err(|e| Status::internal(format!("cluster create_proof_request failed: {e}")))?;
+        if let Err(e) = self.cluster.create_proof_request(create).await {
+            self.admission.release(&proof_id); // reserved but the backend didn't take it
+            return Err(Status::internal(format!(
+                "cluster create_proof_request failed: {e}"
+            )));
+        }
 
         info!(
             proof_id,
@@ -292,6 +314,16 @@ where
         let proof = self.load_cluster_proof(&proof_id).await?;
 
         let fulfillment = fulfillment_from_cluster(proof.proof_status());
+
+        // Release the admission slot on a terminal verdict (idempotent; the SDK
+        // polls repeatedly). Ungated proofs hold no slot → no-op.
+        if matches!(
+            fulfillment,
+            pb::FulfillmentStatus::Fulfilled | pb::FulfillmentStatus::Unfulfillable
+        ) {
+            self.admission.release(&proof_id);
+        }
+
         let execution = proof
             .execution_result
             .as_ref()
@@ -1458,6 +1490,17 @@ mod tests {
         }
     }
 
+    fn test_admission() -> std::sync::Arc<crate::admission::AdmissionController> {
+        std::sync::Arc::new(crate::admission::AdmissionController::new(
+            crate::admission::Classifier::new(Default::default(), Default::default()),
+            1,
+            2,
+            None,
+            true,
+            std::time::Duration::from_secs(3600),
+        ))
+    }
+
     fn mk() -> ProverNetworkImpl<InMemoryArtifactClient> {
         ProverNetworkImpl::new(
             InMemoryArtifactClient::new(),
@@ -1466,6 +1509,7 @@ mod tests {
             "42".into(),
             Auth::default(),
             Arc::new(InMemoryProgramStore::new()),
+            test_admission(),
         )
     }
 
@@ -1477,6 +1521,21 @@ mod tests {
             "42".into(),
             auth,
             Arc::new(InMemoryProgramStore::new()),
+            test_admission(),
+        )
+    }
+
+    fn mk_with_admission(
+        admission: std::sync::Arc<crate::admission::AdmissionController>,
+    ) -> ProverNetworkImpl<InMemoryArtifactClient> {
+        ProverNetworkImpl::new(
+            InMemoryArtifactClient::new(),
+            dummy_cluster_client(),
+            "http://gw.test".into(),
+            "42".into(),
+            Auth::default(),
+            Arc::new(InMemoryProgramStore::new()),
+            admission,
         )
     }
 
@@ -1662,6 +1721,60 @@ mod tests {
         };
         let err = svc.create_program(Request::new(req)).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn admission_sheds_over_cap_compressed() {
+        use crate::admission::{AdmissionController, Classifier};
+        let admission = std::sync::Arc::new(AdmissionController::new(
+            Classifier::new(Default::default(), Default::default()),
+            1,
+            2,
+            None,
+            true,
+            std::time::Duration::from_secs(3600),
+        ));
+        admission
+            .try_acquire("req_preoccupied", 2, &[0xaa; 4])
+            .unwrap(); // fill Range cap 1
+
+        let svc = mk_with_admission(admission.clone());
+
+        // The gate sits AFTER the program warm-up block (right after proof_id
+        // mint), so the request must clear that block first. Pre-warm the
+        // deterministic program artifact directly (mirrors an already-hot
+        // ELF from a prior prove()) so we don't need program_store
+        // registration to reach the gate.
+        let vk_hash = vec![0xbb; 4];
+        svc.client
+            .upload_raw(
+                &program_artifact_id(&vk_hash),
+                ArtifactType::Program,
+                b"\x7fELF fake".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let body = pb::RequestProofRequestBody {
+            nonce: 0,
+            vk_hash,
+            version: "v0".into(),
+            mode: pb::ProofMode::Compressed as i32,
+            strategy: pb::FulfillmentStrategy::Reserved as i32,
+            stdin_uri: "http://gw.test/artifacts/stdin/artifact_stdin".into(),
+            deadline: 0,
+            cycle_limit: 0,
+            gas_limit: 0,
+            min_auction_period: 0,
+            whitelist: vec![],
+        };
+        let req = pb::RequestProofRequest {
+            format: 0,
+            signature: vec![],
+            body: Some(body),
+        };
+        let err = svc.request_proof(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
     }
 
     #[tokio::test]

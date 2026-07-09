@@ -20,6 +20,7 @@ use tokio::signal;
 use tonic::transport::Server;
 use tracing::{info, warn};
 
+use crate::admission::{AdmissionController, Classifier};
 use crate::artifact_http::ArtifactHttpState;
 use crate::auth::{parse_allowlist, Auth, AuthMode};
 use crate::config::Config;
@@ -92,6 +93,10 @@ where
     ))
     .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
     .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
+    // NOTE: reaper scheduling + /metrics exposure land in a follow-up task;
+    // this only builds the controller so the gate is live (enforce/dry-run
+    // per GATEWAY_ADMISSION_ENFORCE).
+    let admission = Arc::new(build_admission(&cfg)?);
     let prover_network = ProverNetworkServer::new(ProverNetworkImpl::new(
         client.clone(),
         cluster,
@@ -99,6 +104,7 @@ where
         balance_amount,
         auth,
         program_store,
+        admission,
     ))
     .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
     .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
@@ -151,6 +157,39 @@ pub fn build_program_store(cfg: &Config) -> Result<Arc<dyn ProgramStore>> {
         }
         other => anyhow::bail!("unknown GATEWAY_PROGRAM_STORE={other} (expected memory or fs)"),
     }
+}
+
+/// Build the admission controller from `GATEWAY_ADMISSION_*` config.
+/// Metrics wiring and the reaper background task are handled by the caller
+/// (follow-up task); this only constructs the counting/classifying core.
+pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
+    let range_vks = parse_vk_hashes(cfg.admission_range_vk_hashes.as_deref())
+        .context("GATEWAY_ADMISSION_RANGE_VK_HASHES")?;
+    let agg_vks = parse_vk_hashes(cfg.admission_agg_vk_hashes.as_deref())
+        .context("GATEWAY_ADMISSION_AGG_VK_HASHES")?;
+    let classifier = Classifier::new(range_vks, agg_vks);
+    Ok(AdmissionController::new(
+        classifier,
+        cfg.admission_range_max_inflight,
+        cfg.admission_agg_max_inflight,
+        cfg.admission_global_max_inflight,
+        cfg.admission_enforce,
+        std::time::Duration::from_secs(cfg.admission_slot_ttl_secs),
+    ))
+}
+
+fn parse_vk_hashes(input: Option<&[String]>) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let Some(entries) = input else {
+        return Ok(Default::default());
+    };
+    entries
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            hex::decode(s.trim_start_matches("0x")).with_context(|| format!("invalid vk_hash {s}"))
+        })
+        .collect()
 }
 
 pub fn build_auth(cfg: &Config) -> Result<Auth> {
