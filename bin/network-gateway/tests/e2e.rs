@@ -6,6 +6,7 @@
 //! → `request_proof` → `get_proof_request_status` polling → proof download.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +51,10 @@ struct FakeCluster {
     artifacts: InMemoryArtifactClient,
     proof_bytes: Vec<u8>, // raw bincode bytes to serve as the proof (pre-zstd is the store's job)
     requests: Arc<dashmap::DashMap<String, cluster_pb::ProofRequest>>,
+    // When set, `proof_request_create` fails immediately (simulates a backend
+    // outage) so tests can verify the gateway releases the admission slot it
+    // reserved instead of leaking it.
+    fail_create: Arc<AtomicBool>,
 }
 
 impl FakeCluster {
@@ -58,6 +63,7 @@ impl FakeCluster {
             artifacts,
             proof_bytes,
             requests: Arc::new(dashmap::DashMap::new()),
+            fail_create: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -68,6 +74,9 @@ impl ClusterService for FakeCluster {
         &self,
         request: tonic::Request<cluster_pb::ProofRequestCreateRequest>,
     ) -> Result<tonic::Response<()>, tonic::Status> {
+        if self.fail_create.load(Ordering::SeqCst) {
+            return Err(tonic::Status::internal("simulated cluster failure"));
+        }
         let req = request.into_inner();
 
         // Pre-populate the proof artifact so a later GET on the proof_uri serves
@@ -180,6 +189,9 @@ struct GatewayStack {
     cluster_shutdown_tx: oneshot::Sender<()>,
     gateway: tokio::task::JoinHandle<()>,
     cluster_server: tokio::task::JoinHandle<()>,
+    // Shared with the `FakeCluster` instance backing this stack; toggling it
+    // flips whether `proof_request_create` succeeds or fails.
+    fail_create: Arc<AtomicBool>,
 }
 
 impl GatewayStack {
@@ -208,6 +220,7 @@ async fn spawn_gateway_stack(
     let cluster_port = free_port();
     let cluster_addr: SocketAddr = format!("127.0.0.1:{cluster_port}").parse().unwrap();
     let fake = FakeCluster::new(artifacts.clone(), proof_bytes);
+    let fail_create = fake.fail_create.clone();
     let (cluster_shutdown_tx, cluster_shutdown_rx) = oneshot::channel::<()>();
     let cluster_server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -225,9 +238,20 @@ async fn spawn_gateway_stack(
     let channel = Endpoint::from_shared(cluster_rpc.clone())
         .unwrap()
         .connect_lazy();
+    // `ClusterServiceClient` retries Internal/Unavailable/etc. with backoff;
+    // the crate default's `max_elapsed_time` is 15 minutes, which would make
+    // any test that exercises a failing cluster call (e.g. the admission
+    // release-on-error test) hang for the length of the test suite. Keep the
+    // retry loop itself (some tests rely on eventual success against the
+    // fake) but cap it at a test-scale duration.
+    let backoff = backoff::ExponentialBackoffBuilder::default()
+        .with_initial_interval(Duration::from_millis(5))
+        .with_max_interval(Duration::from_millis(20))
+        .with_max_elapsed_time(Some(Duration::from_millis(200)))
+        .build();
     let cluster = ClusterServiceClient {
         rpc: InnerClusterClient::new(channel),
-        backoff: Default::default(),
+        backoff,
     };
 
     // ---- start the gateway ----
@@ -306,6 +330,7 @@ async fn spawn_gateway_stack(
         cluster_shutdown_tx,
         gateway,
         cluster_server,
+        fail_create,
     }
 }
 
@@ -552,6 +577,117 @@ async fn e2e_admission_sheds_over_cap_then_readmits() {
     let request_id_3 = resp3.body.expect("body").request_id;
     assert!(!request_id_3.is_empty());
     assert_ne!(request_id_3, request_id_1, "each request mints its own id");
+
+    // ---- shutdown ----
+    stack.shutdown().await;
+}
+
+/// A `request_proof` that fails after the admission slot is reserved (because
+/// the cluster's `create_proof_request` errors) must release that slot —
+/// otherwise it leaks until the reaper TTL. Drives the same Range pool (cap
+/// 1) through a failing create, then flips the fake back to success and
+/// confirms a follow-up request is still admitted.
+#[tokio::test]
+async fn e2e_admission_releases_slot_on_cluster_create_failure() {
+    let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
+
+    let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
+        cfg.admission_enforce = true;
+        cfg.admission_range_max_inflight = 1;
+    })
+    .await;
+
+    // ---- register a program ----
+    let elf_bytes = b"fake-elf-bytes".to_vec();
+    let program_uri = create_artifact_put(
+        &mut stack.artifact_rpc,
+        &stack.http,
+        SdkArtifactType::Program,
+        &elf_bytes,
+    )
+    .await;
+
+    let vk_hash = vec![0xcc; 32];
+    let vk_bytes = b"fake-vk".to_vec();
+    let body = CreateProgramRequestBody {
+        nonce: 0,
+        vk_hash: vk_hash.clone(),
+        vk: vk_bytes.clone(),
+        program_uri,
+    };
+    stack
+        .network_rpc
+        .create_program(CreateProgramRequest {
+            format: MessageFormat::Binary as i32,
+            signature: vec![],
+            body: Some(body),
+        })
+        .await
+        .unwrap();
+
+    async fn compressed_request_body(
+        stack: &mut GatewayStack,
+        vk_hash: &[u8],
+    ) -> RequestProofRequestBody {
+        let stdin_bytes = b"fake-stdin".to_vec();
+        let stdin_uri = create_artifact_put(
+            &mut stack.artifact_rpc,
+            &stack.http,
+            SdkArtifactType::Stdin,
+            &stdin_bytes,
+        )
+        .await;
+        RequestProofRequestBody {
+            nonce: 0,
+            vk_hash: vk_hash.to_vec(),
+            version: "test".into(),
+            mode: ProofMode::Compressed as i32,
+            strategy: 2, // Reserved
+            stdin_uri,
+            deadline: u64::MAX,
+            cycle_limit: 0,
+            gas_limit: 0,
+            min_auction_period: 0,
+            whitelist: vec![],
+        }
+    }
+
+    // 1) make the fake cluster's create_proof_request fail, then send a
+    // Compressed request — it reserves the sole Range slot, the cluster call
+    // errors, and request_proof must surface Internal.
+    stack.fail_create.store(true, Ordering::SeqCst);
+    let body1 = compressed_request_body(&mut stack, &vk_hash).await;
+    let err = stack
+        .network_rpc
+        .request_proof(RequestProofRequest {
+            format: MessageFormat::Binary as i32,
+            signature: vec![],
+            body: Some(body1),
+        })
+        .await
+        .expect_err("cluster create_proof_request failure must surface as an error");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Internal,
+        "expected Internal, got {err:?}"
+    );
+
+    // 2) flip the fake back to success. If the failed request above leaked
+    // its Range slot, this next request (cap 1) would be shed with
+    // Unavailable instead of admitted.
+    stack.fail_create.store(false, Ordering::SeqCst);
+    let body2 = compressed_request_body(&mut stack, &vk_hash).await;
+    let resp2 = stack
+        .network_rpc
+        .request_proof(RequestProofRequest {
+            format: MessageFormat::Binary as i32,
+            signature: vec![],
+            body: Some(body2),
+        })
+        .await
+        .expect("request #2 must be admitted: the failed request #1 must not leak its slot");
+    let request_id_2 = resp2.into_inner().body.expect("body").request_id;
+    assert!(!request_id_2.is_empty());
 
     // ---- shutdown ----
     stack.shutdown().await;

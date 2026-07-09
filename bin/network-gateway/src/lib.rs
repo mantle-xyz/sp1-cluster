@@ -180,8 +180,8 @@ pub fn build_program_store(cfg: &Config) -> Result<Arc<dyn ProgramStore>> {
 }
 
 /// Build the admission controller from `GATEWAY_ADMISSION_*` config.
-/// Metrics wiring and the reaper background task are handled by the caller
-/// (follow-up task); this only constructs the counting/classifying core.
+/// This only constructs the counting/classifying core — `serve` attaches
+/// metrics (`with_metrics`), spawns the reaper task, and mounts `/metrics`.
 pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
     let range_vks = parse_vk_hashes(cfg.admission_range_vk_hashes.as_deref())
         .context("GATEWAY_ADMISSION_RANGE_VK_HASHES")?;

@@ -230,10 +230,15 @@ where
             return Err(Status::unavailable(format!("{scope}; retry shortly")));
         }
 
-        let proof_artifact = self
-            .client
-            .create_artifact()
-            .map_err(|e| Status::internal(format!("create proof artifact failed: {e}")))?;
+        let proof_artifact = match self.client.create_artifact() {
+            Ok(a) => a,
+            Err(e) => {
+                self.admission.release(&proof_id); // reserved but never committed to the cluster
+                return Err(Status::internal(format!(
+                    "create proof artifact failed: {e}"
+                )));
+            }
+        };
         let proof_artifact_id = proof_artifact.to_id();
 
         let create = cluster_pb::ProofRequestCreateRequest {
@@ -364,6 +369,16 @@ where
         let req = request.into_inner();
         let proof_id = proof_id_from_request_id(&req.request_id);
         let proof = self.load_cluster_proof(&proof_id).await?;
+
+        // Release the admission slot on a terminal verdict, mirroring
+        // `get_proof_request_status` (idempotent; ungated proofs hold no slot).
+        let fulfillment = fulfillment_from_cluster(proof.proof_status());
+        if matches!(
+            fulfillment,
+            pb::FulfillmentStatus::Fulfilled | pb::FulfillmentStatus::Unfulfillable
+        ) {
+            self.admission.release(&proof_id);
+        }
 
         let details = self.build_sdk_proof_request(&req.request_id, proof);
         Ok(Response::new(pb::GetProofRequestDetailsResponse {
