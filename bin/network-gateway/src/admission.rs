@@ -95,6 +95,136 @@ impl PerPool {
     }
 }
 
+/// Global per-proof-type concurrency gate. Single-instance, in-memory.
+pub struct AdmissionController {
+    caps: PerPool,
+    /// `None` = pools independent; `Some(n)` = at most `n` in-flight total.
+    global_cap: Option<usize>,
+    counts: Mutex<PerPool>,
+    /// proof_id → (pool, acquired_at). Owns committed-slot accounting; the
+    /// idempotent-release latch is `DashMap::remove` (one winner).
+    slots: DashMap<String, (PoolId, Instant)>,
+    /// `false` = dry-run (count + metrics, never reject); `true` = enforce.
+    enforce: bool,
+    /// Reaper TTL for a slot whose terminal release was lost. Must exceed the
+    /// longest legitimate proof so a live proof's slot is never reclaimed.
+    ttl: Duration,
+    classifier: Classifier,
+    metrics: Option<Arc<AdmissionMetrics>>,
+}
+
+impl AdmissionController {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        classifier: Classifier,
+        range_cap: usize,
+        agg_cap: usize,
+        global_cap: Option<usize>,
+        enforce: bool,
+        ttl: Duration,
+    ) -> Self {
+        Self {
+            caps: PerPool {
+                range: range_cap,
+                agg: agg_cap,
+            },
+            global_cap,
+            counts: Mutex::new(PerPool::default()),
+            slots: DashMap::new(),
+            enforce,
+            ttl,
+            classifier,
+            metrics: None,
+        }
+    }
+
+    /// Classify + cap-check + reserve a slot keyed by `proof_id`.
+    /// - `Ok(())` when admitted (a slot was reserved) OR ungated (no slot).
+    /// - `Err(Rejection)` only in enforce mode when over a cap.
+    ///
+    /// The caller MUST call [`release`](Self::release) if the subsequent cluster
+    /// create fails, and again (idempotently) on the terminal status poll.
+    /// Releasing an unknown `proof_id` (ungated request) is a no-op.
+    pub fn try_acquire(&self, proof_id: &str, mode: i32, vk_hash: &[u8]) -> Result<(), Rejection> {
+        let Some(pool) = self.classifier.classify(mode, vk_hash) else {
+            self.metric_unclassified();
+            return Ok(()); // ungated
+        };
+        let over = {
+            let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+            let pool_over = c.get(pool) >= self.caps.get(pool);
+            let global_over = self.global_cap.is_some_and(|g| c.total() >= g);
+            let over = pool_over || global_over;
+            if over && self.enforce {
+                let global = global_over && !pool_over;
+                drop(c);
+                self.metric_rejected(pool, global);
+                return Err(Rejection { pool, global });
+            }
+            *c.get_mut(pool) += 1;
+            self.set_gauges(pool, c.get(pool), c.total());
+            over
+        };
+        // Reserve the slot (dry-run reserves too, so release stays symmetric).
+        self.slots.insert(proof_id.to_string(), (pool, Instant::now()));
+        if over {
+            self.metric_would_reject(pool);
+        }
+        self.metric_admitted(pool);
+        Ok(())
+    }
+
+    /// Release the slot held by `proof_id`, if any. Idempotent.
+    pub fn release(&self, proof_id: &str) {
+        if let Some((_, (pool, _))) = self.slots.remove(proof_id) {
+            self.dec_pool(pool);
+        }
+    }
+
+    /// Reclaim slots whose terminal release was lost (client dropped, crash).
+    pub fn reap(&self) {
+        let expired: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|e| e.value().1.elapsed() > self.ttl)
+            .map(|e| e.key().clone())
+            .collect();
+        for id in expired {
+            if let Some((_, (pool, _))) = self.slots.remove(&id) {
+                self.dec_pool(pool);
+                self.metric_reaped(pool);
+            }
+        }
+    }
+
+    /// In-flight for a pool (test/observability accessor).
+    #[cfg(test)]
+    pub fn in_flight(&self, pool: PoolId) -> usize {
+        self.counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(pool)
+    }
+
+    fn dec_pool(&self, pool: PoolId) {
+        let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let e = c.get_mut(pool);
+        *e = e.saturating_sub(1);
+        self.set_gauges(pool, c.get(pool), c.total());
+    }
+
+    // --- metric shims; Task 3 gives them bodies. No-op until then. ---
+    fn set_gauges(&self, _pool: PoolId, _pool_val: usize, _total: usize) {}
+    fn metric_admitted(&self, _pool: PoolId) {}
+    fn metric_would_reject(&self, _pool: PoolId) {}
+    fn metric_reaped(&self, _pool: PoolId) {}
+    fn metric_rejected(&self, _pool: PoolId, _global: bool) {}
+    fn metric_unclassified(&self) {}
+}
+
+/// Placeholder so the field type resolves before Task 3 fills it in.
+pub struct AdmissionMetrics;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +248,67 @@ mod tests {
         assert_eq!(c.classify(3, &[0x99; 4]), Some(PoolId::Agg)); // Plonk
         assert_eq!(c.classify(4, &[0x99; 4]), Some(PoolId::Agg)); // Groth16
         assert_eq!(c.classify(1, &[0x99; 4]), None); // Core → ungated
+    }
+
+    fn enforce_ctrl() -> AdmissionController {
+        AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_secs(3600))
+    }
+
+    #[test]
+    fn acquire_up_to_cap_then_reject() {
+        let c = enforce_ctrl();
+        assert!(c.try_acquire("p1", 2, RANGE_VK).is_ok()); // Range cap 1
+        assert_eq!(c.in_flight(PoolId::Range), 1);
+        assert_eq!(
+            c.try_acquire("p2", 2, RANGE_VK).unwrap_err(),
+            Rejection { pool: PoolId::Range, global: false }
+        );
+    }
+
+    #[test]
+    fn release_frees_slot_idempotently() {
+        let c = enforce_ctrl();
+        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        c.release("p1");
+        c.release("p1"); // idempotent
+        assert_eq!(c.in_flight(PoolId::Range), 0);
+        assert!(c.try_acquire("p3", 2, RANGE_VK).is_ok());
+    }
+
+    #[test]
+    fn dry_run_admits_over_cap() {
+        let c = AdmissionController::new(classifier(), 1, 2, None, false, Duration::from_secs(3600));
+        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        assert!(c.try_acquire("p2", 2, RANGE_VK).is_ok()); // over cap, dry-run admits
+        assert_eq!(c.in_flight(PoolId::Range), 2);
+    }
+
+    #[test]
+    fn ungated_takes_no_slot() {
+        let c = enforce_ctrl();
+        c.try_acquire("p1", 1, &[0x99; 4]).unwrap(); // Core → ungated
+        assert_eq!(c.in_flight(PoolId::Range), 0);
+        c.release("p1"); // no-op, no panic
+    }
+
+    #[test]
+    fn global_cap_serialises_pools() {
+        let c = AdmissionController::new(classifier(), 2, 2, Some(1), true, Duration::from_secs(3600));
+        c.try_acquire("p1", 2, RANGE_VK).unwrap(); // takes the 1 global slot
+        assert_eq!(
+            c.try_acquire("p2", 3, AGG_VK).unwrap_err(),
+            Rejection { pool: PoolId::Agg, global: true } // agg pool had room; global full
+        );
+    }
+
+    #[test]
+    fn reaper_reclaims_expired() {
+        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_millis(30));
+        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        c.reap();
+        assert_eq!(c.in_flight(PoolId::Range), 1); // not yet expired
+        std::thread::sleep(Duration::from_millis(45));
+        c.reap();
+        assert_eq!(c.in_flight(PoolId::Range), 0);
     }
 }
