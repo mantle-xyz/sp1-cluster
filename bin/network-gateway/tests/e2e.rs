@@ -168,18 +168,46 @@ fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-#[tokio::test]
-async fn e2e_register_program_request_proof_download() {
-    // ---- canned proof bytes (raw bincode, per SDK wire format) ----
-    let proof_bytes: Vec<u8> = (0..1024u16).flat_map(|x| x.to_le_bytes()).collect();
+/// A running gateway + fake cluster, wired together, with everything a test
+/// needs to drive the SDK-facing surface and then tear it down.
+struct GatewayStack {
+    network_rpc: ProverNetworkClient<Channel>,
+    artifact_rpc: ArtifactStoreClient<Channel>,
+    http: reqwest::Client,
+    public_http_url: String,
+    gw_grpc_shutdown_tx: oneshot::Sender<()>,
+    gw_http_shutdown_tx: oneshot::Sender<()>,
+    cluster_shutdown_tx: oneshot::Sender<()>,
+    gateway: tokio::task::JoinHandle<()>,
+    cluster_server: tokio::task::JoinHandle<()>,
+}
 
+impl GatewayStack {
+    /// Trigger both graceful-shutdown channels and wait (with a timeout) for
+    /// both server tasks to exit.
+    async fn shutdown(self) {
+        self.gw_grpc_shutdown_tx.send(()).ok();
+        self.gw_http_shutdown_tx.send(()).ok();
+        self.cluster_shutdown_tx.send(()).ok();
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.gateway).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.cluster_server).await;
+    }
+}
+
+/// Bring up a `FakeCluster` on one ephemeral port and a real gateway on two
+/// more, wired together, mirroring the bring-up every e2e test needs. Callers
+/// get back connected SDK-style clients plus shutdown handles.
+async fn spawn_gateway_stack(
+    proof_bytes: Vec<u8>,
+    admission_overrides: impl FnOnce(&mut Config),
+) -> GatewayStack {
     // ---- shared in-memory artifact store ----
     let artifacts = InMemoryArtifactClient::new();
 
     // ---- start the fake ClusterService on an ephemeral port ----
     let cluster_port = free_port();
     let cluster_addr: SocketAddr = format!("127.0.0.1:{cluster_port}").parse().unwrap();
-    let fake = FakeCluster::new(artifacts.clone(), proof_bytes.clone());
+    let fake = FakeCluster::new(artifacts.clone(), proof_bytes);
     let (cluster_shutdown_tx, cluster_shutdown_rx) = oneshot::channel::<()>();
     let cluster_server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -206,7 +234,7 @@ async fn e2e_register_program_request_proof_download() {
     let grpc_port = free_port();
     let http_port = free_port();
     let public_http_url = format!("http://127.0.0.1:{http_port}");
-    let cfg = Config {
+    let mut cfg = Config {
         grpc_addr: format!("127.0.0.1:{grpc_port}"),
         http_addr: format!("127.0.0.1:{http_port}"),
         public_http_url: public_http_url.clone(),
@@ -231,6 +259,7 @@ async fn e2e_register_program_request_proof_download() {
         admission_reap_period_secs: 60,
         admission_slot_ttl_secs: 3600,
     };
+    admission_overrides(&mut cfg);
     let program_store: Arc<dyn ProgramStore> = Arc::new(InMemoryProgramStore::new());
     let (gw_grpc_shutdown_tx, gw_grpc_shutdown_rx) = oneshot::channel::<()>();
     let (gw_http_shutdown_tx, gw_http_shutdown_rx) = oneshot::channel::<()>();
@@ -257,21 +286,42 @@ async fn e2e_register_program_request_proof_download() {
     wait_for_port(http_port).await;
     wait_for_port(grpc_port).await;
 
-    // ---- run the SDK-side flow via the generated proto clients ----
+    // ---- connect the SDK-side clients ----
     let gw_channel = Endpoint::from_shared(format!("http://127.0.0.1:{grpc_port}"))
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let mut artifact_rpc = ArtifactStoreClient::new(gw_channel.clone());
-    let mut network_rpc = ProverNetworkClient::new(gw_channel);
+    let artifact_rpc = ArtifactStoreClient::new(gw_channel.clone());
+    let network_rpc = ProverNetworkClient::new(gw_channel);
     let http = reqwest::Client::new();
+
+    GatewayStack {
+        network_rpc,
+        artifact_rpc,
+        http,
+        public_http_url,
+        gw_grpc_shutdown_tx,
+        gw_http_shutdown_tx,
+        cluster_shutdown_tx,
+        gateway,
+        cluster_server,
+    }
+}
+
+#[tokio::test]
+async fn e2e_register_program_request_proof_download() {
+    // ---- canned proof bytes (raw bincode, per SDK wire format) ----
+    let proof_bytes: Vec<u8> = (0..1024u16).flat_map(|x| x.to_le_bytes()).collect();
+
+    let mut stack = spawn_gateway_stack(proof_bytes.clone(), |_cfg| {}).await;
+    let public_http_url = stack.public_http_url.clone();
 
     // 1) upload the ELF ("program")
     let elf_bytes = b"fake-elf-bytes".to_vec();
     let program_uri = create_artifact_put(
-        &mut artifact_rpc,
-        &http,
+        &mut stack.artifact_rpc,
+        &stack.http,
         SdkArtifactType::Program,
         &elf_bytes,
     )
@@ -286,7 +336,8 @@ async fn e2e_register_program_request_proof_download() {
         vk: vk_bytes.clone(),
         program_uri,
     };
-    network_rpc
+    stack
+        .network_rpc
         .create_program(CreateProgramRequest {
             format: MessageFormat::Binary as i32,
             signature: vec![],
@@ -298,8 +349,8 @@ async fn e2e_register_program_request_proof_download() {
     // 3) upload stdin
     let stdin_bytes = b"fake-stdin".to_vec();
     let stdin_uri = create_artifact_put(
-        &mut artifact_rpc,
-        &http,
+        &mut stack.artifact_rpc,
+        &stack.http,
         SdkArtifactType::Stdin,
         &stdin_bytes,
     )
@@ -319,7 +370,8 @@ async fn e2e_register_program_request_proof_download() {
         min_auction_period: 0,
         whitelist: vec![],
     };
-    let resp = network_rpc
+    let resp = stack
+        .network_rpc
         .request_proof(RequestProofRequest {
             format: MessageFormat::Binary as i32,
             signature: vec![],
@@ -332,7 +384,8 @@ async fn e2e_register_program_request_proof_download() {
     assert!(!request_id.is_empty());
 
     // 5) poll get_proof_request_status (fake reports Completed immediately)
-    let status = network_rpc
+    let status = stack
+        .network_rpc
         .get_proof_request_status(GetProofRequestStatusRequest {
             request_id: request_id.clone(),
         })
@@ -351,7 +404,7 @@ async fn e2e_register_program_request_proof_download() {
 
     // 6) GET proof_uri — gateway `download_raw` zstd-decodes; InMemoryArtifactClient
     // is identity, so bytes come back as what we uploaded (raw bincode of the "proof").
-    let got = http.get(&proof_uri).send().await.unwrap();
+    let got = stack.http.get(&proof_uri).send().await.unwrap();
     assert!(got.status().is_success());
     let got_bytes = got.bytes().await.unwrap().to_vec();
     assert_eq!(
@@ -360,11 +413,148 @@ async fn e2e_register_program_request_proof_download() {
     );
 
     // ---- shutdown ----
-    gw_grpc_shutdown_tx.send(()).ok();
-    gw_http_shutdown_tx.send(()).ok();
-    cluster_shutdown_tx.send(()).ok();
-    let _ = tokio::time::timeout(Duration::from_secs(5), gateway).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), cluster_server).await;
+    stack.shutdown().await;
+}
+
+/// The admission gate sheds a second Compressed (Range-pool) request once the
+/// pool cap is exhausted, then re-admits after the first request's terminal
+/// status poll releases its slot.
+#[tokio::test]
+async fn e2e_admission_sheds_over_cap_then_readmits() {
+    let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
+
+    let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
+        cfg.admission_enforce = true;
+        cfg.admission_range_max_inflight = 1;
+    })
+    .await;
+
+    // ---- register a program ----
+    let elf_bytes = b"fake-elf-bytes".to_vec();
+    let program_uri = create_artifact_put(
+        &mut stack.artifact_rpc,
+        &stack.http,
+        SdkArtifactType::Program,
+        &elf_bytes,
+    )
+    .await;
+
+    let vk_hash = vec![0xbb; 32];
+    let vk_bytes = b"fake-vk".to_vec();
+    let body = CreateProgramRequestBody {
+        nonce: 0,
+        vk_hash: vk_hash.clone(),
+        vk: vk_bytes.clone(),
+        program_uri,
+    };
+    stack
+        .network_rpc
+        .create_program(CreateProgramRequest {
+            format: MessageFormat::Binary as i32,
+            signature: vec![],
+            body: Some(body),
+        })
+        .await
+        .unwrap();
+
+    // Helper to build a fresh Compressed request_proof body (each call mints
+    // its own request_id/proof_id, i.e. its own admission slot).
+    async fn compressed_request_body(
+        stack: &mut GatewayStack,
+        vk_hash: &[u8],
+    ) -> RequestProofRequestBody {
+        let stdin_bytes = b"fake-stdin".to_vec();
+        let stdin_uri = create_artifact_put(
+            &mut stack.artifact_rpc,
+            &stack.http,
+            SdkArtifactType::Stdin,
+            &stdin_bytes,
+        )
+        .await;
+        RequestProofRequestBody {
+            nonce: 0,
+            vk_hash: vk_hash.to_vec(),
+            version: "test".into(),
+            mode: ProofMode::Compressed as i32,
+            strategy: 2, // Reserved
+            stdin_uri,
+            deadline: u64::MAX,
+            cycle_limit: 0,
+            gas_limit: 0,
+            min_auction_period: 0,
+            whitelist: vec![],
+        }
+    }
+
+    // 1) request_proof #1 (Compressed) — holds the single Range slot.
+    let body1 = compressed_request_body(&mut stack, &vk_hash).await;
+    let resp1 = stack
+        .network_rpc
+        .request_proof(RequestProofRequest {
+            format: MessageFormat::Binary as i32,
+            signature: vec![],
+            body: Some(body1),
+        })
+        .await
+        .expect("request #1 should be admitted (Range pool empty)")
+        .into_inner();
+    let request_id_1 = resp1.body.expect("body").request_id;
+    assert!(!request_id_1.is_empty());
+
+    // 2) request_proof #2 (Compressed) — Range pool cap (1) already held by
+    // #1, so this must be shed with Unavailable. Note: do NOT poll status for
+    // #1 before this — the fake marks proofs Completed on create, but the
+    // gate only releases the slot on a terminal status poll.
+    let body2 = compressed_request_body(&mut stack, &vk_hash).await;
+    let err = stack
+        .network_rpc
+        .request_proof(RequestProofRequest {
+            format: MessageFormat::Binary as i32,
+            signature: vec![],
+            body: Some(body2),
+        })
+        .await
+        .expect_err("request #2 should be shed: Range pool is at cap");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unavailable,
+        "expected Unavailable, got {err:?}"
+    );
+
+    // 3) poll get_proof_request_status for #1 — fake reports Completed, so
+    // this observes a terminal Fulfilled verdict and releases #1's slot.
+    let status1 = stack
+        .network_rpc
+        .get_proof_request_status(GetProofRequestStatusRequest {
+            request_id: request_id_1.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        status1.fulfillment_status,
+        FulfillmentStatus::Fulfilled as i32
+    );
+
+    // 4) request_proof #3 (Compressed) — the Range slot freed by #1's release
+    // means this is admitted again.
+    let body3 = compressed_request_body(&mut stack, &vk_hash).await;
+    let resp3 = stack
+        .network_rpc
+        .request_proof(RequestProofRequest {
+            format: MessageFormat::Binary as i32,
+            signature: vec![],
+            body: Some(body3),
+        })
+        .await
+        .expect("request #3 should be re-admitted after #1's slot was released")
+        .into_inner();
+    let request_id_3 = resp3.body.expect("body").request_id;
+    assert!(!request_id_3.is_empty());
+    assert_ne!(request_id_3, request_id_1, "each request mints its own id");
+
+    // ---- shutdown ----
+    stack.shutdown().await;
 }
 
 /// create_artifact → HTTP PUT with the SDK's zstd(bincode(...)) shape. Returns
