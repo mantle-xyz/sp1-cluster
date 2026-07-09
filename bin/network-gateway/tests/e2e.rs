@@ -257,10 +257,12 @@ async fn spawn_gateway_stack(
     // ---- start the gateway ----
     let grpc_port = free_port();
     let http_port = free_port();
+    let metrics_port = free_port();
     let public_http_url = format!("http://127.0.0.1:{http_port}");
     let mut cfg = Config {
         grpc_addr: format!("127.0.0.1:{grpc_port}"),
         http_addr: format!("127.0.0.1:{http_port}"),
+        metrics_addr: format!("127.0.0.1:{metrics_port}"),
         public_http_url: public_http_url.clone(),
         cluster_rpc: cluster_rpc.clone(),
         artifact_store: "unused".into(),

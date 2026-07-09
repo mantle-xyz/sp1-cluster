@@ -227,6 +227,12 @@ where
             } else {
                 format!("self-hosted {} proof pool at capacity", rej.pool.label())
             };
+            tracing::warn!(
+                proof_id,
+                pool = rej.pool.label(),
+                global = rej.global,
+                "admission shed request"
+            );
             return Err(Status::unavailable(format!("{scope}; retry shortly")));
         }
 
@@ -327,6 +333,8 @@ where
             pb::FulfillmentStatus::Fulfilled | pb::FulfillmentStatus::Unfulfillable
         ) {
             self.admission.release(&proof_id);
+        } else {
+            self.admission.touch(&proof_id); // still in flight → keep the reaper away
         }
 
         let execution = proof
@@ -378,6 +386,8 @@ where
             pb::FulfillmentStatus::Fulfilled | pb::FulfillmentStatus::Unfulfillable
         ) {
             self.admission.release(&proof_id);
+        } else {
+            self.admission.touch(&proof_id); // still in flight → keep the reaper away
         }
 
         let details = self.build_sdk_proof_request(&req.request_id, proof);

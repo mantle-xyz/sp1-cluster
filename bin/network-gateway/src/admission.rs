@@ -194,6 +194,32 @@ impl AdmissionController {
         Ok(())
     }
 
+    /// Classify a `(mode, vk_hash)` pair without acquiring a slot. Exposed so
+    /// the restart-seed path (best-effort, see `seed`) can classify proofs
+    /// that already existed in the cluster before this process started.
+    pub fn classify(&self, mode: i32, vk_hash: &[u8]) -> Option<PoolId> {
+        self.classifier.classify(mode, vk_hash)
+    }
+
+    /// Best-effort restart seed: insert a slot for `proof_id` in `pool` and
+    /// increment its count, bypassing the cap check entirely. Used at boot to
+    /// reflect proofs that were already in flight in the cluster before this
+    /// gateway process started (the in-memory counters otherwise reset to 0
+    /// on restart while the cluster keeps proving). Idempotent — a `proof_id`
+    /// already tracked is left untouched rather than double-counted.
+    pub fn seed(&self, proof_id: &str, pool: PoolId) {
+        if self.slots.contains_key(proof_id) {
+            return;
+        }
+        {
+            let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+            *c.get_mut(pool) += 1;
+            self.set_gauges(pool, c.get(pool), c.total());
+        }
+        self.slots
+            .insert(proof_id.to_string(), (pool, Instant::now()));
+    }
+
     /// Release the slot held by `proof_id`, if any. Idempotent.
     pub fn release(&self, proof_id: &str) {
         if let Some((_, (pool, _))) = self.slots.remove(proof_id) {
@@ -401,10 +427,29 @@ impl AdmissionMetrics {
         }
     }
 
+    /// OpenMetrics text body. Never panics: on the (practically-unreachable)
+    /// encode error it logs and returns an empty body rather than killing the
+    /// scrape task.
     pub fn render(&self) -> String {
         let mut buf = String::new();
-        encode(&mut buf, &self.registry).expect("encode metrics");
+        if let Err(e) = encode(&mut buf, &self.registry) {
+            tracing::error!(error = %e, "failed to encode admission metrics");
+            buf.clear();
+        }
         buf
+    }
+
+    /// axum response with the correct OpenMetrics content-type.
+    pub fn render_response(&self) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/openmetrics-text; version=1.0.0; charset=utf-8",
+            )],
+            self.render(),
+        )
+            .into_response()
     }
 }
 
@@ -536,6 +581,21 @@ mod tests {
         let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_secs(3600));
         c.touch("nope"); // no panic, no effect
         assert_eq!(c.in_flight(PoolId::Range), 0);
+    }
+
+    #[test]
+    fn seed_bypasses_cap_and_is_idempotent() {
+        let c = enforce_ctrl(); // Range cap = 1
+        c.seed("restart-1", PoolId::Range);
+        c.seed("restart-2", PoolId::Range); // over cap, but seed doesn't check it
+        assert_eq!(c.in_flight(PoolId::Range), 2);
+        c.seed("restart-1", PoolId::Range); // already tracked → no double-count
+        assert_eq!(c.in_flight(PoolId::Range), 2);
+        // A normal acquire still enforces the cap against the seeded count.
+        assert!(c.try_acquire("p1", 2, RANGE_VK).is_err());
+        // Releasing a seeded slot behaves like any other slot.
+        c.release("restart-1");
+        assert_eq!(c.in_flight(PoolId::Range), 1);
     }
 
     #[test]

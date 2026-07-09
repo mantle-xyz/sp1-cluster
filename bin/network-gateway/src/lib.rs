@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use axum::{routing::get, Router};
 use sp1_cluster_artifact::{ArtifactClient, CompressedUpload};
 use sp1_cluster_common::client::ClusterServiceClient;
+use sp1_cluster_common::proto as cluster_pb;
 use sp1_sdk::network::proto::artifact::artifact_store_server::ArtifactStoreServer;
 use sp1_sdk::network::proto::base::network::prover_network_server::ProverNetworkServer;
 use tokio::signal;
@@ -95,6 +96,28 @@ where
     .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
     let admission_metrics = Arc::new(crate::admission::AdmissionMetrics::new());
     let admission = Arc::new(build_admission(&cfg)?.with_metrics(admission_metrics.clone()));
+    log_admission_config(&cfg);
+
+    // Best-effort restart seed: the in-memory counters reset to 0 on restart
+    // while the cluster may still have proofs in flight from before this
+    // process started. Seed those into the controller so we don't briefly
+    // over-admit until they drain. Any failure here is logged and swallowed —
+    // a cluster hiccup at boot must never stop the gateway from serving.
+    match seed_admission_from_cluster(&admission, &cluster).await {
+        Ok(seeded) => {
+            if seeded > 0 {
+                info!(
+                    seeded,
+                    "admission: seeded in-flight proofs from cluster after restart"
+                );
+            }
+        }
+        Err(e) => warn!(
+            error = %e,
+            "admission: restart-seed failed (best-effort; continuing boot — brief over-admit possible)"
+        ),
+    }
+
     let prover_network = ProverNetworkServer::new(ProverNetworkImpl::new(
         client.clone(),
         cluster,
@@ -131,18 +154,10 @@ where
         }
     });
 
-    let metrics_for_http = admission_metrics.clone();
     let http_state = Arc::new(ArtifactHttpState { client });
     let app = Router::new()
         .route("/", get(|| async { "OK" }))
         .route("/healthz", get(|| async { "OK" }))
-        .route(
-            "/metrics",
-            get(move || {
-                let m = metrics_for_http.clone();
-                async move { m.render() }
-            }),
-        )
         .merge(artifact_http::router(http_state));
 
     let http_listener = tokio::net::TcpListener::bind(&cfg.http_addr)
@@ -150,14 +165,99 @@ where
         .with_context(|| format!("bind {}", cfg.http_addr))?;
     info!("HTTP server listening on {}", cfg.http_addr);
 
+    // `/metrics` is served on its own loopback-bound listener (default
+    // 127.0.0.1:9091), deliberately kept off the public artifact HTTP
+    // surface so admission telemetry isn't exposed to SDK clients.
+    let metrics_handle = admission_metrics.clone();
+    let metrics_app = Router::new().route(
+        "/metrics",
+        get(move || {
+            let m = metrics_handle.clone();
+            async move { m.render_response() }
+        }),
+    );
+    let metrics_listener = tokio::net::TcpListener::bind(&cfg.metrics_addr)
+        .await
+        .with_context(|| format!("bind metrics {}", cfg.metrics_addr))?;
+    info!("metrics server listening on {}", cfg.metrics_addr);
+    let metrics_task = tokio::spawn(async move {
+        axum::serve(metrics_listener, metrics_app)
+            .await
+            .unwrap_or_else(|e| warn!("metrics server error: {e}"));
+    });
+
     axum::serve(http_listener, app)
         .with_graceful_shutdown(http_shutdown)
         .await?;
 
     grpc_task.await.ok();
     reaper_task.abort();
+    metrics_task.abort();
     info!("network-gateway shut down cleanly");
     Ok(())
+}
+
+/// Log the effective admission policy at startup, and warn on the
+/// enforce=true + cap=0 footgun (all requests for that pool would be shed).
+fn log_admission_config(cfg: &Config) {
+    info!(
+        enforce = cfg.admission_enforce,
+        range_cap = cfg.admission_range_max_inflight,
+        agg_cap = cfg.admission_agg_max_inflight,
+        global_cap = ?cfg.admission_global_max_inflight,
+        "admission gate configured (single-instance authoritative; do not run >1 gateway replica)"
+    );
+    if cfg.admission_enforce
+        && (cfg.admission_range_max_inflight == 0 || cfg.admission_agg_max_inflight == 0)
+    {
+        warn!(
+            "admission enforce=true with a pool cap of 0 — all requests for that pool will be shed"
+        );
+    }
+}
+
+/// Best-effort: classify the cluster's currently-non-terminal (`Pending`)
+/// proof requests and seed matching admission slots so the in-memory
+/// counters reflect reality after a gateway restart.
+///
+/// The cluster's `ProofRequest` doesn't carry `vk_hash` (it's never
+/// persisted past `request_proof`) — only `options_artifact_id`, which holds
+/// the proof `mode` as a string (mirroring how `build_sdk_proof_request`
+/// recovers `mode`). So seeded classification falls back to the mode-only
+/// path of `Classifier::classify` (as if `vk_hash` were empty); requests that
+/// were only classified by an explicit `*_VK_HASHES` override won't be
+/// re-classified correctly by this path, but the default mode-based
+/// classification (Compressed → Range, Plonk/Groth16 → Agg) still applies.
+async fn seed_admission_from_cluster(
+    admission: &AdmissionController,
+    cluster: &ClusterServiceClient,
+) -> Result<usize> {
+    let proofs = cluster
+        .get_proof_requests(cluster_pb::ProofRequestListRequest {
+            proof_status: vec![cluster_pb::ProofRequestStatus::Pending as i32],
+            execution_status: vec![],
+            minimum_deadline: None,
+            handled: None,
+            limit: None,
+            offset: None,
+            scheduled_by: None,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("cluster get_proof_requests failed: {e}"))?;
+
+    let mut seeded = 0usize;
+    for proof in proofs {
+        let mode: i32 = proof
+            .options_artifact_id
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if let Some(pool) = admission.classify(mode, &[]) {
+            admission.seed(&proof.id, pool);
+            seeded += 1;
+        }
+    }
+    Ok(seeded)
 }
 
 pub fn build_program_store(cfg: &Config) -> Result<Arc<dyn ProgramStore>> {

@@ -18,6 +18,12 @@ pub struct Config {
     #[arg(long, env = "GATEWAY_HTTP_ADDR", default_value = "0.0.0.0:8081")]
     pub http_addr: String,
 
+    /// Operator metrics endpoint bind address (serves ONLY `/metrics`). Kept
+    /// separate from GATEWAY_HTTP_ADDR (the public artifact surface) and bound
+    /// to loopback by default so admission telemetry isn't exposed publicly.
+    #[arg(long, env = "GATEWAY_METRICS_ADDR", default_value = "127.0.0.1:9091")]
+    pub metrics_addr: String,
+
     /// Public base URL used to build artifact URIs returned to SDK clients.
     /// e.g. `http://gateway.internal:8081`.
     #[arg(
