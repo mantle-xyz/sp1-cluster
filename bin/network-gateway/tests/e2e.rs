@@ -222,6 +222,14 @@ async fn e2e_register_program_request_proof_download() {
         auth_allowlist: None,
         program_store: "memory".into(),
         program_store_dir: None,
+        admission_enforce: false,
+        admission_range_max_inflight: 1,
+        admission_agg_max_inflight: 2,
+        admission_global_max_inflight: None,
+        admission_range_vk_hashes: None,
+        admission_agg_vk_hashes: None,
+        admission_reap_period_secs: 60,
+        admission_slot_ttl_secs: 3600,
     };
     let program_store: Arc<dyn ProgramStore> = Arc::new(InMemoryProgramStore::new());
     let (gw_grpc_shutdown_tx, gw_grpc_shutdown_rx) = oneshot::channel::<()>();

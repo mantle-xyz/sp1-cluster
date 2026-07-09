@@ -74,4 +74,43 @@ pub struct Config {
     /// `program_store=fs`; created on startup if missing.
     #[arg(long, env = "GATEWAY_PROGRAM_STORE_DIR")]
     pub program_store_dir: Option<PathBuf>,
+
+    /// Enforce the admission gate. `false` (default) = dry-run: count + expose
+    /// metrics but never reject; `true` = shed overflow with gRPC `Unavailable`.
+    #[arg(long, env = "GATEWAY_ADMISSION_ENFORCE", default_value_t = false)]
+    pub admission_enforce: bool,
+
+    /// Range-pool (GPU) max concurrent in-flight.
+    #[arg(
+        long,
+        env = "GATEWAY_ADMISSION_RANGE_MAX_INFLIGHT",
+        default_value_t = 1
+    )]
+    pub admission_range_max_inflight: usize,
+
+    /// Agg-pool (cpunode) max concurrent in-flight.
+    #[arg(long, env = "GATEWAY_ADMISSION_AGG_MAX_INFLIGHT", default_value_t = 2)]
+    pub admission_agg_max_inflight: usize,
+
+    /// Optional cap across ALL pools combined. Unset = pools independent.
+    #[arg(long, env = "GATEWAY_ADMISSION_GLOBAL_MAX_INFLIGHT")]
+    pub admission_global_max_inflight: Option<usize>,
+
+    /// Comma-separated 0x-hex vk_hashes classified as Range (optional; mode is
+    /// the fallback when empty).
+    #[arg(long, env = "GATEWAY_ADMISSION_RANGE_VK_HASHES", value_delimiter = ',')]
+    pub admission_range_vk_hashes: Option<Vec<String>>,
+
+    /// Comma-separated 0x-hex vk_hashes classified as Agg.
+    #[arg(long, env = "GATEWAY_ADMISSION_AGG_VK_HASHES", value_delimiter = ',')]
+    pub admission_agg_vk_hashes: Option<Vec<String>>,
+
+    /// Reaper sweep period (seconds).
+    #[arg(long, env = "GATEWAY_ADMISSION_REAP_PERIOD_SECS", default_value_t = 60)]
+    pub admission_reap_period_secs: u64,
+
+    /// Slot TTL (seconds). MUST exceed the longest legitimate proof so the
+    /// reaper never reclaims a live proof's slot.
+    #[arg(long, env = "GATEWAY_ADMISSION_SLOT_TTL_SECS", default_value_t = 3600)]
+    pub admission_slot_ttl_secs: u64,
 }
