@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod artifact_http;
 pub mod auth;
 pub mod config;
