@@ -32,6 +32,7 @@ futures = { workspace = true }
 hex = { workspace = true }
 mti = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+prometheus-client = "0.22"
 prost = { workspace = true }
 rustls = { workspace = true, features = ["ring"] }
 serde = { workspace = true }

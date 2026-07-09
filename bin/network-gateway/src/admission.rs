@@ -11,6 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::registry::Registry;
 
 /// The two concurrency pools, one per backend-bound proof type.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -63,9 +69,9 @@ impl Classifier {
             return Some(PoolId::Agg);
         }
         match mode {
-            2 => Some(PoolId::Range),      // ProofMode::Compressed
-            3 | 4 => Some(PoolId::Agg),    // Plonk | Groth16
-            _ => None,                     // Core / unspecified
+            2 => Some(PoolId::Range),   // ProofMode::Compressed
+            3 | 4 => Some(PoolId::Agg), // Plonk | Groth16
+            _ => None,                  // Core / unspecified
         }
     }
 }
@@ -166,7 +172,8 @@ impl AdmissionController {
             over
         };
         // Reserve the slot (dry-run reserves too, so release stays symmetric).
-        self.slots.insert(proof_id.to_string(), (pool, Instant::now()));
+        self.slots
+            .insert(proof_id.to_string(), (pool, Instant::now()));
         if over {
             self.metric_would_reject(pool);
         }
@@ -213,17 +220,163 @@ impl AdmissionController {
         self.set_gauges(pool, c.get(pool), c.total());
     }
 
-    // --- metric shims; Task 3 gives them bodies. No-op until then. ---
-    fn set_gauges(&self, _pool: PoolId, _pool_val: usize, _total: usize) {}
-    fn metric_admitted(&self, _pool: PoolId) {}
-    fn metric_would_reject(&self, _pool: PoolId) {}
-    fn metric_reaped(&self, _pool: PoolId) {}
-    fn metric_rejected(&self, _pool: PoolId, _global: bool) {}
-    fn metric_unclassified(&self) {}
+    pub fn with_metrics(mut self, metrics: Arc<AdmissionMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn set_gauges(&self, pool: PoolId, pool_val: usize, total: usize) {
+        if let Some(m) = &self.metrics {
+            m.inflight
+                .get_or_create(&PoolLabel {
+                    pool: pool.label().into(),
+                })
+                .set(pool_val as i64);
+            m.global_inflight.set(total as i64);
+        }
+    }
+    fn metric_admitted(&self, pool: PoolId) {
+        if let Some(m) = &self.metrics {
+            m.admitted
+                .get_or_create(&PoolLabel {
+                    pool: pool.label().into(),
+                })
+                .inc();
+        }
+    }
+    fn metric_would_reject(&self, pool: PoolId) {
+        if let Some(m) = &self.metrics {
+            m.would_reject
+                .get_or_create(&PoolLabel {
+                    pool: pool.label().into(),
+                })
+                .inc();
+        }
+    }
+    fn metric_reaped(&self, pool: PoolId) {
+        if let Some(m) = &self.metrics {
+            m.reaped
+                .get_or_create(&PoolLabel {
+                    pool: pool.label().into(),
+                })
+                .inc();
+        }
+    }
+    fn metric_rejected(&self, pool: PoolId, global: bool) {
+        if let Some(m) = &self.metrics {
+            if global {
+                m.rejected_global.inc();
+            } else {
+                m.rejected
+                    .get_or_create(&PoolLabel {
+                        pool: pool.label().into(),
+                    })
+                    .inc();
+            }
+        }
+    }
+    fn metric_unclassified(&self) {
+        if let Some(m) = &self.metrics {
+            m.unclassified.inc();
+        }
+    }
 }
 
-/// Placeholder so the field type resolves before Task 3 fills it in.
-pub struct AdmissionMetrics;
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PoolLabel {
+    pub pool: String,
+}
+
+/// Admission metrics + their registry. `render()` returns the OpenMetrics text
+/// body for the `/metrics` endpoint.
+pub struct AdmissionMetrics {
+    registry: Registry,
+    inflight: Family<PoolLabel, Gauge>,
+    global_inflight: Gauge,
+    admitted: Family<PoolLabel, Counter>,
+    rejected: Family<PoolLabel, Counter>,
+    rejected_global: Counter,
+    would_reject: Family<PoolLabel, Counter>,
+    reaped: Family<PoolLabel, Counter>,
+    unclassified: Counter,
+}
+
+impl AdmissionMetrics {
+    pub fn new() -> Self {
+        let mut registry = Registry::default();
+        let inflight = Family::<PoolLabel, Gauge>::default();
+        let global_inflight = Gauge::default();
+        let admitted = Family::<PoolLabel, Counter>::default();
+        let rejected = Family::<PoolLabel, Counter>::default();
+        let rejected_global = Counter::default();
+        let would_reject = Family::<PoolLabel, Counter>::default();
+        let reaped = Family::<PoolLabel, Counter>::default();
+        let unclassified = Counter::default();
+        registry.register(
+            "gateway_admission_inflight",
+            "In-flight per pool",
+            inflight.clone(),
+        );
+        registry.register(
+            "gateway_admission_global_inflight",
+            "In-flight across all pools",
+            global_inflight.clone(),
+        );
+        registry.register(
+            "gateway_admission_admitted",
+            "Admitted, per pool",
+            admitted.clone(),
+        );
+        registry.register(
+            "gateway_admission_rejected",
+            "Rejected (pool cap), per pool",
+            rejected.clone(),
+        );
+        registry.register(
+            "gateway_admission_rejected_global",
+            "Rejected (global cap)",
+            rejected_global.clone(),
+        );
+        registry.register(
+            "gateway_admission_would_reject",
+            "Dry-run over-cap admits, per pool",
+            would_reject.clone(),
+        );
+        registry.register(
+            "gateway_admission_reaped",
+            "Slots reclaimed by the reaper, per pool",
+            reaped.clone(),
+        );
+        registry.register(
+            "gateway_admission_unclassified",
+            "Requests passed through ungated",
+            unclassified.clone(),
+        );
+        Self {
+            registry,
+            inflight,
+            global_inflight,
+            admitted,
+            rejected,
+            rejected_global,
+            would_reject,
+            reaped,
+            unclassified,
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let mut buf = String::new();
+        encode(&mut buf, &self.registry).expect("encode metrics");
+        buf
+    }
+}
+
+impl Default for AdmissionMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -261,7 +414,10 @@ mod tests {
         assert_eq!(c.in_flight(PoolId::Range), 1);
         assert_eq!(
             c.try_acquire("p2", 2, RANGE_VK).unwrap_err(),
-            Rejection { pool: PoolId::Range, global: false }
+            Rejection {
+                pool: PoolId::Range,
+                global: false
+            }
         );
     }
 
@@ -277,7 +433,8 @@ mod tests {
 
     #[test]
     fn dry_run_admits_over_cap() {
-        let c = AdmissionController::new(classifier(), 1, 2, None, false, Duration::from_secs(3600));
+        let c =
+            AdmissionController::new(classifier(), 1, 2, None, false, Duration::from_secs(3600));
         c.try_acquire("p1", 2, RANGE_VK).unwrap();
         assert!(c.try_acquire("p2", 2, RANGE_VK).is_ok()); // over cap, dry-run admits
         assert_eq!(c.in_flight(PoolId::Range), 2);
@@ -293,11 +450,15 @@ mod tests {
 
     #[test]
     fn global_cap_serialises_pools() {
-        let c = AdmissionController::new(classifier(), 2, 2, Some(1), true, Duration::from_secs(3600));
+        let c =
+            AdmissionController::new(classifier(), 2, 2, Some(1), true, Duration::from_secs(3600));
         c.try_acquire("p1", 2, RANGE_VK).unwrap(); // takes the 1 global slot
         assert_eq!(
             c.try_acquire("p2", 3, AGG_VK).unwrap_err(),
-            Rejection { pool: PoolId::Agg, global: true } // agg pool had room; global full
+            Rejection {
+                pool: PoolId::Agg,
+                global: true
+            } // agg pool had room; global full
         );
     }
 
@@ -310,5 +471,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(45));
         c.reap();
         assert_eq!(c.in_flight(PoolId::Range), 0);
+    }
+
+    #[test]
+    fn metrics_render_reflects_state() {
+        let m = Arc::new(AdmissionMetrics::new());
+        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_secs(3600))
+            .with_metrics(m.clone());
+        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        let _ = c.try_acquire("p2", 2, RANGE_VK); // rejected
+        let out = m.render();
+        assert!(out.contains("gateway_admission_admitted"));
+        assert!(out.contains("gateway_admission_rejected"));
+        assert!(out.contains("pool=\"range\""));
     }
 }
