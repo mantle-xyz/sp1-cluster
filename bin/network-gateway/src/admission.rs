@@ -4,7 +4,14 @@
 //! proof-router environment forwards here, so one in-memory counter is an
 //! authoritative aggregate cap (no distributed coordination). Overflow is shed
 //! with gRPC `Unavailable`, which the SP1 SDK retries in place — so op-succinct
-//! neither records a failure nor bisects the range. Single-instance only.
+//! neither records a failure nor bisects the range. Single-instance only: this
+//! is a per-process in-memory counter, so running more than one gateway
+//! replica multiplies the aggregate cap rather than sharing it.
+//!
+//! Unclassified requests (Core / unspecified mode with no vk match) are
+//! passed through **ungated by design** — this is a protective throttle on
+//! known proof shapes, not an allowlist, and it must never silently block an
+//! unconfigured request type.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -107,13 +114,19 @@ pub struct AdmissionController {
     /// `None` = pools independent; `Some(n)` = at most `n` in-flight total.
     global_cap: Option<usize>,
     counts: Mutex<PerPool>,
-    /// proof_id → (pool, acquired_at). Owns committed-slot accounting; the
-    /// idempotent-release latch is `DashMap::remove` (one winner).
+    /// proof_id → (pool, last_polled_at). Owns committed-slot accounting; the
+    /// idempotent-release latch is `DashMap::remove` (one winner). The
+    /// timestamp is refreshed by [`touch`](Self::touch) on every non-terminal
+    /// poll, so it tracks recency-of-poll rather than acquire time.
     slots: DashMap<String, (PoolId, Instant)>,
     /// `false` = dry-run (count + metrics, never reject); `true` = enforce.
     enforce: bool,
-    /// Reaper TTL for a slot whose terminal release was lost. Must exceed the
-    /// longest legitimate proof so a live proof's slot is never reclaimed.
+    /// Reaper TTL: max time since a slot's *last poll* (not since acquire) —
+    /// a live proof is `touch`ed on every non-terminal status/details poll,
+    /// so TTL only needs to exceed the client's poll interval, not the
+    /// longest legitimate proof duration. A slot that goes unpolled for
+    /// longer than this is assumed abandoned (or its release was lost) and
+    /// is reclaimed.
     ttl: Duration,
     classifier: Classifier,
     metrics: Option<Arc<AdmissionMetrics>>,
@@ -188,19 +201,42 @@ impl AdmissionController {
         }
     }
 
-    /// Reclaim slots whose terminal release was lost (client dropped, crash).
+    /// Refresh a slot's age so the reaper won't reclaim it while its proof is
+    /// still being polled (i.e. still alive). No-op if the slot isn't tracked
+    /// (ungated request, or already released). Called on every non-terminal
+    /// status/details poll.
+    pub fn touch(&self, proof_id: &str) {
+        if let Some(mut e) = self.slots.get_mut(proof_id) {
+            e.value_mut().1 = Instant::now();
+        }
+    }
+
+    /// Reclaim slots not polled within `ttl` (a lost release, or an abandoned
+    /// proof the client stopped polling). A live proof is polled continuously
+    /// and `touch`ed, so it is never reclaimed.
     pub fn reap(&self) {
-        let expired: Vec<String> = self
+        let candidates: Vec<String> = self
             .slots
             .iter()
             .filter(|e| e.value().1.elapsed() > self.ttl)
             .map(|e| e.key().clone())
             .collect();
-        for id in expired {
-            if let Some((_, (pool, _))) = self.slots.remove(&id) {
+        let mut reclaimed = 0usize;
+        for id in candidates {
+            // Re-check age atomically at removal: if a concurrent `touch`
+            // refreshed it (the proof is still being polled), spare it.
+            if let Some((_, (pool, _))) = self.slots.remove_if(&id, |_, v| v.1.elapsed() > self.ttl)
+            {
                 self.dec_pool(pool);
                 self.metric_reaped(pool);
+                reclaimed += 1;
             }
+        }
+        if reclaimed > 0 {
+            tracing::warn!(
+                reclaimed,
+                "admission reaper reclaimed leaked slots (a release was likely missed or a proof was abandoned)"
+            );
         }
     }
 
@@ -470,6 +506,35 @@ mod tests {
         assert_eq!(c.in_flight(PoolId::Range), 1); // not yet expired
         std::thread::sleep(Duration::from_millis(45));
         c.reap();
+        assert_eq!(c.in_flight(PoolId::Range), 0);
+    }
+
+    #[test]
+    fn touch_prevents_reap_of_polled_slot() {
+        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_millis(30));
+        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        c.touch("p1"); // still being polled → refresh
+        std::thread::sleep(Duration::from_millis(20)); // 40ms since acquire, but 20ms since touch
+        c.reap();
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "recently-touched slot must not be reaped"
+        );
+        std::thread::sleep(Duration::from_millis(40)); // now >30ms since last touch
+        c.reap();
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "unpolled slot ages out and is reaped"
+        );
+    }
+
+    #[test]
+    fn touch_absent_slot_is_noop() {
+        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_secs(3600));
+        c.touch("nope"); // no panic, no effect
         assert_eq!(c.in_flight(PoolId::Range), 0);
     }
 
