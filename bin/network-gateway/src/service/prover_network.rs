@@ -69,6 +69,18 @@ impl<A> ProverNetworkImpl<A> {
         current.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Release the admission slot on a terminal verdict, else `touch` it so the
+    /// reaper spares a still-live proof. Idempotent, and a no-op for ungated
+    /// proofs (which hold no slot). Called from every completion poll; the
+    /// terminal predicate lives in `status::is_terminal` so it can't drift.
+    fn settle_slot(&self, proof_id: &str, fulfillment: pb::FulfillmentStatus) {
+        if crate::status::is_terminal(fulfillment) {
+            self.admission.release(proof_id);
+        } else {
+            self.admission.touch(proof_id);
+        }
+    }
+
     async fn load_cluster_proof(&self, proof_id: &str) -> Result<cluster_pb::ProofRequest, Status> {
         self.cluster
             .get_proof_request(cluster_pb::ProofRequestGetRequest {
@@ -236,15 +248,15 @@ where
             return Err(Status::unavailable(format!("{scope}; retry shortly")));
         }
 
-        let proof_artifact = match self.client.create_artifact() {
-            Ok(a) => a,
-            Err(e) => {
-                self.admission.release(&proof_id); // reserved but never committed to the cluster
-                return Err(Status::internal(format!(
-                    "create proof artifact failed: {e}"
-                )));
-            }
-        };
+        // RAII: from here on, any early return releases the reserved slot. We
+        // `commit()` only once the cluster has accepted the request, handing
+        // the slot off to the terminal-poll release path.
+        let slot = self.admission.guard(&proof_id);
+
+        let proof_artifact = self
+            .client
+            .create_artifact()
+            .map_err(|e| Status::internal(format!("create proof artifact failed: {e}")))?;
         let proof_artifact_id = proof_artifact.to_id();
 
         let create = cluster_pb::ProofRequestCreateRequest {
@@ -259,12 +271,11 @@ where
             gas_limit: body.gas_limit,
             scheduled_by: None,
         };
-        if let Err(e) = self.cluster.create_proof_request(create).await {
-            self.admission.release(&proof_id); // reserved but the backend didn't take it
-            return Err(Status::internal(format!(
-                "cluster create_proof_request failed: {e}"
-            )));
-        }
+        self.cluster
+            .create_proof_request(create)
+            .await
+            .map_err(|e| Status::internal(format!("cluster create_proof_request failed: {e}")))?;
+        slot.commit();
 
         info!(
             proof_id,
@@ -325,17 +336,7 @@ where
         let proof = self.load_cluster_proof(&proof_id).await?;
 
         let fulfillment = fulfillment_from_cluster(proof.proof_status());
-
-        // Release the admission slot on a terminal verdict (idempotent; the SDK
-        // polls repeatedly). Ungated proofs hold no slot → no-op.
-        if matches!(
-            fulfillment,
-            pb::FulfillmentStatus::Fulfilled | pb::FulfillmentStatus::Unfulfillable
-        ) {
-            self.admission.release(&proof_id);
-        } else {
-            self.admission.touch(&proof_id); // still in flight → keep the reaper away
-        }
+        self.settle_slot(&proof_id, fulfillment);
 
         let execution = proof
             .execution_result
@@ -378,17 +379,9 @@ where
         let proof_id = proof_id_from_request_id(&req.request_id);
         let proof = self.load_cluster_proof(&proof_id).await?;
 
-        // Release the admission slot on a terminal verdict, mirroring
-        // `get_proof_request_status` (idempotent; ungated proofs hold no slot).
+        // Settle the admission slot, mirroring `get_proof_request_status`.
         let fulfillment = fulfillment_from_cluster(proof.proof_status());
-        if matches!(
-            fulfillment,
-            pb::FulfillmentStatus::Fulfilled | pb::FulfillmentStatus::Unfulfillable
-        ) {
-            self.admission.release(&proof_id);
-        } else {
-            self.admission.touch(&proof_id); // still in flight → keep the reaper away
-        }
+        self.settle_slot(&proof_id, fulfillment);
 
         let details = self.build_sdk_proof_request(&req.request_id, proof);
         Ok(Response::new(pb::GetProofRequestDetailsResponse {

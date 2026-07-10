@@ -98,25 +98,10 @@ where
     let admission = Arc::new(build_admission(&cfg)?.with_metrics(admission_metrics.clone()));
     log_admission_config(&cfg);
 
-    // Best-effort restart seed: the in-memory counters reset to 0 on restart
-    // while the cluster may still have proofs in flight from before this
-    // process started. Seed those into the controller so we don't briefly
-    // over-admit until they drain. Any failure here is logged and swallowed —
-    // a cluster hiccup at boot must never stop the gateway from serving.
-    match seed_admission_from_cluster(&admission, &cluster).await {
-        Ok(seeded) => {
-            if seeded > 0 {
-                info!(
-                    seeded,
-                    "admission: seeded in-flight proofs from cluster after restart"
-                );
-            }
-        }
-        Err(e) => warn!(
-            error = %e,
-            "admission: restart-seed failed (best-effort; continuing boot — brief over-admit possible)"
-        ),
-    }
+    // Handles for the best-effort restart seed, spawned off the boot path
+    // below (see the note at the spawn site).
+    let seed_admission = admission.clone();
+    let seed_cluster = cluster.clone();
 
     let prover_network = ProverNetworkServer::new(ProverNetworkImpl::new(
         client.clone(),
@@ -186,13 +171,41 @@ where
             .unwrap_or_else(|e| warn!("metrics server error: {e}"));
     });
 
-    axum::serve(http_listener, app)
-        .with_graceful_shutdown(http_shutdown)
-        .await?;
+    // Best-effort restart seed, deliberately off the boot path: the in-memory
+    // counters reset to 0 on restart while the cluster may still be proving
+    // requests from before this process started, so seed those to avoid a
+    // brief over-admit until they drain. Spawned (not awaited) so a slow or
+    // flaky cluster can never delay the gateway binding its listeners; it runs
+    // once and exits. Any failure is logged and swallowed.
+    tokio::spawn(async move {
+        match seed_admission_from_cluster(&seed_admission, &seed_cluster).await {
+            Ok(seeded) if seeded > 0 => info!(
+                seeded,
+                "admission: seeded in-flight proofs from cluster after restart"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                error = %e,
+                "admission: restart-seed failed (best-effort; brief over-admit possible)"
+            ),
+        }
+    });
 
-    grpc_task.await.ok();
+    let serve_result = axum::serve(http_listener, app)
+        .with_graceful_shutdown(http_shutdown)
+        .await;
+
+    // Tear down the background tasks even if `serve` errored, so `serve()`
+    // (driven directly by integration tests on a shared runtime) never leaks
+    // the reaper/metrics loops or a still-running gRPC server.
     reaper_task.abort();
     metrics_task.abort();
+    if serve_result.is_err() {
+        grpc_task.abort();
+        serve_result?;
+    }
+
+    grpc_task.await.ok();
     info!("network-gateway shut down cleanly");
     Ok(())
 }
@@ -228,6 +241,9 @@ fn log_admission_config(cfg: &Config) {
 /// were only classified by an explicit `*_VK_HASHES` override won't be
 /// re-classified correctly by this path, but the default mode-based
 /// classification (Compressed → Range, Plonk/Groth16 → Agg) still applies.
+/// Upper bound on proofs pulled by the restart seed (see call site).
+const SEED_MAX_PROOFS: u32 = 4096;
+
 async fn seed_admission_from_cluster(
     admission: &AdmissionController,
     cluster: &ClusterServiceClient,
@@ -238,7 +254,11 @@ async fn seed_admission_from_cluster(
             execution_status: vec![],
             minimum_deadline: None,
             handled: None,
-            limit: None,
+            // Bound the boot-time scan; in-flight (Pending) proofs against a
+            // single self-hosted cluster are far below this. A backlog larger
+            // than this only under-seeds slightly (brief over-admit), which the
+            // reaper and normal admission converge back to correct.
+            limit: Some(SEED_MAX_PROOFS),
             offset: None,
             scheduled_by: None,
         })
@@ -283,6 +303,15 @@ pub fn build_program_store(cfg: &Config) -> Result<Arc<dyn ProgramStore>> {
 /// This only constructs the counting/classifying core — `serve` attaches
 /// metrics (`with_metrics`), spawns the reaper task, and mounts `/metrics`.
 pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
+    // A zero reap period would panic `tokio::time::interval`, silently killing
+    // the reaper task (slots would then leak until never). A zero TTL would
+    // reap live slots on the first sweep. Reject both at boot.
+    if cfg.admission_reap_period_secs == 0 {
+        anyhow::bail!("GATEWAY_ADMISSION_REAP_PERIOD_SECS must be > 0");
+    }
+    if cfg.admission_slot_ttl_secs == 0 {
+        anyhow::bail!("GATEWAY_ADMISSION_SLOT_TTL_SECS must be > 0");
+    }
     let range_vks = parse_vk_hashes(cfg.admission_range_vk_hashes.as_deref())
         .context("GATEWAY_ADMISSION_RANGE_VK_HASHES")?;
     let agg_vks = parse_vk_hashes(cfg.admission_agg_vk_hashes.as_deref())
@@ -351,4 +380,35 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn base_cfg() -> Config {
+        Config::parse_from(["network-gateway", "--cluster-rpc", "http://localhost:50051"])
+    }
+
+    #[test]
+    fn build_admission_accepts_defaults() {
+        assert!(build_admission(&base_cfg()).is_ok());
+    }
+
+    #[test]
+    fn build_admission_rejects_zero_reap_period() {
+        // A zero period would panic tokio's interval and silently kill the reaper.
+        let mut cfg = base_cfg();
+        cfg.admission_reap_period_secs = 0;
+        assert!(build_admission(&cfg).is_err());
+    }
+
+    #[test]
+    fn build_admission_rejects_zero_ttl() {
+        // A zero TTL would reap live slots on the first sweep.
+        let mut cfg = base_cfg();
+        cfg.admission_slot_ttl_secs = 0;
+        assert!(build_admission(&cfg).is_err());
+    }
 }

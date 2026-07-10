@@ -115,8 +115,11 @@ pub struct Config {
     #[arg(long, env = "GATEWAY_ADMISSION_REAP_PERIOD_SECS", default_value_t = 60)]
     pub admission_reap_period_secs: u64,
 
-    /// Slot TTL (seconds). MUST exceed the longest legitimate proof so the
-    /// reaper never reclaims a live proof's slot.
+    /// Slot TTL (seconds). A live proof is `touch`ed on every non-terminal
+    /// status/details poll, so this MUST exceed the maximum gap between a
+    /// client's consecutive polls — NOT the proof duration. A slot unpolled for
+    /// longer is treated as abandoned and reclaimed. The default (3600) clears
+    /// any realistic SDK poll backoff.
     #[arg(long, env = "GATEWAY_ADMISSION_SLOT_TTL_SECS", default_value_t = 3600)]
     pub admission_slot_ttl_secs: u64,
 }

@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use sp1_sdk::network::proto::base::types::ProofMode;
+
 use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -64,7 +66,11 @@ impl Classifier {
     }
 
     /// vk_hash (authoritative) first, then `mode`:
-    /// Compressed(2) → Range; Plonk(3)/Groth16(4) → Agg; else → None (ungated).
+    /// Compressed → Range; Plonk/Groth16 → Agg; else → None (ungated).
+    ///
+    /// `mode` is matched against the proto `ProofMode` enum (not raw i32
+    /// literals) so the mapping tracks the proto definition if it's ever
+    /// renumbered.
     ///
     /// ⚠️ Mode path assumes range == Compressed and agg != Compressed. If a
     /// deployment ever makes agg Compressed, it MUST set `agg_vks`.
@@ -75,10 +81,10 @@ impl Classifier {
         if self.agg_vks.contains(vk_hash) {
             return Some(PoolId::Agg);
         }
-        match mode {
-            2 => Some(PoolId::Range),   // ProofMode::Compressed
-            3 | 4 => Some(PoolId::Agg), // Plonk | Groth16
-            _ => None,                  // Core / unspecified
+        match ProofMode::try_from(mode) {
+            Ok(ProofMode::Compressed) => Some(PoolId::Range),
+            Ok(ProofMode::Plonk | ProofMode::Groth16) => Some(PoolId::Agg),
+            _ => None, // Core / Unspecified / unknown → ungated
         }
     }
 }
@@ -121,12 +127,13 @@ pub struct AdmissionController {
     slots: DashMap<String, (PoolId, Instant)>,
     /// `false` = dry-run (count + metrics, never reject); `true` = enforce.
     enforce: bool,
-    /// Reaper TTL: max time since a slot's *last poll* (not since acquire) —
-    /// a live proof is `touch`ed on every non-terminal status/details poll,
-    /// so TTL only needs to exceed the client's poll interval, not the
-    /// longest legitimate proof duration. A slot that goes unpolled for
-    /// longer than this is assumed abandoned (or its release was lost) and
-    /// is reclaimed.
+    /// Reaper TTL. The single invariant: **TTL must exceed the maximum gap
+    /// between a live proof's consecutive status/details polls.** A live proof
+    /// is `touch`ed on every non-terminal poll, so the timestamp tracks
+    /// recency-of-poll, not acquire time — a slot unpolled for longer than
+    /// this is assumed abandoned (or its release was lost) and is reclaimed.
+    /// Set it comfortably above the SDK's longest poll backoff; the default
+    /// (3600s) clears any realistic gap.
     ttl: Duration,
     classifier: Classifier,
     metrics: Option<Arc<AdmissionMetrics>>,
@@ -224,6 +231,19 @@ impl AdmissionController {
     pub fn release(&self, proof_id: &str) {
         if let Some((_, (pool, _))) = self.slots.remove(proof_id) {
             self.dec_pool(pool);
+        }
+    }
+
+    /// RAII handle over a just-acquired slot: on drop it releases the slot
+    /// unless [`commit`](SlotGuard::commit) was called. Use it on the
+    /// `request_proof` path so any early return between `try_acquire` and the
+    /// cluster accepting the request can't leak the reservation — the release
+    /// no longer depends on remembering to call it at every `?`.
+    pub fn guard<'a>(&'a self, proof_id: &'a str) -> SlotGuard<'a> {
+        SlotGuard {
+            controller: self,
+            proof_id,
+            committed: false,
         }
     }
 
@@ -344,6 +364,31 @@ impl AdmissionController {
     }
 }
 
+/// RAII slot reservation (see [`AdmissionController::guard`]). Releases on drop
+/// unless committed, so a new fallible step added to `request_proof` can't
+/// silently leak the slot until the reaper TTL.
+pub struct SlotGuard<'a> {
+    controller: &'a AdmissionController,
+    proof_id: &'a str,
+    committed: bool,
+}
+
+impl SlotGuard<'_> {
+    /// Hand the slot off to the terminal-poll release path — the reservation
+    /// outlives this scope. Call only once the cluster has accepted the proof.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.controller.release(self.proof_id);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PoolLabel {
     pub pool: String,
@@ -351,6 +396,15 @@ pub struct PoolLabel {
 
 /// Admission metrics + their registry. `render()` returns the OpenMetrics text
 /// body for the `/metrics` endpoint.
+///
+/// NOTE: this is the gateway's only metrics surface (there was none before the
+/// admission gate). It deliberately uses a self-contained `prometheus-client`
+/// registry rather than the workspace's `spn_metrics` MetricServer used by the
+/// cluster binaries (coordinator/bidder/worker/fulfiller): `spn_metrics` is a
+/// process-global recorder facade, whereas an owned registry keeps these
+/// metrics injectable and unit-testable (see `metrics_render_reflects_state`
+/// and the e2e `/metrics` test). Revisit only if the gateway needs to emit
+/// metrics that must share the fleet's recorder.
 pub struct AdmissionMetrics {
     registry: Registry,
     inflight: Family<PoolLabel, Gauge>,
