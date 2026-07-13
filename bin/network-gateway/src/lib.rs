@@ -220,11 +220,22 @@ fn log_admission_config(cfg: &Config) {
         global_cap = ?cfg.admission_global_max_inflight,
         "admission gate configured (single-instance authoritative; do not run >1 gateway replica)"
     );
+    info!(
+        priority_enable = cfg.admission_priority_enable,
+        ranked_proposers = cfg.admission_priority_order.as_ref().map_or(0, |v| v.len()),
+        priority_ttl_secs = cfg.admission_priority_ttl_secs,
+        "admission priority policy configured"
+    );
     if cfg.admission_enforce
         && (cfg.admission_range_max_inflight == 0 || cfg.admission_agg_max_inflight == 0)
     {
         warn!(
             "admission enforce=true with a pool cap of 0 — all requests for that pool will be shed"
+        );
+    }
+    if cfg.admission_priority_enable && !cfg.admission_enforce {
+        warn!(
+            "admission priority enabled but ENFORCE=false — priority is observed only (would_yield metrics); set GATEWAY_ADMISSION_ENFORCE=true to actually hold slots"
         );
     }
 }
