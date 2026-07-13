@@ -8,8 +8,18 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_stream::Stream;
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 use tracing::info;
+
+/// Marker attached to an admission-shed `Status` so the proof-router can tell a
+/// deliberate throttle from a genuine backend fault (and NOT trip its circuit
+/// breaker / fail over to Succinct, whose s3:// store can't take our http://
+/// artifact URIs). Set both as a gRPC trailer metadata key AND as a token in
+/// the message text, so it survives a proxy that strips custom trailers. Kept
+/// in sync with the router (`prove-network crates/proof-router/src/backend.rs`
+/// `ADMISSION_SHED_MARKER`).
+const ADMISSION_SHED_MARKER: &str = "x-sp1-admission-shed";
 
 use crate::auth::Auth;
 use crate::ids::{
@@ -245,7 +255,14 @@ where
                 global = rej.global,
                 "admission shed request"
             );
-            return Err(Status::unavailable(format!("{scope}; retry shortly")));
+            // Mark the shed so the router treats it as a throttle (neutral),
+            // not a backend fault — see ADMISSION_SHED_MARKER. The marker token
+            // is also in the message as a proxy-robust fallback.
+            let mut shed =
+                Status::unavailable(format!("{ADMISSION_SHED_MARKER}: {scope}; retry shortly"));
+            shed.metadata_mut()
+                .insert(ADMISSION_SHED_MARKER, MetadataValue::from_static("1"));
+            return Err(shed);
         }
 
         // RAII: from here on, any early return releases the reserved slot. We

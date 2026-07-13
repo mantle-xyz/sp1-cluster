@@ -571,6 +571,17 @@ async fn e2e_admission_sheds_over_cap_then_readmits() {
         tonic::Code::Unavailable,
         "expected Unavailable, got {err:?}"
     );
+    // The shed must carry the admission marker (metadata trailer + message
+    // token) so the proof-router settles it neutrally instead of tripping its
+    // circuit breaker and failing over to Succinct.
+    assert!(
+        err.metadata().contains_key("x-sp1-admission-shed"),
+        "shed must carry the x-sp1-admission-shed metadata trailer, got {err:?}"
+    );
+    assert!(
+        err.message().contains("x-sp1-admission-shed"),
+        "shed message must carry the marker token as a proxy-robust fallback, got {err:?}"
+    );
 
     // 3) poll get_proof_request_status for #1 — fake reports Completed, so
     // this observes a terminal Fulfilled verdict and releases #1's slot.
