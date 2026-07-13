@@ -231,10 +231,13 @@ impl AdmissionController {
         }
         e.rank = rank;
         e.last_seen = now;
+        drop(e);
+        self.metric_demand_gauge(pool);
     }
 
     fn clear_demand(&self, pool: PoolId, requester: &[u8]) {
         self.demand.remove(&(pool, requester.to_vec()));
+        self.metric_demand_gauge(pool);
     }
 
     #[cfg(test)]
@@ -482,22 +485,58 @@ impl AdmissionController {
             m.unclassified.inc();
         }
     }
-    /// Reason-aware reject metric. Fleshed out in Task 4 (PriorityYield
-    /// counter); for now maps cap rejects onto the existing counters and
-    /// leaves PriorityYield unmetered.
+    /// Reason-aware reject metric. Cap rejects map onto the existing counters;
+    /// a PriorityYield bumps both the yield-shed counter and the hold-open
+    /// counter (v1: hold_open counts yield events).
     fn metric_reject(&self, pool: PoolId, reason: RejectReason) {
         match reason {
             RejectReason::PoolCap => self.metric_rejected(pool, false),
             RejectReason::GlobalCap => self.metric_rejected(pool, true),
-            RejectReason::PriorityYield => {}
+            RejectReason::PriorityYield => {
+                if let Some(m) = &self.metrics {
+                    m.priority_yielded
+                        .get_or_create(&PoolLabel {
+                            pool: pool.label().into(),
+                        })
+                        .inc();
+                    m.priority_hold_open
+                        .get_or_create(&PoolLabel {
+                            pool: pool.label().into(),
+                        })
+                        .inc();
+                }
+            }
         }
     }
-    /// Dry-run "would reject/yield" metric. Fleshed out in Task 4; for now maps
-    /// cap contention onto the existing would_reject counter.
+    /// Dry-run "would reject/yield" metric. Cap contention maps onto the
+    /// would_reject counter; a would-yield bumps the priority would-yield
+    /// counter.
     fn metric_would(&self, pool: PoolId, reason: RejectReason) {
         match reason {
             RejectReason::PoolCap | RejectReason::GlobalCap => self.metric_would_reject(pool),
-            RejectReason::PriorityYield => {}
+            RejectReason::PriorityYield => {
+                if let Some(m) = &self.metrics {
+                    m.priority_would_yield
+                        .get_or_create(&PoolLabel {
+                            pool: pool.label().into(),
+                        })
+                        .inc();
+                }
+            }
+        }
+    }
+    fn metric_demand_gauge(&self, pool: PoolId) {
+        if let Some(m) = &self.metrics {
+            let n = self
+                .demand
+                .iter()
+                .filter(|e| e.key().0 == pool && e.value().last_seen.elapsed() <= self.priority_ttl)
+                .count();
+            m.priority_demand
+                .get_or_create(&PoolLabel {
+                    pool: pool.label().into(),
+                })
+                .set(n as i64);
         }
     }
 }
@@ -553,6 +592,10 @@ pub struct AdmissionMetrics {
     would_reject: Family<PoolLabel, Counter>,
     reaped: Family<PoolLabel, Counter>,
     unclassified: Counter,
+    priority_yielded: Family<PoolLabel, Counter>,
+    priority_would_yield: Family<PoolLabel, Counter>,
+    priority_demand: Family<PoolLabel, Gauge>,
+    priority_hold_open: Family<PoolLabel, Counter>,
 }
 
 impl AdmissionMetrics {
@@ -566,6 +609,10 @@ impl AdmissionMetrics {
         let would_reject = Family::<PoolLabel, Counter>::default();
         let reaped = Family::<PoolLabel, Counter>::default();
         let unclassified = Counter::default();
+        let priority_yielded = Family::<PoolLabel, Counter>::default();
+        let priority_would_yield = Family::<PoolLabel, Counter>::default();
+        let priority_demand = Family::<PoolLabel, Gauge>::default();
+        let priority_hold_open = Family::<PoolLabel, Counter>::default();
         registry.register(
             "gateway_admission_inflight",
             "In-flight per pool",
@@ -606,6 +653,26 @@ impl AdmissionMetrics {
             "Requests passed through ungated",
             unclassified.clone(),
         );
+        registry.register(
+            "gateway_admission_priority_yielded",
+            "Requests shed by yielding a free slot to a higher-priority proposer, per pool",
+            priority_yielded.clone(),
+        );
+        registry.register(
+            "gateway_admission_priority_would_yield",
+            "Dry-run: requests that WOULD have yielded, per pool",
+            priority_would_yield.clone(),
+        );
+        registry.register(
+            "gateway_admission_priority_demand",
+            "Current fresh priority demanders, per pool",
+            priority_demand.clone(),
+        );
+        registry.register(
+            "gateway_admission_priority_hold_open",
+            "Yield events (a free slot held for a higher-priority proposer), per pool",
+            priority_hold_open.clone(),
+        );
         Self {
             registry,
             inflight,
@@ -616,6 +683,10 @@ impl AdmissionMetrics {
             would_reject,
             reaped,
             unclassified,
+            priority_yielded,
+            priority_would_yield,
+            priority_demand,
+            priority_hold_open,
         }
     }
 
@@ -979,6 +1050,66 @@ mod tests {
         c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err();
         c.release("occ");
         assert!(c.try_acquire("b1", 2, RANGE_VK, BB).is_ok()); // no priority → first wins
+    }
+
+    #[test]
+    fn priority_metrics_render() {
+        let m = Arc::new(AdmissionMetrics::new());
+        let c = prio_ctrl().with_metrics(m.clone());
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err(); // A shed (cap) → demand[A]
+        c.release("occ");
+        c.try_acquire("b1", 2, RANGE_VK, BB).unwrap_err(); // yield
+        let out = m.render();
+        // Assert the SAMPLE lines (label-set present ⇒ get_or_create+inc/set
+        // actually ran), not just the registered `# TYPE` name.
+        assert!(
+            out.contains("gateway_admission_priority_yielded_total{pool=\"range\"} 1"),
+            "yield must have incremented priority_yielded for range:\n{out}"
+        );
+        // Both A (shed on cap) and B (yielded) are fresh Range demanders → 2.
+        assert!(
+            out.contains("gateway_admission_priority_demand{pool=\"range\"} 2"),
+            "demand gauge must reflect the two fresh Range demanders:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dry_run_emits_would_yield_not_yielded() {
+        let m = Arc::new(AdmissionMetrics::new());
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            false,
+            Duration::from_secs(3600), // enforce OFF
+            std::collections::HashMap::from([(AA.to_vec(), 0u32), (BB.to_vec(), 1u32)]),
+            true,
+            Duration::from_secs(90),
+        )
+        .with_metrics(m.clone());
+        // Range cap = 1. Fill it (occ), push A over → dry-run admits but records
+        // demand[A]. Then release BOTH reservations so the pool is back under
+        // cap when B arrives — `release` frees the slot but does NOT clear
+        // demand, so demand[A] persists. B then sees a free slot with a
+        // higher-ranked fresh demander → would_yield (dry-run admits anyway).
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap(); // count 1 (cap 1)
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap(); // over cap → dry-run admit; demand[A]
+        c.release("occ");
+        c.release("a1"); // pool back to 0; demand[A] persists (release ≠ clear_demand)
+        c.try_acquire("b1", 2, RANGE_VK, BB).unwrap(); // slot free + A out-ranks B → would_yield
+        let out = m.render();
+        // Dry-run must emit would_yield (the SAMPLE line, label present)...
+        assert!(
+            out.contains("gateway_admission_priority_would_yield_total{pool=\"range\"} 1"),
+            "dry-run yield must increment priority_would_yield for range:\n{out}"
+        );
+        // ...and must NOT emit an actual yielded sample (enforce is OFF).
+        assert!(
+            !out.contains("gateway_admission_priority_yielded_total{pool=\"range\"}"),
+            "dry-run must not shed: priority_yielded must have no range sample:\n{out}"
+        );
     }
 
     #[test]
