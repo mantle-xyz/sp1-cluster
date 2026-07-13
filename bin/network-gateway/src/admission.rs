@@ -212,11 +212,16 @@ impl AdmissionController {
             *p == pool
                 && addr.as_slice() != requester
                 && d.last_seen.elapsed() <= self.priority_ttl
-                && (d.rank < rank_r || (d.rank == rank_r && d.first_seen < r_first))
+                // u32::MAX = unlisted/default rank: no FCFS among unconfigured proposers
+                && (d.rank < rank_r
+                    || (d.rank == rank_r && rank_r != u32::MAX && d.first_seen < r_first))
         })
     }
 
     fn record_demand(&self, pool: PoolId, requester: &[u8], rank: u32) {
+        if !self.priority_enable {
+            return; // priority OFF → no demand tracking, no demand gauge
+        }
         let now = Instant::now();
         let mut e = self
             .demand
@@ -236,6 +241,9 @@ impl AdmissionController {
     }
 
     fn clear_demand(&self, pool: PoolId, requester: &[u8]) {
+        if !self.priority_enable {
+            return; // priority OFF → no demand tracking, no demand gauge
+        }
         self.demand.remove(&(pool, requester.to_vec()));
         self.metric_demand_gauge(pool);
     }
@@ -1052,6 +1060,51 @@ mod tests {
         c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err();
         c.release("occ");
         assert!(c.try_acquire("b1", 2, RANGE_VK, BB).is_ok()); // no priority → first wins
+    }
+
+    #[test]
+    fn priority_disabled_records_no_demand() {
+        // enforce on, priority OFF: cap sheds must NOT populate the demand map.
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::from([(AA.to_vec(), 0u32), (BB.to_vec(), 1u32)]),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err(); // cap shed
+        assert!(c.demand_is_empty(), "priority-off must not record demand");
+    }
+
+    #[test]
+    fn unconfigured_equal_default_ranks_do_not_yield() {
+        // priority ENABLED but NO ranks configured → two distinct unlisted
+        // proposers must NOT yield a free slot to each other (empty order = no-op).
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(), // empty PRIORITY_ORDER
+            true,
+            Duration::from_secs(90),
+        );
+        let x: &[u8] = &[0x01];
+        let y: &[u8] = &[0x02];
+        c.try_acquire("occ", 2, RANGE_VK, x).unwrap(); // fills cap
+        c.try_acquire("x1", 2, RANGE_VK, x).unwrap_err(); // x shed → demand[x]
+        c.release("occ");
+        assert!(
+            c.try_acquire("y1", 2, RANGE_VK, y).is_ok(),
+            "unconfigured proposer must not yield to another unconfigured one"
+        );
     }
 
     #[test]

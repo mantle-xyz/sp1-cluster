@@ -366,7 +366,9 @@ fn parse_priority_order(
             .trim()
             .parse()
             .with_context(|| format!("PRIORITY_ORDER invalid rank in {s}"))?;
-        map.insert(addr, rank);
+        if map.insert(addr.clone(), rank).is_some() {
+            anyhow::bail!("PRIORITY_ORDER duplicate address: {}", hex::encode(&addr));
+        }
     }
     Ok(map)
 }
@@ -469,6 +471,7 @@ mod tests {
         assert!(parse_priority_order(Some(&["0xZZ:0".to_string()])).is_err()); // bad hex
         assert!(parse_priority_order(Some(&["0x11:notanum".to_string()])).is_err()); // bad rank
         assert!(parse_priority_order(Some(&["0x11".to_string()])).is_err()); // no rank
+        assert!(parse_priority_order(Some(&["0x11:0".to_string(), "0x11:1".to_string()])).is_err()); // duplicate address
         assert!(parse_priority_order(None).unwrap().is_empty());
     }
 }
