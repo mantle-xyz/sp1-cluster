@@ -238,6 +238,11 @@ fn log_admission_config(cfg: &Config) {
             "admission priority enabled but ENFORCE=false — priority is observed only (would_yield metrics); set GATEWAY_ADMISSION_ENFORCE=true to actually hold slots"
         );
     }
+    if cfg.admission_priority_enable && cfg.auth_mode == AuthMode::None {
+        warn!(
+            "admission priority enabled but GATEWAY_AUTH_MODE=none — all requesters collapse to the zero address, so priority cannot distinguish proposers and is a no-op; set GATEWAY_AUTH_MODE=verify"
+        );
+    }
 }
 
 /// Best-effort: classify the cluster's currently-non-terminal (`Pending`)
@@ -323,6 +328,9 @@ pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
     if cfg.admission_slot_ttl_secs == 0 {
         anyhow::bail!("GATEWAY_ADMISSION_SLOT_TTL_SECS must be > 0");
     }
+    if cfg.admission_priority_enable && cfg.admission_priority_ttl_secs == 0 {
+        anyhow::bail!("GATEWAY_ADMISSION_PRIORITY_TTL_SECS must be > 0 when priority is enabled (0 makes every demand instantly stale → priority never fires)");
+    }
     let range_vks = parse_vk_hashes(cfg.admission_range_vk_hashes.as_deref())
         .context("GATEWAY_ADMISSION_RANGE_VK_HASHES")?;
     let agg_vks = parse_vk_hashes(cfg.admission_agg_vk_hashes.as_deref())
@@ -362,6 +370,11 @@ fn parse_priority_order(
             .with_context(|| format!("PRIORITY_ORDER entry missing ':' rank: {s}"))?;
         let addr = hex::decode(addr.trim().trim_start_matches("0x"))
             .with_context(|| format!("PRIORITY_ORDER invalid address {addr}"))?;
+        // Must match the recovered requester width (20-byte Ethereum address),
+        // else a listed rank could never key against a real requester.
+        if addr.len() != 20 {
+            anyhow::bail!("PRIORITY_ORDER address must be 20 bytes: {}", s);
+        }
         let rank: u32 = rank
             .trim()
             .parse()
@@ -460,18 +473,33 @@ mod tests {
 
     #[test]
     fn parse_priority_order_pairs_and_rejects_malformed() {
-        let ok = parse_priority_order(Some(&[
-            "0x1111:0".to_string(),
-            "2222:1".to_string(), // bare hex tolerated
-        ]))
-        .expect("valid");
-        assert_eq!(ok.get(&hex::decode("1111").unwrap()), Some(&0));
-        assert_eq!(ok.get(&hex::decode("2222").unwrap()), Some(&1));
+        let a = format!("0x{}", "11".repeat(20)); // 20-byte address, 0x-prefixed
+        let b = "22".repeat(20); // 20-byte address, bare hex tolerated
+        let ok = parse_priority_order(Some(&[format!("{a}:0"), format!("{b}:1")])).expect("valid");
+        assert_eq!(ok.get(&hex::decode("11".repeat(20)).unwrap()), Some(&0));
+        assert_eq!(ok.get(&hex::decode("22".repeat(20)).unwrap()), Some(&1));
 
         assert!(parse_priority_order(Some(&["0xZZ:0".to_string()])).is_err()); // bad hex
-        assert!(parse_priority_order(Some(&["0x11:notanum".to_string()])).is_err()); // bad rank
-        assert!(parse_priority_order(Some(&["0x11".to_string()])).is_err()); // no rank
-        assert!(parse_priority_order(Some(&["0x11:0".to_string(), "0x11:1".to_string()])).is_err()); // duplicate address
+                                                                               // wrong length: 20-byte addresses required, a short one is rejected
+        assert!(parse_priority_order(Some(&["0x1111:0".to_string()])).is_err());
+        assert!(parse_priority_order(Some(&[format!("{a}:notanum")])).is_err()); // bad rank
+        assert!(parse_priority_order(Some(std::slice::from_ref(&a))).is_err()); // no rank
+        assert!(parse_priority_order(Some(&[format!("{a}:0"), format!("{a}:1")])).is_err()); // duplicate address
         assert!(parse_priority_order(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_admission_rejects_zero_priority_ttl_when_enabled() {
+        // A zero priority TTL makes every demand instantly stale → priority
+        // never fires. Reject at boot when priority is enabled.
+        let mut cfg = base_cfg();
+        cfg.admission_priority_enable = true;
+        cfg.admission_priority_ttl_secs = 0;
+        assert!(build_admission(&cfg).is_err());
+        // ...but a zero TTL is harmless (ignored) while priority is disabled.
+        let mut cfg_off = base_cfg();
+        cfg_off.admission_priority_enable = false;
+        cfg_off.admission_priority_ttl_secs = 0;
+        assert!(build_admission(&cfg_off).is_ok());
     }
 }

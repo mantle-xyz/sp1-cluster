@@ -157,6 +157,16 @@ pub struct AdmissionController {
     classifier: Classifier,
     metrics: Option<Arc<AdmissionMetrics>>,
     priorities: std::collections::HashMap<Vec<u8>, u32>,
+    /// Outstanding demand for a pool slot, keyed per `(pool, requester)` — i.e.
+    /// ONE priority identity per proposer. A proposer pipelining multiple
+    /// requests shares a single demand entry, and a clean admit of any one of
+    /// them clears it (it is re-recorded on the next shed). This is intentional:
+    /// a proposer is a single priority actor, not one actor per in-flight
+    /// request.
+    ///
+    /// Lock discipline: demand writes happen under the `counts` lock (order
+    /// counts→demand), making the counter decision and the demand update atomic.
+    /// No path may take `counts` while holding a `demand` guard.
     demand: DashMap<(PoolId, Vec<u8>), Demand>,
     priority_enable: bool,
     priority_ttl: Duration,
@@ -273,16 +283,15 @@ impl AdmissionController {
         };
         let rank_r = self.rank_of(requester);
 
-        // Under the counts lock: decide over-cap / would-yield and, if we admit,
-        // increment. `demand` is only *read* here (via `out_ranked`, O(#proposers));
-        // demand *writes* happen after the guard is dropped, below.
-        enum Outcome {
-            /// Admitted but contended (dry-run over-cap/yield): keep demand.
-            AdmitContended,
-            /// Clean admit: clear demand.
-            AdmitClean,
-        }
-        let outcome = {
+        // Under the counts lock: decide over-cap / would-yield, increment if we
+        // admit, AND write demand — all atomically. `demand` is read here (via
+        // `out_ranked`, O(#proposers)) and written here (record/clear_demand),
+        // both under the `counts` lock so the counter decision and the demand
+        // update can't be reordered against a concurrent try_acquire from the
+        // same proposer (which would otherwise cause phantom demand or lost FCFS
+        // seniority). Lock order is always counts→demand; no path takes `counts`
+        // while holding a `demand` guard, so this stays deadlock-free.
+        {
             let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
             let pool_over = c.get(pool) >= self.caps.get(pool);
             let global_over = self.global_cap.is_some_and(|g| c.total() >= g);
@@ -302,32 +311,34 @@ impl AdmissionController {
             };
             match reason {
                 Some(reason) if self.enforce => {
-                    drop(c);
+                    // Shed: record demand while still under `counts` so the
+                    // counter decision and the demand write are atomic.
                     self.record_demand(pool, requester, rank_r);
+                    drop(c);
                     self.metric_reject(pool, reason);
                     return Err(Rejection { pool, reason });
                 }
                 Some(reason) => {
-                    // dry-run: admit but count + flag the contention.
+                    // dry-run: admit but count + flag the contention, keeping
+                    // (recording) demand atomically under `counts`.
                     self.metric_would(pool, reason);
                     *c.get_mut(pool) += 1;
                     self.set_gauges(pool, c.get(pool), c.total());
-                    Outcome::AdmitContended
+                    self.record_demand(pool, requester, rank_r);
                 }
                 None => {
+                    // Clean admit: clear demand atomically under `counts`.
                     *c.get_mut(pool) += 1;
                     self.set_gauges(pool, c.get(pool), c.total());
-                    Outcome::AdmitClean
+                    self.clear_demand(pool, requester);
                 }
             }
-        };
+        }
         // Reserve the slot (dry-run reserves too, so release stays symmetric).
+        // `slots` is not part of the counter/demand race, so it stays outside the
+        // `counts` critical section.
         self.slots
             .insert(proof_id.to_string(), (pool, Instant::now()));
-        match outcome {
-            Outcome::AdmitClean => self.clear_demand(pool, requester),
-            Outcome::AdmitContended => self.record_demand(pool, requester, rank_r),
-        }
         self.metric_admitted(pool);
         Ok(())
     }
@@ -417,6 +428,11 @@ impl AdmissionController {
         }
         self.demand
             .retain(|_, d| d.last_seen.elapsed() <= self.priority_ttl);
+        // Refresh the demand gauge for both pools so a demander that just went
+        // stale is reflected. `metric_demand_gauge` is a no-op when metrics is
+        // None, and takes no `counts` lock — safe from the reaper task.
+        self.metric_demand_gauge(PoolId::Range);
+        self.metric_demand_gauge(PoolId::Agg);
     }
 
     /// In-flight for a pool (test/observability accessor).
@@ -1121,6 +1137,12 @@ mod tests {
         assert!(
             out.contains("gateway_admission_priority_yielded_total{pool=\"range\"} 1"),
             "yield must have incremented priority_yielded for range:\n{out}"
+        );
+        // A yield bumps hold_open in lockstep with yielded (v1: hold_open counts
+        // yield events), so its sample line must be present for the yielded pool.
+        assert!(
+            out.contains("gateway_admission_priority_hold_open_total{pool=\"range\"}"),
+            "yield must have incremented priority_hold_open for range:\n{out}"
         );
         // Both A (shed on cap) and B (yielded) are fresh Range demanders → 2.
         assert!(
