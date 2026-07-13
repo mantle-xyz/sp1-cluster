@@ -305,6 +305,9 @@ async fn spawn_gateway_stack(
         admission_agg_vk_hashes: None,
         admission_reap_period_secs: 60,
         admission_slot_ttl_secs: 3600,
+        admission_priority_enable: false,
+        admission_priority_order: None,
+        admission_priority_ttl_secs: 90,
     };
     admission_overrides(&mut cfg);
     let program_store: Arc<dyn ProgramStore> = Arc::new(InMemoryProgramStore::new());

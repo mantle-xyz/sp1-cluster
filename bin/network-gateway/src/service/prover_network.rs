@@ -244,7 +244,8 @@ where
             .admission
             .try_acquire(&proof_id, body.mode, &body.vk_hash)
         {
-            let scope = if rej.global {
+            let global = matches!(rej.reason, crate::admission::RejectReason::GlobalCap);
+            let scope = if global {
                 "self-hosted backend at global capacity".to_string()
             } else {
                 format!("self-hosted {} proof pool at capacity", rej.pool.label())
@@ -252,7 +253,7 @@ where
             tracing::warn!(
                 proof_id,
                 pool = rej.pool.label(),
-                global = rej.global,
+                global,
                 "admission shed request"
             );
             // Mark the shed so the router treats it as a throttle (neutral),
@@ -1533,6 +1534,9 @@ mod tests {
             None,
             true,
             std::time::Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            std::time::Duration::from_secs(90),
         ))
     }
 
@@ -1768,6 +1772,9 @@ mod tests {
             None,
             true,
             std::time::Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            std::time::Duration::from_secs(90),
         ));
         admission
             .try_acquire("req_preoccupied", 2, &[0xaa; 4])

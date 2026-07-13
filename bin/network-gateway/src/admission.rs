@@ -13,7 +13,7 @@
 //! known proof shapes, not an allowlist, and it must never silently block an
 //! unconfigured request type.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,12 +45,37 @@ impl PoolId {
     }
 }
 
-/// Why `try_acquire` rejected in enforce mode. `global` is true when the GLOBAL
-/// cap (not the pool cap) was the binding constraint.
+/// Why a request was (or would be) shed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Pool concurrency cap reached.
+    PoolCap,
+    /// Global cross-pool cap reached.
+    GlobalCap,
+    /// A free slot was held for a higher-priority (or earlier equal-rank) proposer.
+    PriorityYield,
+}
+
+/// Why `try_acquire` rejected in enforce mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rejection {
     pub pool: PoolId,
-    pub global: bool,
+    pub reason: RejectReason,
+}
+
+/// A proposer's outstanding demand for a pool slot (drives priority + FCFS).
+struct Demand {
+    // used in Task 3
+    #[allow(dead_code)]
+    rank: u32,
+    /// when this waiting-spell began — FCFS tie-break
+    // used in Task 3
+    #[allow(dead_code)]
+    first_seen: Instant,
+    /// most recent shed — freshness
+    // used in Task 3
+    #[allow(dead_code)]
+    last_seen: Instant,
 }
 
 /// Maps a request to a pool by `vk_hash` (primary) then proof `mode` (fallback).
@@ -137,6 +162,18 @@ pub struct AdmissionController {
     ttl: Duration,
     classifier: Classifier,
     metrics: Option<Arc<AdmissionMetrics>>,
+    // used in Task 3
+    #[allow(dead_code)]
+    priorities: std::collections::HashMap<Vec<u8>, u32>,
+    // used in Task 3
+    #[allow(dead_code)]
+    demand: DashMap<(PoolId, Vec<u8>), Demand>,
+    // used in Task 3
+    #[allow(dead_code)]
+    priority_enable: bool,
+    // used in Task 3
+    #[allow(dead_code)]
+    priority_ttl: Duration,
 }
 
 impl AdmissionController {
@@ -148,6 +185,9 @@ impl AdmissionController {
         global_cap: Option<usize>,
         enforce: bool,
         ttl: Duration,
+        priorities: HashMap<Vec<u8>, u32>,
+        priority_enable: bool,
+        priority_ttl: Duration,
     ) -> Self {
         Self {
             caps: PerPool {
@@ -161,7 +201,17 @@ impl AdmissionController {
             ttl,
             classifier,
             metrics: None,
+            priorities,
+            demand: DashMap::new(),
+            priority_enable,
+            priority_ttl,
         }
+    }
+
+    // used in Task 3
+    #[allow(dead_code)]
+    fn rank_of(&self, requester: &[u8]) -> u32 {
+        self.priorities.get(requester).copied().unwrap_or(u32::MAX)
     }
 
     /// Classify + cap-check + reserve a slot keyed by `proof_id`.
@@ -185,7 +235,14 @@ impl AdmissionController {
                 let global = global_over && !pool_over;
                 drop(c);
                 self.metric_rejected(pool, global);
-                return Err(Rejection { pool, global });
+                return Err(Rejection {
+                    pool,
+                    reason: if global {
+                        RejectReason::GlobalCap
+                    } else {
+                        RejectReason::PoolCap
+                    },
+                });
             }
             *c.get_mut(pool) += 1;
             self.set_gauges(pool, c.get(pool), c.total());
@@ -539,7 +596,34 @@ mod tests {
     }
 
     fn enforce_ctrl() -> AdmissionController {
-        AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_secs(3600))
+        AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        )
+    }
+
+    #[test]
+    fn rank_of_uses_config_then_default() {
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::from([(vec![0xAAu8], 0u32)]),
+            false,
+            Duration::from_secs(90),
+        );
+        assert_eq!(c.rank_of(&[0xAA]), 0);
+        assert_eq!(c.rank_of(&[0xBB]), u32::MAX);
     }
 
     #[test]
@@ -551,7 +635,7 @@ mod tests {
             c.try_acquire("p2", 2, RANGE_VK).unwrap_err(),
             Rejection {
                 pool: PoolId::Range,
-                global: false
+                reason: RejectReason::PoolCap
             }
         );
     }
@@ -568,8 +652,17 @@ mod tests {
 
     #[test]
     fn dry_run_admits_over_cap() {
-        let c =
-            AdmissionController::new(classifier(), 1, 2, None, false, Duration::from_secs(3600));
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            false,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
         c.try_acquire("p1", 2, RANGE_VK).unwrap();
         assert!(c.try_acquire("p2", 2, RANGE_VK).is_ok()); // over cap, dry-run admits
         assert_eq!(c.in_flight(PoolId::Range), 2);
@@ -585,21 +678,40 @@ mod tests {
 
     #[test]
     fn global_cap_serialises_pools() {
-        let c =
-            AdmissionController::new(classifier(), 2, 2, Some(1), true, Duration::from_secs(3600));
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            Some(1),
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
         c.try_acquire("p1", 2, RANGE_VK).unwrap(); // takes the 1 global slot
         assert_eq!(
             c.try_acquire("p2", 3, AGG_VK).unwrap_err(),
             Rejection {
                 pool: PoolId::Agg,
-                global: true
+                reason: RejectReason::GlobalCap
             } // agg pool had room; global full
         );
     }
 
     #[test]
     fn reaper_reclaims_expired() {
-        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_millis(30));
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_millis(30),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
         c.try_acquire("p1", 2, RANGE_VK).unwrap();
         c.reap();
         assert_eq!(c.in_flight(PoolId::Range), 1); // not yet expired
@@ -610,7 +722,17 @@ mod tests {
 
     #[test]
     fn touch_prevents_reap_of_polled_slot() {
-        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_millis(30));
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_millis(30),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
         c.try_acquire("p1", 2, RANGE_VK).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         c.touch("p1"); // still being polled → refresh
@@ -632,7 +754,17 @@ mod tests {
 
     #[test]
     fn touch_absent_slot_is_noop() {
-        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_secs(3600));
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
         c.touch("nope"); // no panic, no effect
         assert_eq!(c.in_flight(PoolId::Range), 0);
     }
@@ -655,8 +787,18 @@ mod tests {
     #[test]
     fn metrics_render_reflects_state() {
         let m = Arc::new(AdmissionMetrics::new());
-        let c = AdmissionController::new(classifier(), 1, 2, None, true, Duration::from_secs(3600))
-            .with_metrics(m.clone());
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        )
+        .with_metrics(m.clone());
         c.try_acquire("p1", 2, RANGE_VK).unwrap();
         let _ = c.try_acquire("p2", 2, RANGE_VK); // rejected
         let out = m.render();

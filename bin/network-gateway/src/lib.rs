@@ -317,6 +317,8 @@ pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
     let agg_vks = parse_vk_hashes(cfg.admission_agg_vk_hashes.as_deref())
         .context("GATEWAY_ADMISSION_AGG_VK_HASHES")?;
     let classifier = Classifier::new(range_vks, agg_vks);
+    let priorities = parse_priority_order(cfg.admission_priority_order.as_deref())
+        .context("GATEWAY_ADMISSION_PRIORITY_ORDER")?;
     Ok(AdmissionController::new(
         classifier,
         cfg.admission_range_max_inflight,
@@ -324,13 +326,14 @@ pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
         cfg.admission_global_max_inflight,
         cfg.admission_enforce,
         std::time::Duration::from_secs(cfg.admission_slot_ttl_secs),
+        priorities,
+        cfg.admission_priority_enable,
+        std::time::Duration::from_secs(cfg.admission_priority_ttl_secs),
     ))
 }
 
 /// Parse `0xADDR:RANK` pairs into a requester→rank map. Lower rank = higher
 /// priority; missing entries default to lowest at lookup time.
-// wired in a later task
-#[allow(dead_code)]
 fn parse_priority_order(
     input: Option<&[String]>,
 ) -> Result<std::collections::HashMap<Vec<u8>, u32>> {
