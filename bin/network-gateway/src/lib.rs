@@ -327,6 +327,36 @@ pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
     ))
 }
 
+/// Parse `0xADDR:RANK` pairs into a requester→rank map. Lower rank = higher
+/// priority; missing entries default to lowest at lookup time.
+// wired in a later task
+#[allow(dead_code)]
+fn parse_priority_order(
+    input: Option<&[String]>,
+) -> Result<std::collections::HashMap<Vec<u8>, u32>> {
+    let Some(entries) = input else {
+        return Ok(Default::default());
+    };
+    let mut map = std::collections::HashMap::new();
+    for raw in entries {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let (addr, rank) = s
+            .split_once(':')
+            .with_context(|| format!("PRIORITY_ORDER entry missing ':' rank: {s}"))?;
+        let addr = hex::decode(addr.trim().trim_start_matches("0x"))
+            .with_context(|| format!("PRIORITY_ORDER invalid address {addr}"))?;
+        let rank: u32 = rank
+            .trim()
+            .parse()
+            .with_context(|| format!("PRIORITY_ORDER invalid rank in {s}"))?;
+        map.insert(addr, rank);
+    }
+    Ok(map)
+}
+
 fn parse_vk_hashes(input: Option<&[String]>) -> Result<std::collections::HashSet<Vec<u8>>> {
     let Some(entries) = input else {
         return Ok(Default::default());
@@ -410,5 +440,21 @@ mod tests {
         let mut cfg = base_cfg();
         cfg.admission_slot_ttl_secs = 0;
         assert!(build_admission(&cfg).is_err());
+    }
+
+    #[test]
+    fn parse_priority_order_pairs_and_rejects_malformed() {
+        let ok = parse_priority_order(Some(&[
+            "0x1111:0".to_string(),
+            "2222:1".to_string(), // bare hex tolerated
+        ]))
+        .expect("valid");
+        assert_eq!(ok.get(&hex::decode("1111").unwrap()), Some(&0));
+        assert_eq!(ok.get(&hex::decode("2222").unwrap()), Some(&1));
+
+        assert!(parse_priority_order(Some(&["0xZZ:0".to_string()])).is_err()); // bad hex
+        assert!(parse_priority_order(Some(&["0x11:notanum".to_string()])).is_err()); // bad rank
+        assert!(parse_priority_order(Some(&["0x11".to_string()])).is_err()); // no rank
+        assert!(parse_priority_order(None).unwrap().is_empty());
     }
 }

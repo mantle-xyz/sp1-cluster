@@ -122,4 +122,29 @@ pub struct Config {
     /// any realistic SDK poll backoff.
     #[arg(long, env = "GATEWAY_ADMISSION_SLOT_TTL_SECS", default_value_t = 3600)]
     pub admission_slot_ttl_secs: u64,
+
+    /// Enable priority-aware slot allocation (requires ENFORCE to actually
+    /// hold; in dry-run it only emits `would_yield`). Default off.
+    #[arg(
+        long,
+        env = "GATEWAY_ADMISSION_PRIORITY_ENABLE",
+        default_value_t = false
+    )]
+    pub admission_priority_enable: bool,
+
+    /// Per-proposer priority ranks: comma-separated `0xADDR:RANK` pairs. Lower
+    /// rank = higher priority; ties allowed (equal rank → first-come-first-served
+    /// among fresh demanders). Requesters not listed get the lowest priority.
+    #[arg(long, env = "GATEWAY_ADMISSION_PRIORITY_ORDER", value_delimiter = ',')]
+    pub admission_priority_order: Option<Vec<String>>,
+
+    /// Priority demand freshness / max hold-open idle (seconds). A demander is
+    /// "still waiting" while it retried within this window; a held slot idles at
+    /// most this long waiting for a higher-priority retry. Default 90.
+    #[arg(
+        long,
+        env = "GATEWAY_ADMISSION_PRIORITY_TTL_SECS",
+        default_value_t = 90
+    )]
+    pub admission_priority_ttl_secs: u64,
 }
