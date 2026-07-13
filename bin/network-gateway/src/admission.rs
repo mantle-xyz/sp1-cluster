@@ -407,6 +407,8 @@ impl AdmissionController {
                 "admission reaper reclaimed leaked slots (a release was likely missed or a proof was abandoned)"
             );
         }
+        self.demand
+            .retain(|_, d| d.last_seen.elapsed() <= self.priority_ttl);
     }
 
     /// In-flight for a pool (test/observability accessor).
@@ -1110,6 +1112,27 @@ mod tests {
             !out.contains("gateway_admission_priority_yielded_total{pool=\"range\"}"),
             "dry-run must not shed: priority_yielded must have no range sample:\n{out}"
         );
+    }
+
+    #[test]
+    fn reap_drops_stale_demand() {
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::from([(AA.to_vec(), 0u32)]),
+            true,
+            Duration::from_millis(20),
+        );
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err(); // records demand[AA]
+        assert!(!c.demand_is_empty());
+        std::thread::sleep(Duration::from_millis(35));
+        c.reap();
+        assert!(c.demand_is_empty(), "stale demand must be reaped");
     }
 
     #[test]
