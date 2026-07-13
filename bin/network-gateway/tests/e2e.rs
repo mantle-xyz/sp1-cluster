@@ -20,7 +20,8 @@ use sp1_cluster_common::{
     },
 };
 use sp1_cluster_network_gateway::{
-    auth::Auth,
+    auth::AuthMode,
+    build_auth,
     config::Config,
     program_store::{InMemoryProgramStore, ProgramStore},
     serve,
@@ -310,6 +311,11 @@ async fn spawn_gateway_stack(
         admission_priority_ttl_secs: 90,
     };
     admission_overrides(&mut cfg);
+    // Build `Auth` from the (possibly-overridden) config so tests can exercise
+    // `AuthMode::Verify` end-to-end. With the default `AuthMode::None` this is
+    // identical to the previous `Auth::default()`, leaving existing tests
+    // unaffected.
+    let auth = build_auth(&cfg).expect("build_auth");
     let program_store: Arc<dyn ProgramStore> = Arc::new(InMemoryProgramStore::new());
     let (gw_grpc_shutdown_tx, gw_grpc_shutdown_rx) = oneshot::channel::<()>();
     let (gw_http_shutdown_tx, gw_http_shutdown_rx) = oneshot::channel::<()>();
@@ -319,7 +325,7 @@ async fn spawn_gateway_stack(
             cfg,
             gateway_artifacts,
             cluster,
-            Auth::default(),
+            auth,
             program_store,
             async move {
                 gw_grpc_shutdown_rx.await.ok();
@@ -1056,6 +1062,246 @@ async fn e2e_admission_touch_keeps_polled_slot() {
         tonic::Code::Unavailable,
         "expected Unavailable, got {err:?}"
     );
+
+    stack.shutdown().await;
+}
+
+/// Sign the encoded proto `body` (the exact bytes the gateway feeds to
+/// `Auth::authorize`) with `signer`, yielding a 65-byte `[r||s||v]` EIP-191
+/// signature. Mirrors sp1-sdk's `NetworkProver` signing of `request_proof` /
+/// `create_program` bodies.
+fn sign_body(body: &impl prost::Message, signer: &alloy_signer_local::PrivateKeySigner) -> Vec<u8> {
+    use alloy_signer::SignerSync;
+    signer
+        .sign_message_sync(&body.encode_to_vec())
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+}
+
+/// The fixed message `create_artifact` authenticates over (see
+/// `ArtifactStoreImpl`'s `CREATE_ARTIFACT_MESSAGE`). Unlike the proto-body RPCs,
+/// this signs a constant string, not the request body.
+fn sign_create_artifact(signer: &alloy_signer_local::PrivateKeySigner) -> Vec<u8> {
+    use alloy_signer::SignerSync;
+    signer
+        .sign_message_sync(b"create_artifact")
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+}
+
+/// `create_artifact` + HTTP PUT, signed for `AuthMode::Verify`. Same as
+/// [`create_artifact_put`] but carries the fixed-message signature so the
+/// gateway can recover a requester instead of rejecting with Unauthenticated.
+async fn create_artifact_put_signed(
+    artifact_rpc: &mut ArtifactStoreClient<Channel>,
+    http: &reqwest::Client,
+    artifact_type: SdkArtifactType,
+    raw: &[u8],
+    signer: &alloy_signer_local::PrivateKeySigner,
+) -> String {
+    let req = CreateArtifactRequest {
+        artifact_type: artifact_type as i32,
+        signature: sign_create_artifact(signer),
+    };
+    let resp = artifact_rpc
+        .create_artifact(req)
+        .await
+        .unwrap()
+        .into_inner();
+    let bincoded = bincode::serialize(raw).unwrap();
+    let compressed = zstd::encode_all(bincoded.as_slice(), 3).unwrap();
+    let put = http
+        .put(&resp.artifact_presigned_url)
+        .body(compressed)
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status().is_success(), "PUT failed: {}", put.status());
+    resp.artifact_uri
+}
+
+/// Register a program under `vk_hash` with all RPCs signed by `signer` (needed
+/// under `AuthMode::Verify`). Program bytes aren't priority-gated, so any valid
+/// signer works.
+async fn register_program_signed(
+    stack: &mut GatewayStack,
+    vk_hash: &[u8],
+    signer: &alloy_signer_local::PrivateKeySigner,
+) {
+    let elf_bytes = b"fake-elf-bytes".to_vec();
+    let program_uri = create_artifact_put_signed(
+        &mut stack.artifact_rpc,
+        &stack.http,
+        SdkArtifactType::Program,
+        &elf_bytes,
+        signer,
+    )
+    .await;
+    let body = CreateProgramRequestBody {
+        nonce: 0,
+        vk_hash: vk_hash.to_vec(),
+        vk: b"fake-vk".to_vec(),
+        program_uri,
+    };
+    let signature = sign_body(&body, signer);
+    stack
+        .network_rpc
+        .create_program(CreateProgramRequest {
+            format: MessageFormat::Binary as i32,
+            signature,
+            body: Some(body),
+        })
+        .await
+        .unwrap();
+}
+
+/// Build a fresh Compressed (Range-pool) `request_proof` body reusing a shared
+/// `stdin_uri`. Each server-side call still mints its own random request_id
+/// (i.e. its own admission slot), so the stdin artifact can be shared.
+fn compressed_body_with_stdin(vk_hash: &[u8], stdin_uri: &str) -> RequestProofRequestBody {
+    RequestProofRequestBody {
+        nonce: 0,
+        vk_hash: vk_hash.to_vec(),
+        version: "test".into(),
+        mode: ProofMode::Compressed as i32,
+        strategy: 2, // Reserved
+        stdin_uri: stdin_uri.to_string(),
+        deadline: u64::MAX,
+        cycle_limit: 0,
+        gas_limit: 0,
+        min_auction_period: 0,
+        whitelist: vec![],
+    }
+}
+
+/// Send a `request_proof` signed by `signer` (so the gateway recovers that
+/// proposer's address under `AuthMode::Verify`). Returns the minted request_id
+/// on success, or the raw `tonic::Status` so callers can assert on the shed
+/// code/metadata/message.
+async fn send_request_proof_signed(
+    stack: &mut GatewayStack,
+    body: RequestProofRequestBody,
+    signer: &alloy_signer_local::PrivateKeySigner,
+) -> Result<Vec<u8>, tonic::Status> {
+    let signature = sign_body(&body, signer);
+    let resp = stack
+        .network_rpc
+        .request_proof(RequestProofRequest {
+            format: MessageFormat::Binary as i32,
+            signature,
+            body: Some(body),
+        })
+        .await?;
+    Ok(resp.into_inner().body.expect("body").request_id)
+}
+
+/// Priority-aware admission, end-to-end over gRPC under `AuthMode::Verify`:
+/// when the sole Range slot frees and a higher-ranked proposer has fresh
+/// demand, a lower-ranked proposer is YIELDED (shed as Unavailable) and the
+/// higher-ranked one wins the slot. This is the e2e mirror of the unit test
+/// `higher_rank_fresh_demand_makes_lower_yield_even_with_free_slot`.
+#[tokio::test]
+async fn e2e_admission_priority_admits_higher_rank() {
+    use alloy_signer_local::PrivateKeySigner;
+
+    let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
+
+    // `hi` is rank 0 (highest priority), `lo` is rank 1.
+    let hi = PrivateKeySigner::random();
+    let lo = PrivateKeySigner::random();
+    let hi_addr = hi.address();
+    let lo_addr = lo.address();
+
+    let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
+        cfg.auth_mode = AuthMode::Verify;
+        cfg.admission_enforce = true;
+        cfg.admission_range_max_inflight = 1;
+        cfg.admission_priority_enable = true;
+        // `{:x}` renders the 20-byte address as 40 lowercase hex chars (no 0x);
+        // the parser hex-decodes it and compares against the recovered signer.
+        cfg.admission_priority_order =
+            Some(vec![format!("{hi_addr:x}:0"), format!("{lo_addr:x}:1")]);
+        cfg.admission_priority_ttl_secs = 3600;
+    })
+    .await;
+
+    // ---- register a program + one shared stdin artifact (signed by `hi`) ----
+    let vk_hash = vec![0xd5; 32];
+    register_program_signed(&mut stack, &vk_hash, &hi).await;
+    let stdin_uri = create_artifact_put_signed(
+        &mut stack.artifact_rpc,
+        &stack.http,
+        SdkArtifactType::Stdin,
+        b"fake-stdin",
+        &hi,
+    )
+    .await;
+
+    // 1) `lo` requests → admitted, holding the sole Range slot. Not polled, so
+    // the slot stays reserved (the fake marks it Completed on create, but the
+    // gate only releases on a terminal status poll).
+    let lo_body_1 = compressed_body_with_stdin(&vk_hash, &stdin_uri);
+    let lo_req_1 = send_request_proof_signed(&mut stack, lo_body_1, &lo)
+        .await
+        .expect("lo admitted: Range pool empty");
+    assert!(!lo_req_1.is_empty());
+
+    // 2) `hi` requests → shed on PoolCap (slot held by `lo`). This records
+    // fresh demand for `hi`, which is what makes the later yield fire.
+    let hi_body_1 = compressed_body_with_stdin(&vk_hash, &stdin_uri);
+    let err = send_request_proof_signed(&mut stack, hi_body_1, &hi)
+        .await
+        .expect_err("hi shed: Range pool at cap");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unavailable,
+        "expected Unavailable (PoolCap), got {err:?}"
+    );
+
+    // 3) poll status for `lo`'s request → terminal Fulfilled → releases the slot.
+    let status = stack
+        .network_rpc
+        .get_proof_request_status(GetProofRequestStatusRequest {
+            request_id: lo_req_1.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        status.fulfillment_status,
+        FulfillmentStatus::Fulfilled as i32
+    );
+
+    // 4) `lo` requests again → the slot is now FREE, but `hi` (rank 0) has fresh
+    // demand and out-ranks `lo` (rank 1), so `lo` must YIELD. The shed must
+    // carry the admission marker (so the router stays neutral) and name the
+    // higher-priority hold in its message.
+    let lo_body_2 = compressed_body_with_stdin(&vk_hash, &stdin_uri);
+    let yield_err = send_request_proof_signed(&mut stack, lo_body_2, &lo)
+        .await
+        .expect_err("lo must yield the freed slot to higher-ranked hi");
+    assert_eq!(
+        yield_err.code(),
+        tonic::Code::Unavailable,
+        "expected Unavailable (PriorityYield), got {yield_err:?}"
+    );
+    assert!(
+        yield_err.metadata().contains_key("x-sp1-admission-shed"),
+        "yield must carry the x-sp1-admission-shed metadata trailer, got {yield_err:?}"
+    );
+    assert!(
+        yield_err.message().contains("higher-priority"),
+        "yield message must name the higher-priority hold, got {yield_err:?}"
+    );
+
+    // 5) `hi` requests → wins the freed slot it was holding out for.
+    let hi_body_2 = compressed_body_with_stdin(&vk_hash, &stdin_uri);
+    let hi_req_2 = send_request_proof_signed(&mut stack, hi_body_2, &hi)
+        .await
+        .expect("hi wins the freed slot");
+    assert!(!hi_req_2.is_empty());
 
     stack.shutdown().await;
 }
