@@ -21,6 +21,17 @@ use tracing::info;
 /// `ADMISSION_SHED_MARKER`).
 const ADMISSION_SHED_MARKER: &str = "x-sp1-admission-shed";
 
+/// Build the marked `Unavailable` used for every admission shed (capacity AND
+/// priority yield). The `x-sp1-admission-shed` marker (trailer + message prefix)
+/// is what the proof-router keys on to treat the shed as a neutral throttle, so
+/// there must be exactly ONE shed constructor — see backend.rs `is_admission_shed`.
+fn admission_shed_status(scope: &str) -> Status {
+    let mut st = Status::unavailable(format!("{ADMISSION_SHED_MARKER}: {scope}; retry shortly"));
+    st.metadata_mut()
+        .insert(ADMISSION_SHED_MARKER, MetadataValue::from_static("1"));
+    st
+}
+
 use crate::auth::Auth;
 use crate::ids::{
     artifact_id_from_uri, artifact_uri, mint_request_id, program_artifact_id,
@@ -244,26 +255,28 @@ where
             self.admission
                 .try_acquire(&proof_id, body.mode, &body.vk_hash, requester.as_slice())
         {
-            let global = matches!(rej.reason, crate::admission::RejectReason::GlobalCap);
-            let scope = if global {
-                "self-hosted backend at global capacity".to_string()
-            } else {
-                format!("self-hosted {} proof pool at capacity", rej.pool.label())
+            let scope = match rej.reason {
+                crate::admission::RejectReason::GlobalCap => {
+                    "self-hosted backend at global capacity".to_string()
+                }
+                crate::admission::RejectReason::PoolCap => {
+                    format!("self-hosted {} proof pool at capacity", rej.pool.label())
+                }
+                crate::admission::RejectReason::PriorityYield => format!(
+                    "self-hosted {} slot held for a higher-priority proposer",
+                    rej.pool.label()
+                ),
             };
             tracing::warn!(
                 proof_id,
                 pool = rej.pool.label(),
-                global,
+                reason = ?rej.reason,
                 "admission shed request"
             );
             // Mark the shed so the router treats it as a throttle (neutral),
             // not a backend fault — see ADMISSION_SHED_MARKER. The marker token
             // is also in the message as a proxy-robust fallback.
-            let mut shed =
-                Status::unavailable(format!("{ADMISSION_SHED_MARKER}: {scope}; retry shortly"));
-            shed.metadata_mut()
-                .insert(ADMISSION_SHED_MARKER, MetadataValue::from_static("1"));
-            return Err(shed);
+            return Err(admission_shed_status(&scope));
         }
 
         // RAII: from here on, any early return releases the reserved slot. We
