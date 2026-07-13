@@ -240,9 +240,9 @@ where
         // Admission gate: shed overflow before it reaches the shared cluster.
         // Keyed by the proof_id we just minted (single-phase — the id is known
         // before the cluster create). Ungated requests take no slot.
-        if let Err(rej) = self
-            .admission
-            .try_acquire(&proof_id, body.mode, &body.vk_hash)
+        if let Err(rej) =
+            self.admission
+                .try_acquire(&proof_id, body.mode, &body.vk_hash, requester.as_slice())
         {
             let global = matches!(rej.reason, crate::admission::RejectReason::GlobalCap);
             let scope = if global {
@@ -1777,7 +1777,7 @@ mod tests {
             std::time::Duration::from_secs(90),
         ));
         admission
-            .try_acquire("req_preoccupied", 2, &[0xaa; 4])
+            .try_acquire("req_preoccupied", 2, &[0xaa; 4], &[0x01])
             .unwrap(); // fill Range cap 1
 
         let svc = mk_with_admission(admission.clone());

@@ -65,16 +65,10 @@ pub struct Rejection {
 
 /// A proposer's outstanding demand for a pool slot (drives priority + FCFS).
 struct Demand {
-    // used in Task 3
-    #[allow(dead_code)]
     rank: u32,
     /// when this waiting-spell began — FCFS tie-break
-    // used in Task 3
-    #[allow(dead_code)]
     first_seen: Instant,
     /// most recent shed — freshness
-    // used in Task 3
-    #[allow(dead_code)]
     last_seen: Instant,
 }
 
@@ -162,17 +156,9 @@ pub struct AdmissionController {
     ttl: Duration,
     classifier: Classifier,
     metrics: Option<Arc<AdmissionMetrics>>,
-    // used in Task 3
-    #[allow(dead_code)]
     priorities: std::collections::HashMap<Vec<u8>, u32>,
-    // used in Task 3
-    #[allow(dead_code)]
     demand: DashMap<(PoolId, Vec<u8>), Demand>,
-    // used in Task 3
-    #[allow(dead_code)]
     priority_enable: bool,
-    // used in Task 3
-    #[allow(dead_code)]
     priority_ttl: Duration,
 }
 
@@ -208,10 +194,52 @@ impl AdmissionController {
         }
     }
 
-    // used in Task 3
-    #[allow(dead_code)]
     fn rank_of(&self, requester: &[u8]) -> u32 {
         self.priorities.get(requester).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Is there a fresh demander for `pool` that out-ranks `requester`?
+    /// (strictly higher rank, or equal rank with an earlier first_seen).
+    fn out_ranked(&self, pool: PoolId, requester: &[u8], rank_r: u32) -> bool {
+        let r_first = self
+            .demand
+            .get(&(pool, requester.to_vec()))
+            .filter(|d| d.last_seen.elapsed() <= self.priority_ttl)
+            .map(|d| d.first_seen)
+            .unwrap_or_else(Instant::now);
+        self.demand.iter().any(|e| {
+            let ((p, addr), d) = (e.key(), e.value());
+            *p == pool
+                && addr.as_slice() != requester
+                && d.last_seen.elapsed() <= self.priority_ttl
+                && (d.rank < rank_r || (d.rank == rank_r && d.first_seen < r_first))
+        })
+    }
+
+    fn record_demand(&self, pool: PoolId, requester: &[u8], rank: u32) {
+        let now = Instant::now();
+        let mut e = self
+            .demand
+            .entry((pool, requester.to_vec()))
+            .or_insert(Demand {
+                rank,
+                first_seen: now,
+                last_seen: now,
+            });
+        if e.last_seen.elapsed() > self.priority_ttl {
+            e.first_seen = now; // returning after stale → restart FCFS seniority
+        }
+        e.rank = rank;
+        e.last_seen = now;
+    }
+
+    fn clear_demand(&self, pool: PoolId, requester: &[u8]) {
+        self.demand.remove(&(pool, requester.to_vec()));
+    }
+
+    #[cfg(test)]
+    pub fn demand_is_empty(&self) -> bool {
+        self.demand.is_empty()
     }
 
     /// Classify + cap-check + reserve a slot keyed by `proof_id`.
@@ -221,38 +249,73 @@ impl AdmissionController {
     /// The caller MUST call [`release`](Self::release) if the subsequent cluster
     /// create fails, and again (idempotently) on the terminal status poll.
     /// Releasing an unknown `proof_id` (ungated request) is a no-op.
-    pub fn try_acquire(&self, proof_id: &str, mode: i32, vk_hash: &[u8]) -> Result<(), Rejection> {
+    pub fn try_acquire(
+        &self,
+        proof_id: &str,
+        mode: i32,
+        vk_hash: &[u8],
+        requester: &[u8],
+    ) -> Result<(), Rejection> {
         let Some(pool) = self.classifier.classify(mode, vk_hash) else {
             self.metric_unclassified();
             return Ok(()); // ungated
         };
-        let over = {
+        let rank_r = self.rank_of(requester);
+
+        // Under the counts lock: decide over-cap / would-yield and, if we admit,
+        // increment. `demand` is only *read* here (via `out_ranked`, O(#proposers));
+        // demand *writes* happen after the guard is dropped, below.
+        enum Outcome {
+            /// Admitted but contended (dry-run over-cap/yield): keep demand.
+            AdmitContended,
+            /// Clean admit: clear demand.
+            AdmitClean,
+        }
+        let outcome = {
             let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
             let pool_over = c.get(pool) >= self.caps.get(pool);
             let global_over = self.global_cap.is_some_and(|g| c.total() >= g);
             let over = pool_over || global_over;
-            if over && self.enforce {
-                let global = global_over && !pool_over;
-                drop(c);
-                self.metric_rejected(pool, global);
-                return Err(Rejection {
-                    pool,
-                    reason: if global {
-                        RejectReason::GlobalCap
-                    } else {
-                        RejectReason::PoolCap
-                    },
-                });
+            let would_yield =
+                self.priority_enable && !over && self.out_ranked(pool, requester, rank_r);
+            let reason = if over {
+                Some(if global_over && !pool_over {
+                    RejectReason::GlobalCap
+                } else {
+                    RejectReason::PoolCap
+                })
+            } else if would_yield {
+                Some(RejectReason::PriorityYield)
+            } else {
+                None
+            };
+            match reason {
+                Some(reason) if self.enforce => {
+                    drop(c);
+                    self.record_demand(pool, requester, rank_r);
+                    self.metric_reject(pool, reason);
+                    return Err(Rejection { pool, reason });
+                }
+                Some(reason) => {
+                    // dry-run: admit but count + flag the contention.
+                    self.metric_would(pool, reason);
+                    *c.get_mut(pool) += 1;
+                    self.set_gauges(pool, c.get(pool), c.total());
+                    Outcome::AdmitContended
+                }
+                None => {
+                    *c.get_mut(pool) += 1;
+                    self.set_gauges(pool, c.get(pool), c.total());
+                    Outcome::AdmitClean
+                }
             }
-            *c.get_mut(pool) += 1;
-            self.set_gauges(pool, c.get(pool), c.total());
-            over
         };
         // Reserve the slot (dry-run reserves too, so release stays symmetric).
         self.slots
             .insert(proof_id.to_string(), (pool, Instant::now()));
-        if over {
-            self.metric_would_reject(pool);
+        match outcome {
+            Outcome::AdmitClean => self.clear_demand(pool, requester),
+            Outcome::AdmitContended => self.record_demand(pool, requester, rank_r),
         }
         self.metric_admitted(pool);
         Ok(())
@@ -419,6 +482,24 @@ impl AdmissionController {
             m.unclassified.inc();
         }
     }
+    /// Reason-aware reject metric. Fleshed out in Task 4 (PriorityYield
+    /// counter); for now maps cap rejects onto the existing counters and
+    /// leaves PriorityYield unmetered.
+    fn metric_reject(&self, pool: PoolId, reason: RejectReason) {
+        match reason {
+            RejectReason::PoolCap => self.metric_rejected(pool, false),
+            RejectReason::GlobalCap => self.metric_rejected(pool, true),
+            RejectReason::PriorityYield => {}
+        }
+    }
+    /// Dry-run "would reject/yield" metric. Fleshed out in Task 4; for now maps
+    /// cap contention onto the existing would_reject counter.
+    fn metric_would(&self, pool: PoolId, reason: RejectReason) {
+        match reason {
+            RejectReason::PoolCap | RejectReason::GlobalCap => self.metric_would_reject(pool),
+            RejectReason::PriorityYield => {}
+        }
+    }
 }
 
 /// RAII slot reservation (see [`AdmissionController::guard`]). Releases on drop
@@ -573,6 +654,7 @@ impl Default for AdmissionMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     const RANGE_VK: &[u8] = &[0x11; 4];
     const AGG_VK: &[u8] = &[0x22; 4];
@@ -629,10 +711,10 @@ mod tests {
     #[test]
     fn acquire_up_to_cap_then_reject() {
         let c = enforce_ctrl();
-        assert!(c.try_acquire("p1", 2, RANGE_VK).is_ok()); // Range cap 1
+        assert!(c.try_acquire("p1", 2, RANGE_VK, &[0x01]).is_ok()); // Range cap 1
         assert_eq!(c.in_flight(PoolId::Range), 1);
         assert_eq!(
-            c.try_acquire("p2", 2, RANGE_VK).unwrap_err(),
+            c.try_acquire("p2", 2, RANGE_VK, &[0x01]).unwrap_err(),
             Rejection {
                 pool: PoolId::Range,
                 reason: RejectReason::PoolCap
@@ -643,11 +725,11 @@ mod tests {
     #[test]
     fn release_frees_slot_idempotently() {
         let c = enforce_ctrl();
-        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
         c.release("p1");
         c.release("p1"); // idempotent
         assert_eq!(c.in_flight(PoolId::Range), 0);
-        assert!(c.try_acquire("p3", 2, RANGE_VK).is_ok());
+        assert!(c.try_acquire("p3", 2, RANGE_VK, &[0x01]).is_ok());
     }
 
     #[test]
@@ -663,15 +745,15 @@ mod tests {
             false,
             Duration::from_secs(90),
         );
-        c.try_acquire("p1", 2, RANGE_VK).unwrap();
-        assert!(c.try_acquire("p2", 2, RANGE_VK).is_ok()); // over cap, dry-run admits
+        c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
+        assert!(c.try_acquire("p2", 2, RANGE_VK, &[0x01]).is_ok()); // over cap, dry-run admits
         assert_eq!(c.in_flight(PoolId::Range), 2);
     }
 
     #[test]
     fn ungated_takes_no_slot() {
         let c = enforce_ctrl();
-        c.try_acquire("p1", 1, &[0x99; 4]).unwrap(); // Core → ungated
+        c.try_acquire("p1", 1, &[0x99; 4], &[0x01]).unwrap(); // Core → ungated
         assert_eq!(c.in_flight(PoolId::Range), 0);
         c.release("p1"); // no-op, no panic
     }
@@ -689,9 +771,9 @@ mod tests {
             false,
             Duration::from_secs(90),
         );
-        c.try_acquire("p1", 2, RANGE_VK).unwrap(); // takes the 1 global slot
+        c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap(); // takes the 1 global slot
         assert_eq!(
-            c.try_acquire("p2", 3, AGG_VK).unwrap_err(),
+            c.try_acquire("p2", 3, AGG_VK, &[0x01]).unwrap_err(),
             Rejection {
                 pool: PoolId::Agg,
                 reason: RejectReason::GlobalCap
@@ -712,7 +794,7 @@ mod tests {
             false,
             Duration::from_secs(90),
         );
-        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
         c.reap();
         assert_eq!(c.in_flight(PoolId::Range), 1); // not yet expired
         std::thread::sleep(Duration::from_millis(45));
@@ -733,7 +815,7 @@ mod tests {
             false,
             Duration::from_secs(90),
         );
-        c.try_acquire("p1", 2, RANGE_VK).unwrap();
+        c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         c.touch("p1"); // still being polled → refresh
         std::thread::sleep(Duration::from_millis(20)); // 40ms since acquire, but 20ms since touch
@@ -778,7 +860,7 @@ mod tests {
         c.seed("restart-1", PoolId::Range); // already tracked → no double-count
         assert_eq!(c.in_flight(PoolId::Range), 2);
         // A normal acquire still enforces the cap against the seeded count.
-        assert!(c.try_acquire("p1", 2, RANGE_VK).is_err());
+        assert!(c.try_acquire("p1", 2, RANGE_VK, &[0x01]).is_err());
         // Releasing a seeded slot behaves like any other slot.
         c.release("restart-1");
         assert_eq!(c.in_flight(PoolId::Range), 1);
@@ -799,11 +881,119 @@ mod tests {
             Duration::from_secs(90),
         )
         .with_metrics(m.clone());
-        c.try_acquire("p1", 2, RANGE_VK).unwrap();
-        let _ = c.try_acquire("p2", 2, RANGE_VK); // rejected
+        c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
+        let _ = c.try_acquire("p2", 2, RANGE_VK, &[0x01]); // rejected
         let out = m.render();
         assert!(out.contains("gateway_admission_admitted"));
         assert!(out.contains("gateway_admission_rejected"));
         assert!(out.contains("pool=\"range\""));
+    }
+
+    const AA: &[u8] = &[0xAA]; // rank 0 (high)
+    const BB: &[u8] = &[0xBB]; // rank 1 (low)
+
+    fn prio_ctrl() -> AdmissionController {
+        AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            HashMap::from([(AA.to_vec(), 0u32), (BB.to_vec(), 1u32)]),
+            true,
+            Duration::from_secs(90),
+        )
+    }
+
+    #[test]
+    fn higher_rank_fresh_demand_makes_lower_yield_even_with_free_slot() {
+        let c = prio_ctrl();
+        c.try_acquire("occupier", 2, RANGE_VK, &[0x01]).unwrap(); // fills Range cap=1
+        let e = c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err();
+        assert_eq!(e.reason, RejectReason::PoolCap); // A shed on cap → demand[A]
+        c.release("occupier");
+        let e2 = c.try_acquire("b1", 2, RANGE_VK, BB).unwrap_err();
+        assert_eq!(e2.reason, RejectReason::PriorityYield); // slot free but A out-ranks B
+        assert!(c.try_acquire("a2", 2, RANGE_VK, AA).is_ok()); // A wins
+        assert_eq!(c.in_flight(PoolId::Range), 1);
+    }
+
+    #[test]
+    fn stale_higher_demand_does_not_block_lower() {
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            HashMap::from([(AA.to_vec(), 0u32), (BB.to_vec(), 1u32)]),
+            true,
+            Duration::from_millis(20),
+        );
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err();
+        c.release("occ");
+        std::thread::sleep(Duration::from_millis(35));
+        assert!(c.try_acquire("b1", 2, RANGE_VK, BB).is_ok());
+    }
+
+    #[test]
+    fn equal_rank_first_seen_wins() {
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            HashMap::from([(AA.to_vec(), 5), (BB.to_vec(), 5)]),
+            true,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err(); // A waits first
+        std::thread::sleep(Duration::from_millis(5));
+        c.try_acquire("b1", 2, RANGE_VK, BB).unwrap_err(); // B waits second
+        c.release("occ");
+        let eb = c.try_acquire("b2", 2, RANGE_VK, BB).unwrap_err();
+        assert_eq!(eb.reason, RejectReason::PriorityYield); // B yields to earlier A
+        assert!(c.try_acquire("a2", 2, RANGE_VK, AA).is_ok());
+    }
+
+    #[test]
+    fn priority_disabled_behaves_as_today() {
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            HashMap::from([(AA.to_vec(), 0), (BB.to_vec(), 1)]),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err();
+        c.release("occ");
+        assert!(c.try_acquire("b1", 2, RANGE_VK, BB).is_ok()); // no priority → first wins
+    }
+
+    #[test]
+    fn admit_clears_demand() {
+        let c = prio_ctrl(); // Range cap = 1
+                             // AA gets shed first (cap full) → records demand[AA].
+        c.try_acquire("occ", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("a1", 2, RANGE_VK, AA).unwrap_err();
+        assert!(!c.demand_is_empty(), "shed must have recorded demand[AA]");
+        // Free the slot and let AA admit cleanly → its demand must be cleared.
+        c.release("occ");
+        c.try_acquire("a2", 2, RANGE_VK, AA).unwrap();
+        assert!(
+            c.demand_is_empty(),
+            "clean admit must clear the proposer's demand"
+        );
     }
 }
