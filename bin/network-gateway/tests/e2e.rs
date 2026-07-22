@@ -63,6 +63,10 @@ struct FakeCluster {
     // which only matter for slots that outlive a single poll. Default false
     // (Completed immediately) leaves existing tests unaffected.
     pending: Arc<AtomicBool>,
+    // When set, `proof_request_list` returns an error, simulating a cluster whose
+    // Pending query is unavailable — so the reconciler can't run and the TTL
+    // reaper is the only path that can reclaim a committed slot.
+    list_fails: Arc<AtomicBool>,
 }
 
 impl FakeCluster {
@@ -73,6 +77,7 @@ impl FakeCluster {
             requests: Arc::new(dashmap::DashMap::new()),
             fail_create: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(AtomicBool::new(false)),
+            list_fails: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -170,10 +175,26 @@ impl ClusterService for FakeCluster {
 
     async fn proof_request_list(
         &self,
-        _request: tonic::Request<cluster_pb::ProofRequestListRequest>,
+        request: tonic::Request<cluster_pb::ProofRequestListRequest>,
     ) -> Result<tonic::Response<cluster_pb::ProofRequestListResponse>, tonic::Status> {
+        if self.list_fails.load(Ordering::SeqCst) {
+            return Err(tonic::Status::unavailable(
+                "simulated proof_request_list outage",
+            ));
+        }
+        // Honor the proof_status filter like the real cluster api, so the
+        // gateway's reconciler sees only the requested states (an empty filter
+        // means "no status filter"). Without this the reconciler would always
+        // see every proof as still-pending and never reconcile.
+        let req = request.into_inner();
+        let proof_requests = self
+            .requests
+            .iter()
+            .map(|r| r.clone())
+            .filter(|r| req.proof_status.is_empty() || req.proof_status.contains(&r.proof_status))
+            .collect();
         Ok(tonic::Response::new(cluster_pb::ProofRequestListResponse {
-            proof_requests: self.requests.iter().map(|r| r.clone()).collect(),
+            proof_requests,
         }))
     }
 
@@ -213,6 +234,13 @@ struct GatewayStack {
     // flips whether newly-created proofs are recorded Pending (non-terminal,
     // never auto-completes) instead of Completed.
     pending: Arc<AtomicBool>,
+    // Shared store of created proofs, so a test can drive the reconciler by
+    // dropping a proof from the cluster's Pending set (remove it, or flip its
+    // status to a terminal one).
+    requests: Arc<dashmap::DashMap<String, cluster_pb::ProofRequest>>,
+    // Shared with `FakeCluster`; toggling it makes proof_request_list error, so a
+    // test can exercise the TTL reaper backstop with the reconciler unavailable.
+    list_fails: Arc<AtomicBool>,
 }
 
 impl GatewayStack {
@@ -243,6 +271,8 @@ async fn spawn_gateway_stack(
     let fake = FakeCluster::new(artifacts.clone(), proof_bytes);
     let fail_create = fake.fail_create.clone();
     let pending = fake.pending.clone();
+    let requests = fake.requests.clone();
+    let list_fails = fake.list_fails.clone();
     let (cluster_shutdown_tx, cluster_shutdown_rx) = oneshot::channel::<()>();
     let cluster_server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -306,6 +336,12 @@ async fn spawn_gateway_stack(
         admission_agg_vk_hashes: None,
         admission_reap_period_secs: 60,
         admission_slot_ttl_secs: 3600,
+        admission_reconcile_absent_observations: 3,
+        // 0 = no post-commit grace: the FakeCluster create is instant, so there's
+        // no create-window race to guard against, and the reconcile tests want
+        // prompt release. Production defaults this to 60s.
+        admission_reconcile_commit_grace_secs: 0,
+        admission_reconcile_fetch_timeout_secs: 5,
         admission_priority_enable: false,
         admission_priority_order: None,
         admission_priority_ttl_secs: 90,
@@ -366,6 +402,8 @@ async fn spawn_gateway_stack(
         cluster_server,
         fail_create,
         pending,
+        requests,
+        list_fails,
     }
 }
 
@@ -628,18 +666,26 @@ async fn e2e_admission_sheds_over_cap_then_readmits() {
     stack.shutdown().await;
 }
 
-/// A `request_proof` that fails after the admission slot is reserved (because
-/// the cluster's `create_proof_request` errors) must release that slot —
-/// otherwise it leaks until the reaper TTL. Drives the same Range pool (cap
-/// 1) through a failing create, then flips the fake back to success and
-/// confirms a follow-up request is still admitted.
+/// A `request_proof` whose cluster `create_proof_request` errors keeps its
+/// admission slot COMMITTED (the create may have registered the proof and only
+/// lost the response — releasing here would over-admit). The slot is then held
+/// until the RECONCILER observes the proof absent from the cluster's Pending set
+/// and releases it. This exercises both the commit-before-create behavior (a
+/// follow-up request is shed while the slot is held) AND the full reconcile
+/// wiring (fetch Pending → reconcile → release), which then re-admits.
 #[tokio::test]
-async fn e2e_admission_releases_slot_on_cluster_create_failure() {
+async fn e2e_admission_create_failure_holds_slot_until_reconciled() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
 
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
         cfg.admission_enforce = true;
         cfg.admission_range_max_inflight = 1;
+        // Fast reconcile so the test doesn't wait the production cadence: reap
+        // every 1s, release a committed-absent slot after 2 consecutive absent
+        // observations (≈2s at a 1s reap period).
+        cfg.admission_reap_period_secs = 1;
+        cfg.admission_reconcile_fetch_timeout_secs = 1;
+        cfg.admission_reconcile_absent_observations = 2;
     })
     .await;
 
@@ -698,9 +744,10 @@ async fn e2e_admission_releases_slot_on_cluster_create_failure() {
         }
     }
 
-    // 1) make the fake cluster's create_proof_request fail, then send a
-    // Compressed request — it reserves the sole Range slot, the cluster call
-    // errors, and request_proof must surface Internal.
+    // 1) make the cluster's create_proof_request fail, then send a Compressed
+    // request — it reserves the sole Range slot, commits it (just before the
+    // create), the cluster call errors, and request_proof surfaces Internal. The
+    // slot stays COMMITTED (the create's fate is ambiguous).
     stack.fail_create.store(true, Ordering::SeqCst);
     let body1 = compressed_request_body(&mut stack, &vk_hash).await;
     let err = stack
@@ -718,12 +765,11 @@ async fn e2e_admission_releases_slot_on_cluster_create_failure() {
         "expected Internal, got {err:?}"
     );
 
-    // 2) flip the fake back to success. If the failed request above leaked
-    // its Range slot, this next request (cap 1) would be shed with
-    // Unavailable instead of admitted.
+    // 2) the slot is HELD (committed), so an immediate follow-up (cap 1) is shed
+    // — this is the deliberate no-over-admit behavior, not a leak.
     stack.fail_create.store(false, Ordering::SeqCst);
     let body2 = compressed_request_body(&mut stack, &vk_hash).await;
-    let resp2 = stack
+    let shed = stack
         .network_rpc
         .request_proof(RequestProofRequest {
             format: MessageFormat::Binary as i32,
@@ -731,11 +777,110 @@ async fn e2e_admission_releases_slot_on_cluster_create_failure() {
             body: Some(body2),
         })
         .await
-        .expect("request #2 must be admitted: the failed request #1 must not leak its slot");
-    let request_id_2 = resp2.into_inner().body.expect("body").request_id;
-    assert!(!request_id_2.is_empty());
+        .expect_err("while the failed request's slot is still committed, a 2nd request is shed");
+    assert_eq!(
+        shed.code(),
+        tonic::Code::Unavailable,
+        "expected an admission shed (Unavailable), got {shed:?}"
+    );
+
+    // 3) the failed create never registered the proof in the cluster, so the
+    // reconciler (fetch Pending → reconcile) sees the committed slot as absent
+    // and releases it after the absence-observation threshold. A follow-up then
+    // admits.
+    // Poll until it succeeds (bounded), rather than a fixed sleep.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut admitted = None;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let body = compressed_request_body(&mut stack, &vk_hash).await;
+        match stack
+            .network_rpc
+            .request_proof(RequestProofRequest {
+                format: MessageFormat::Binary as i32,
+                signature: vec![],
+                body: Some(body),
+            })
+            .await
+        {
+            Ok(resp) => {
+                admitted = Some(resp.into_inner().body.expect("body").request_id);
+                break;
+            }
+            Err(e) => assert_eq!(
+                e.code(),
+                tonic::Code::Unavailable,
+                "pre-reconcile requests are shed; got {e:?}"
+            ),
+        }
+    }
+    let request_id = admitted.expect("the reconciler must release the phantom slot and re-admit");
+    assert!(!request_id.is_empty());
 
     // ---- shutdown ----
+    stack.shutdown().await;
+}
+
+/// The reconciler releases a COMMITTED slot once its proof leaves the cluster's
+/// Pending set (completed). Admit a Pending proof (holds the sole Range slot),
+/// flip its stored status to Completed so `proof_request_list` (Pending filter)
+/// no longer returns it, and confirm the reconciler frees the slot and re-admits.
+#[tokio::test]
+async fn e2e_admission_reconcile_releases_completed_proof() {
+    let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
+
+    let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
+        cfg.admission_enforce = true;
+        cfg.admission_range_max_inflight = 1;
+        cfg.admission_reap_period_secs = 1;
+        cfg.admission_reconcile_fetch_timeout_secs = 1;
+        cfg.admission_reconcile_absent_observations = 2;
+    })
+    .await;
+
+    let vk_hash = vec![0xdd; 32];
+    register_program(&mut stack, &vk_hash).await;
+
+    // Newly-created proofs stay Pending (never auto-complete), so the first
+    // request commits the sole Range slot and holds it.
+    stack.pending.store(true, Ordering::SeqCst);
+    let body1 = compressed_body(&mut stack, &vk_hash).await;
+    send_request_proof(&mut stack, body1)
+        .await
+        .expect("first request admitted");
+
+    // Cap 1 is now full: a 2nd request is shed.
+    let body2 = compressed_body(&mut stack, &vk_hash).await;
+    let shed = send_request_proof(&mut stack, body2)
+        .await
+        .expect_err("pool at capacity → shed");
+    assert_eq!(shed.code(), tonic::Code::Unavailable, "got {shed:?}");
+
+    // The proof completes in the cluster → drops out of the Pending set.
+    for mut r in stack.requests.iter_mut() {
+        r.value_mut().proof_status = cluster_pb::ProofRequestStatus::Completed as i32;
+    }
+
+    // The reconciler observes the committed slot absent from Pending and frees
+    // it; a follow-up then admits. Poll (bounded) rather than sleep a fixed time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut admitted = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let body = compressed_body(&mut stack, &vk_hash).await;
+        match send_request_proof(&mut stack, body).await {
+            Ok(_) => {
+                admitted = true;
+                break;
+            }
+            Err(e) => assert_eq!(e.code(), tonic::Code::Unavailable, "got {e:?}"),
+        }
+    }
+    assert!(
+        admitted,
+        "the reconciler must release the completed proof's slot and re-admit"
+    );
+
     stack.shutdown().await;
 }
 
@@ -942,17 +1087,16 @@ async fn e2e_admission_metrics_endpoint() {
         .text()
         .await
         .unwrap();
+    // Assert the SAMPLE lines with values (label-set present ⇒ the counter
+    // actually incremented), not just the always-present `# TYPE` name — the
+    // latter would pass even if the gate never counted anything.
     assert!(
-        body.contains("gateway_admission_admitted"),
-        "missing admitted counter in:\n{body}"
+        body.contains("gateway_admission_admitted_total{pool=\"range\"} 1"),
+        "admitted_total{{range}} should be 1 in:\n{body}"
     );
     assert!(
-        body.contains("gateway_admission_rejected"),
-        "missing rejected counter in:\n{body}"
-    );
-    assert!(
-        body.contains("pool=\"range\""),
-        "missing range pool label in:\n{body}"
+        body.contains("gateway_admission_rejected_total{pool=\"range\"} 1"),
+        "rejected_total{{range}} should be 1 in:\n{body}"
     );
 
     stack.shutdown().await;
@@ -968,17 +1112,27 @@ async fn e2e_admission_reaper_reclaims_abandoned() {
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
         cfg.admission_enforce = true;
         cfg.admission_range_max_inflight = 1;
-        // Both fields are whole seconds (u64, no sub-second config), so 1s is
-        // the smallest usable value for each. The reaper's first sweep fires
-        // `admission_reap_period_secs` after boot and every period thereafter;
-        // sleeping ~2.5s below guarantees at least one sweep observes the
-        // slot's age comfortably past the 1s ttl, without being so tight that
-        // scheduling jitter could flake it.
+        // Reap sweeps every 1s; a committed slot's TTL backstop is 3s — the
+        // smallest legal ttl here, since the absence debounce (2 observations) ×
+        // reap (1s) = 2s must stay strictly below it. The reaper's first sweep
+        // fires after ~1s and every period thereafter; sleeping ~4.7s below
+        // guarantees a sweep observes the slot past its 3s ttl without being so
+        // tight that jitter flakes it.
         cfg.admission_reap_period_secs = 1;
-        cfg.admission_slot_ttl_secs = 1;
+        cfg.admission_slot_ttl_secs = 3;
+        cfg.admission_reconcile_absent_observations = 2;
+        // Fetch timeout must be <= the reap period (it is awaited inline in the
+        // reaper loop).
+        cfg.admission_reconcile_fetch_timeout_secs = 1;
     })
     .await;
-    stack.pending.store(true, Ordering::SeqCst); // proof never reaches a terminal status on its own
+    // Proof stays Pending (never terminal) AND the Pending query fails, so the
+    // reconciler can't confirm/refresh the slot — the TTL reaper is the ONLY path
+    // that can reclaim it (which is exactly what this test covers). Without the
+    // list outage the reconciler would keep refreshing the still-Pending slot and
+    // the reaper would correctly never fire.
+    stack.pending.store(true, Ordering::SeqCst);
+    stack.list_fails.store(true, Ordering::SeqCst);
 
     let vk_hash = vec![0xd3; 32];
     register_program(&mut stack, &vk_hash).await;
@@ -991,8 +1145,8 @@ async fn e2e_admission_reaper_reclaims_abandoned() {
         .expect("request #1 admitted (pool empty)");
     assert!(!request_id_1.is_empty());
 
-    // Let the reaper run past ttl (1s) plus at least one full reap period (1s).
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Let the reaper run past ttl (3s) plus at least one full reap period (1s).
+    tokio::time::sleep(Duration::from_millis(4700)).await;
 
     // #2 is admitted: the reaper must have reclaimed #1's abandoned slot.
     let body2 = compressed_body(&mut stack, &vk_hash).await;
@@ -1013,15 +1167,23 @@ async fn e2e_admission_touch_keeps_polled_slot() {
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
         cfg.admission_enforce = true;
         cfg.admission_range_max_inflight = 1;
-        // Same rationale as the reaper test: whole-second config floor of 1s
-        // for the reap period. A 2s ttl (vs. the reaper test's 1s) gives the
-        // ~300ms poll loop below a comfortable margin against scheduling
-        // jitter on every sweep, while still keeping the test fast.
+        // reap every 1s against a 3s ttl — the smallest legal ttl, since the
+        // absence debounce (2 observations) × reap (1s) = 2s must stay strictly
+        // below it. The ~300ms poll loop below refreshes the slot well within the
+        // 3s ttl on every sweep, while an unpolled slot would be reaped after 3s.
         cfg.admission_reap_period_secs = 1;
-        cfg.admission_slot_ttl_secs = 2;
+        cfg.admission_slot_ttl_secs = 3;
+        cfg.admission_reconcile_absent_observations = 2;
+        // Fetch timeout must be <= the reap period (it is awaited inline in the
+        // reaper loop).
+        cfg.admission_reconcile_fetch_timeout_secs = 1;
     })
     .await;
     stack.pending.store(true, Ordering::SeqCst); // never reaches a terminal status on its own
+                                                 // Disable the cluster Pending query so the reconciler stays inert: the reap
+                                                 // deadline is then refreshed ONLY by touch-on-poll, so this test proves the
+                                                 // polling loop (not a reconcile-present refresh) is what keeps the slot alive.
+    stack.list_fails.store(true, Ordering::SeqCst);
 
     let vk_hash = vec![0xd4; 32];
     register_program(&mut stack, &vk_hash).await;
@@ -1031,11 +1193,12 @@ async fn e2e_admission_touch_keeps_polled_slot() {
         .await
         .expect("request #1 admitted (pool empty)");
 
-    // Poll get_proof_request_status every ~300ms for ~3s (10 iterations).
-    // Each non-terminal poll (Pending → Requested, not terminal) calls
-    // `touch`, refreshing the slot's age so the reaper — sweeping every 1s
-    // against a 2s ttl — never observes it stale.
-    for _ in 0..10 {
+    // Poll get_proof_request_status every ~300ms for ~4.5s (15 iterations),
+    // comfortably past the 3s ttl so an unpolled slot WOULD be reaped. Each
+    // non-terminal poll (Pending → Requested, not terminal) calls `touch`,
+    // refreshing the slot's age so the reaper — sweeping every 1s against a 3s
+    // ttl — never observes it stale.
+    for _ in 0..15 {
         let status = stack
             .network_rpc
             .get_proof_request_status(GetProofRequestStatusRequest {

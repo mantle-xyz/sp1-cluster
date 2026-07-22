@@ -8224,6 +8224,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dotenv",
+ "eyre",
  "futures",
  "hex",
  "mti",

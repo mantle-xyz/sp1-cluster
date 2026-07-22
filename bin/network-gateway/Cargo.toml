@@ -28,6 +28,7 @@ bincode = { workspace = true }
 clap = { workspace = true }
 dashmap = { workspace = true }
 dotenv = { workspace = true }
+eyre = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 mti = { workspace = true }

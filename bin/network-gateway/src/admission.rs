@@ -63,6 +63,30 @@ pub struct Rejection {
     pub reason: RejectReason,
 }
 
+/// What a single reconcile tick observed about the cluster's Pending set. This
+/// is the SOLE input to [`AdmissionController::reconcile`], so the per-tick
+/// "how should I treat this observation" decision lives in one place instead of
+/// being spread across the reaper loop's match arms.
+pub enum PendingObservation {
+    /// A COMPLETE Pending snapshot (reply under the server page limit) — the
+    /// authoritative live set. Present committed slots are refreshed to live;
+    /// absent ones advance their absence streak and are released once it reaches
+    /// the threshold.
+    Complete(HashSet<String>),
+    /// A TRUNCATED Pending snapshot (hit the server page limit) — an INCOMPLETE
+    /// view. A present sighting is still trustworthy, so present committed slots
+    /// are refreshed; but a slot missing from a truncated page may just be on an
+    /// unseen page, so absence is NOT concluded and its streak is left untouched.
+    Partial(HashSet<String>),
+    /// NO usable snapshot this tick (query error / timeout). A gap in
+    /// observation: every streak is left unchanged (neither advanced nor reset).
+    /// Because the streak is an observation count rather than a wall clock, a gap
+    /// simply doesn't count as an observation — so absence still accrues only
+    /// across genuine consecutive absent replies, and a flaky query can neither
+    /// zero a real streak nor forge absence.
+    None,
+}
+
 /// A proposer's outstanding demand for a pool slot (drives priority + FCFS).
 struct Demand {
     rank: u32,
@@ -133,27 +157,103 @@ impl PerPool {
     }
 }
 
+/// A tracked slot reservation.
+///
+/// Lifecycle: RESERVED (`committed_at == None`, set by `try_acquire`) → COMMITTED
+/// (`committed_at == Some`, set by `mark_committed` just before the cluster
+/// create). A RESERVED slot is owned by the in-flight `request_proof` handler's
+/// [`SlotGuard`] (released on its Drop — including on cancellation/panic-unwind)
+/// and is touched by NEITHER the reaper NOR the reconciler; only COMMITTED slots
+/// are subject to cluster-truth reconciliation and the backstop TTL reaper. This
+/// is what prevents a slow upload / mid-create cancellation from being reaped or
+/// reconciled out from under a live-but-not-yet-registered proof.
+struct Slot {
+    pool: PoolId,
+    /// Absolute backstop reap deadline (`now + ttl`), refreshed on commit/touch.
+    /// Only consulted for COMMITTED slots and only as a backstop for when the
+    /// reconciler can't reach the cluster; a live proof is `touch`ed so it never
+    /// hits this. Stored as the deadline (not a last-polled instant) to avoid
+    /// `Instant`-underflow on a freshly-booted host.
+    deadline: Instant,
+    /// `Some(t)` once handed to the cluster at `t` (create leg or seed), else
+    /// `None` while still RESERVED in the handler. The reconciler and the reaper
+    /// act ONLY on COMMITTED slots — a reserved slot's proof isn't in the
+    /// cluster's Pending set yet, so treating its absence as "gone" would wrongly
+    /// release a proof that is still uploading / about to be created → over-admit.
+    committed_at: Option<Instant>,
+    /// For a COMMITTED slot: number of CONSECUTIVE successful reconciles that
+    /// observed this proof ABSENT from the cluster's Pending set. Any liveness
+    /// signal — a present reconcile observation, a client poll, or commit —
+    /// resets it to 0; each absent reconcile observation increments it. The
+    /// reconciler releases a committed slot once this reaches the configured
+    /// threshold, so a reappearance (a transient/anomalous empty reply, or a
+    /// create still landing in the Pending set) resets it and a single bad
+    /// snapshot can't mass-release live slots. It is an OBSERVATION COUNT, not a
+    /// wall clock: a SKIPPED reconcile (truncated / timeout / query error /
+    /// unimplemented) leaves it unchanged rather than resetting it, so absence
+    /// accrues across intermittent query failures instead of being repeatedly
+    /// zeroed — a genuinely-gone proof is still reclaimed by cluster truth
+    /// (not left to the TTL backstop) even when the query is flaky.
+    absent_streak: u32,
+}
+
+impl Slot {
+    /// Apply a liveness signal: clear the absence streak and refresh the backstop
+    /// reap deadline. The single place these two "still alive" effects happen, so
+    /// commit / client-poll / reconcile-saw-it-pending can't drift. `now` is
+    /// passed in so a caller already holding one reuses it.
+    fn observe_live(&mut self, now: Instant, ttl: Duration) {
+        self.absent_streak = 0;
+        self.deadline = now + ttl;
+    }
+
+    /// Record one absent reconcile observation and return the new streak.
+    fn observe_absent(&mut self) -> u32 {
+        self.absent_streak += 1;
+        self.absent_streak
+    }
+
+    fn is_committed(&self) -> bool {
+        self.committed_at.is_some()
+    }
+}
+
 /// Global per-proof-type concurrency gate. Single-instance, in-memory.
 pub struct AdmissionController {
     caps: PerPool,
     /// `None` = pools independent; `Some(n)` = at most `n` in-flight total.
     global_cap: Option<usize>,
     counts: Mutex<PerPool>,
-    /// proof_id → (pool, last_polled_at). Owns committed-slot accounting; the
-    /// idempotent-release latch is `DashMap::remove` (one winner). The
-    /// timestamp is refreshed by [`touch`](Self::touch) on every non-terminal
-    /// poll, so it tracks recency-of-poll rather than acquire time.
-    slots: DashMap<String, (PoolId, Instant)>,
+    /// proof_id → [`Slot`]. Owns per-proof reservation accounting; the
+    /// idempotent-release latch is the atomic `DashMap::remove_if` inside
+    /// [`remove_and_dec`](Self::remove_and_dec) (one winner). See [`Slot`] for the
+    /// deadline (reap) and committed_at (reconcile) semantics. All remove+decrement
+    /// go through `remove_and_dec` so the counter and the map can't drift.
+    slots: DashMap<String, Slot>,
     /// `false` = dry-run (count + metrics, never reject); `true` = enforce.
     enforce: bool,
-    /// Reaper TTL. The single invariant: **TTL must exceed the maximum gap
-    /// between a live proof's consecutive status/details polls.** A live proof
-    /// is `touch`ed on every non-terminal poll, so the timestamp tracks
-    /// recency-of-poll, not acquire time — a slot unpolled for longer than
-    /// this is assumed abandoned (or its release was lost) and is reclaimed.
-    /// Set it comfortably above the SDK's longest poll backoff; the default
-    /// (3600s) clears any realistic gap.
+    /// Reaper TTL: the BACKSTOP deadline for a COMMITTED slot. Both a client poll
+    /// (`touch`) and a reconcile that sees the proof still Pending refresh it (via
+    /// [`Slot::observe_live`]), so in normal operation the reconciler frees
+    /// finished/gone slots and this only fires when reconcile CANNOT confirm
+    /// liveness (cluster query persistently failing/truncated) AND no client is
+    /// polling. It must therefore exceed the maximum gap between a slot's liveness
+    /// signals — a client poll OR a reconcile-present observation — NOT the proof
+    /// duration. It also bounds a hung pre-commit upload: a RESERVED slot past this
+    /// deadline is reclaimed as well. The default (3600s) clears any realistic gap.
+    /// (Related invariants — `reap_period < ttl`, `absent_observations ×
+    /// reap_period < ttl`, `commit_grace < ttl` — are enforced in
+    /// `build_admission`.)
     ttl: Duration,
+    /// Grace after a slot is COMMITTED before the reconciler may count it absent.
+    /// `commit` happens just before the cluster create, so during the create leg
+    /// the proof isn't in the Pending set yet and looks "absent" — this spares it
+    /// (like a RESERVED slot) until it has been committed for `commit_grace`,
+    /// preventing an in-flight create from being reconciled into an over-admit.
+    /// Independent of the reap cadence, so it protects even an aggressively-fast
+    /// reconcile config. `Duration::ZERO` = no grace (set via
+    /// [`with_commit_grace`](Self::with_commit_grace); `new` defaults to ZERO).
+    commit_grace: Duration,
     classifier: Classifier,
     metrics: Option<Arc<AdmissionMetrics>>,
     priorities: std::collections::HashMap<Vec<u8>, u32>,
@@ -195,6 +295,7 @@ impl AdmissionController {
             slots: DashMap::new(),
             enforce,
             ttl,
+            commit_grace: Duration::ZERO,
             classifier,
             metrics: None,
             priorities,
@@ -333,12 +434,35 @@ impl AdmissionController {
                     self.clear_demand(pool, requester);
                 }
             }
+            // Reserve the slot UNDER the same `counts` hold as the increment, so
+            // a panic can't leave a counted-but-slotless phantom (the count and
+            // the slot map stay consistent; a poison-recovered lock would
+            // otherwise inflate the pool forever). `committed_at: None` marks it
+            // RESERVED so the reaper/reconciler leave it alone until `commit()`.
+            //
+            // TRADEOFF (do not flip without reading this): holding `counts`
+            // across the DashMap insert means an admit can briefly block behind a
+            // shard write-guard held by reconcile's `iter_mut` sweep, stalling
+            // other admits (all serialize on `counts`). At the intended pool caps
+            // (single digits) the slot map is tiny; even after a restart `seed`
+            // transiently pushes the map above the caps it stays bounded by the
+            // cluster Pending page limit (≤ ~1000, see PENDING_QUERY_LIMIT) and
+            // the sweep is microseconds, so the stall is negligible. The
+            // alternative (insert outside the lock) reintroduces the panic-window
+            // phantom-count, which is unreclaimable. Keep it under the lock unless
+            // the caps grow large enough that the sweep stall becomes measurable —
+            // then switch reconcile to short per-id `get_mut`s instead of a long
+            // `iter_mut`.
+            self.slots.insert(
+                proof_id.to_string(),
+                Slot {
+                    pool,
+                    deadline: Instant::now() + self.ttl,
+                    committed_at: None,
+                    absent_streak: 0,
+                },
+            );
         }
-        // Reserve the slot (dry-run reserves too, so release stays symmetric).
-        // `slots` is not part of the counter/demand race, so it stays outside the
-        // `counts` critical section.
-        self.slots
-            .insert(proof_id.to_string(), (pool, Instant::now()));
         self.metric_admitted(pool);
         Ok(())
     }
@@ -356,6 +480,11 @@ impl AdmissionController {
     /// gateway process started (the in-memory counters otherwise reset to 0
     /// on restart while the cluster keeps proving). Idempotent — a `proof_id`
     /// already tracked is left untouched rather than double-counted.
+    ///
+    /// A seeded slot is COMMITTED (it reflects a proof the cluster is already
+    /// running, i.e. present in its Pending set), so the reconciler is its
+    /// authority: it is kept while the cluster still reports the proof Pending
+    /// and released once it goes terminal/absent — no special grace needed.
     pub fn seed(&self, proof_id: &str, pool: PoolId) {
         if self.slots.contains_key(proof_id) {
             return;
@@ -364,16 +493,74 @@ impl AdmissionController {
             let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
             *c.get_mut(pool) += 1;
             self.set_gauges(pool, c.get(pool), c.total());
+            // Insert the slot UNDER the same `counts` hold as the increment, so a
+            // panic between the two can't leave a counted-but-slotless phantom that
+            // no path could reclaim — the same invariant `try_acquire` documents at
+            // its reserve site. A seeded slot is COMMITTED (it reflects a proof the
+            // cluster is already running).
+            let now = Instant::now();
+            self.slots.insert(
+                proof_id.to_string(),
+                Slot {
+                    pool,
+                    deadline: now + self.ttl,
+                    committed_at: Some(now),
+                    absent_streak: 0,
+                },
+            );
         }
-        self.slots
-            .insert(proof_id.to_string(), (pool, Instant::now()));
+        self.metric_seeded(pool);
+    }
+
+    /// Remove `proof_id` from `slots` (only if `still_removable`) and decrement
+    /// its pool counter — the SINGLE decrement path, so release / reap /
+    /// reconcile can't drift on locking. The remove + decrement happen under one
+    /// `counts` hold so a concurrent [`try_acquire`](Self::try_acquire) for a
+    /// DIFFERENT proof can't observe the slot gone but the count not yet
+    /// decremented (which on a cap-full pool would spuriously shed it). Returns
+    /// the freed pool, or `None` if nothing was removed.
+    fn remove_and_dec(
+        &self,
+        proof_id: &str,
+        still_removable: impl Fn(&Slot) -> bool,
+    ) -> Option<PoolId> {
+        let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let (_, slot) = self.slots.remove_if(proof_id, |_, v| still_removable(v))?;
+        let e = c.get_mut(slot.pool);
+        *e = e.saturating_sub(1);
+        self.set_gauges(slot.pool, c.get(slot.pool), c.total());
+        Some(slot.pool)
+    }
+
+    /// Mark a reserved slot as handed off to the cluster (see
+    /// [`Slot::committed_at`]). Called by [`SlotGuard::commit`]. Also (re)starts
+    /// the reap deadline from now, so the committed backstop TTL runs from
+    /// commit time, and clears any absence clock (a fresh commit is a liveness
+    /// signal). No-op if the slot is already gone.
+    fn mark_committed(&self, proof_id: &str) {
+        if let Some(mut e) = self.slots.get_mut(proof_id) {
+            let now = Instant::now();
+            let s = e.value_mut();
+            s.committed_at = Some(now);
+            s.observe_live(now, self.ttl); // fresh commit is a liveness signal
+        }
+    }
+
+    /// Whether any slot is currently tracked. The reaper uses this to skip the
+    /// per-tick cluster reconcile query when there is nothing to reconcile.
+    pub fn has_tracked_slots(&self) -> bool {
+        !self.slots.is_empty()
     }
 
     /// Release the slot held by `proof_id`, if any. Idempotent.
     pub fn release(&self, proof_id: &str) {
-        if let Some((_, (pool, _))) = self.slots.remove(proof_id) {
-            self.dec_pool(pool);
+        // Cheap pre-check so a terminal poll of an ungated / already-released
+        // proof (which holds no slot) skips the `counts` lock entirely — the id
+        // is the caller's own and nothing inserts it after its terminal poll.
+        if !self.slots.contains_key(proof_id) {
+            return;
         }
+        self.remove_and_dec(proof_id, |_| true);
     }
 
     /// RAII handle over a just-acquired slot: on drop it releases the slot
@@ -390,32 +577,66 @@ impl AdmissionController {
     }
 
     /// Refresh a slot's age so the reaper won't reclaim it while its proof is
-    /// still being polled (i.e. still alive). No-op if the slot isn't tracked
-    /// (ungated request, or already released). Called on every non-terminal
-    /// status/details poll.
+    /// still being polled (i.e. still alive), and clear its absence clock — a
+    /// non-terminal client poll is a liveness signal, so it must also stop the
+    /// reconciler from releasing the slot even if the cluster's Pending list
+    /// transiently doesn't show it. No-op if the slot isn't tracked (ungated
+    /// request, or already released). Called on every non-terminal status/details
+    /// poll.
     pub fn touch(&self, proof_id: &str) {
         if let Some(mut e) = self.slots.get_mut(proof_id) {
-            e.value_mut().1 = Instant::now();
+            e.value_mut().observe_live(Instant::now(), self.ttl);
         }
     }
 
-    /// Reclaim slots not polled within `ttl` (a lost release, or an abandoned
-    /// proof the client stopped polling). A live proof is polled continuously
-    /// and `touch`ed, so it is never reclaimed.
+    /// Backstop reclaim for COMMITTED slots whose reap deadline has passed. This
+    /// is a TRUE backstop: the deadline is refreshed both by `touch` (a client
+    /// poll) AND by `reconcile` seeing the proof still Pending, so a committed
+    /// slot only ages out — and is only reaped — when the reconciler CANNOT
+    /// confirm liveness (the cluster query is persistently failing / truncated /
+    /// unimplemented) AND no client is polling. In normal operation the
+    /// reconciler releases finished/gone proofs; this only catches slots stranded
+    /// by a prolonged cluster-query outage.
+    ///
+    /// Consequence: while reconcile is working, a proof that stays Pending
+    /// forever (a cluster-side deadlock) keeps its deadline refreshed and is
+    /// therefore NEVER reaped — its slot is held until the proof resolves or the
+    /// gateway restarts. That is intentional: the proof genuinely occupies
+    /// cluster proving capacity, so freeing the slot would over-admit against it;
+    /// the `GatewayRangeSlotWedged` alert is the human-facing signal instead.
+    ///
+    /// RESERVED slots are deliberately NOT reaped, even past their deadline: they
+    /// are owned by the in-flight handler's [`SlotGuard`], and their proof may
+    /// still be uploading / about to be created. Reaping one is UNSAFE, not just
+    /// conservative — the guard outlives the reap, so a later `commit()` +
+    /// successful `create` would leave a live proof running with no tracked slot
+    /// (the reaper already decremented the count), i.e. an over-admit. A stranded
+    /// RESERVED slot (e.g. a pre-commit `upload_raw` that hangs) is instead
+    /// bounded by the request future being cancelled — a client disconnect or the
+    /// transport/keepalive timeout drops the handler future, running
+    /// `SlotGuard::Drop` → `release`. The only unbounded case is a half-open
+    /// connection that never errors AND a client that never disconnects; that is
+    /// left to the transport layer rather than reaped here, precisely to preserve
+    /// the no-over-admit guarantee above.
     pub fn reap(&self) {
+        // A committed slot is expired once its stored reap deadline has passed.
+        // Capture `now` once; a concurrent `touch` pushes the deadline to a
+        // far-future `now2 + ttl`, so the removal re-check below still spares it.
+        let now = Instant::now();
+        let expired = |s: &Slot| s.committed_at.is_some() && s.deadline <= now;
         let candidates: Vec<String> = self
             .slots
             .iter()
-            .filter(|e| e.value().1.elapsed() > self.ttl)
+            .filter(|e| expired(e.value()))
             .map(|e| e.key().clone())
             .collect();
         let mut reclaimed = 0usize;
         for id in candidates {
-            // Re-check age atomically at removal: if a concurrent `touch`
-            // refreshed it (the proof is still being polled), spare it.
-            if let Some((_, (pool, _))) = self.slots.remove_if(&id, |_, v| v.1.elapsed() > self.ttl)
-            {
-                self.dec_pool(pool);
+            // remove_and_dec re-checks the predicate atomically under the counts
+            // lock: a concurrent `touch` that refreshed the deadline (proof still
+            // polled) spares it, and remove+decrement stay atomic (no
+            // spurious-shed window).
+            if let Some(pool) = self.remove_and_dec(&id, expired) {
                 self.metric_reaped(pool);
                 reclaimed += 1;
             }
@@ -426,13 +647,118 @@ impl AdmissionController {
                 "admission reaper reclaimed leaked slots (a release was likely missed or a proof was abandoned)"
             );
         }
-        self.demand
-            .retain(|_, d| d.last_seen.elapsed() <= self.priority_ttl);
+        // Prune stale demand under the `counts` lock so this write honours the
+        // "all demand writes happen under counts" invariant that `out_ranked`
+        // relies on (otherwise a priority decision could be made against a demand
+        // map being torn down concurrently). Held separately from the per-slot
+        // `remove_and_dec` calls above — never nested — so there is no re-entrant
+        // lock.
+        {
+            let _c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+            self.demand
+                .retain(|_, d| d.last_seen.elapsed() <= self.priority_ttl);
+        }
         // Refresh the demand gauge for both pools so a demander that just went
         // stale is reflected. `metric_demand_gauge` is a no-op when metrics is
         // None, and takes no `counts` lock — safe from the reaper task.
         self.metric_demand_gauge(PoolId::Range);
         self.metric_demand_gauge(PoolId::Agg);
+    }
+
+    /// Reconcile tracked slots against a cluster Pending-set [`PendingObservation`]:
+    /// release any COMMITTED slot whose proof is no longer pending (Completed /
+    /// Failed / Cancelled, or gone). This bounds the "slot held for the full TTL
+    /// after the work is already done" case — most often op-succinct abandoning a
+    /// request and re-requesting under a fresh request_id, so the old proof_id is
+    /// never polled to a terminal status. `Pending` is the cluster's ONLY
+    /// non-terminal status (a proof stays `Pending` while it is being proved), so
+    /// absence from the live set means terminal-or-gone.
+    ///
+    /// Only COMMITTED slots are candidates (a reserved slot's proof isn't in the
+    /// cluster's Pending set yet, so its absence is meaningless). A committed slot
+    /// is released only once it has been absent for `absent_observations`
+    /// CONSECUTIVE [`Complete`](PendingObservation::Complete) reconciles: a
+    /// present sighting resets the streak (and refreshes the backstop deadline), an
+    /// absent one advances it. A [`Partial`](PendingObservation::Partial)
+    /// (truncated) view refreshes present slots but never advances absence (a
+    /// missing slot may be on an unseen page); a [`None`](PendingObservation::None)
+    /// observation (query error/timeout) leaves every streak untouched. This makes
+    /// a single anomalous reply harmless, and — because the streak counts
+    /// observations, not wall-clock time — makes absence robust to intermittent
+    /// query failures. `absent_observations` therefore just sets how many clean
+    /// absent snapshots confirm a proof is gone; the effective debounce window is
+    /// `absent_observations × reap_period`.
+    pub fn reconcile(&self, obs: PendingObservation, absent_observations: u32) {
+        let (live, partial) = match &obs {
+            // A gap in observation: leave every streak unchanged. Nothing to do.
+            PendingObservation::None => return,
+            PendingObservation::Complete(live) => (live, false),
+            PendingObservation::Partial(live) => (live, true),
+        };
+        let now = Instant::now();
+        // Pass 1: update each committed slot's absence streak (reserved slots are
+        // ignored). Collect the ids whose streak reached the release threshold.
+        let mut stale: Vec<String> = Vec::new();
+        for mut e in self.slots.iter_mut() {
+            let present = live.contains(e.key());
+            let s = e.value_mut();
+            if !s.is_committed() {
+                continue; // RESERVED — not the reconciler's business
+            }
+            if present {
+                // Confirmed live in the cluster → liveness signal (reset streak +
+                // refresh the backstop reap deadline). This keeps the TTL reaper a
+                // TRUE backstop: it only reclaims a committed slot when reconcile
+                // CAN'T confirm liveness, never one reconcile just saw Pending — so
+                // a genuinely-running-but-unpolled proof isn't reaped out from
+                // under itself.
+                s.observe_live(now, self.ttl);
+            } else if partial {
+                // Truncated (incomplete) view: a slot missing from a capped page
+                // may simply be on an unseen page, so do NOT advance its absence
+                // streak — that would risk releasing a live slot we didn't see.
+                // Present slots above were still refreshed on the trustworthy
+                // positive sightings.
+                continue;
+            } else if s
+                .committed_at
+                .is_some_and(|t| now.saturating_duration_since(t) < self.commit_grace)
+            {
+                // Within the post-commit grace: `commit` runs just before the
+                // cluster create, so during the create leg this proof isn't in the
+                // Pending set yet and its absence is not yet meaningful. Spare it
+                // (exactly like a RESERVED slot) until the grace elapses, so an
+                // in-flight create can't be reconciled away into an over-admit. The
+                // grace is wall-clock (independent of the reap cadence), so this
+                // holds even under an aggressively-fast `absent_observations ×
+                // reap_period` window.
+                continue;
+            } else if s.observe_absent() >= absent_observations {
+                stale.push(e.key().clone());
+            }
+        }
+        // Pass 2: release the slots that reached the threshold. remove_and_dec
+        // re-checks the predicate atomically under the counts lock, so a
+        // concurrent `touch` (a client poll — the liveness signal that resets the
+        // streak via observe_live) landing between pass 1 and here spares the slot.
+        // (mark_committed can't apply here: a `stale` slot is already committed,
+        // and reserved slots never enter `stale`.) The iter_mut guards from pass 1
+        // are dropped before we lock counts, preserving the counts→slots order.
+        let sustained_absent =
+            |s: &Slot| s.is_committed() && s.absent_streak >= absent_observations;
+        let mut reclaimed = 0usize;
+        for id in stale {
+            if let Some(pool) = self.remove_and_dec(&id, sustained_absent) {
+                self.metric_reconciled(pool);
+                reclaimed += 1;
+            }
+        }
+        if reclaimed > 0 {
+            tracing::info!(
+                reclaimed,
+                "admission reconciler released slots continuously absent from the cluster Pending set"
+            );
+        }
     }
 
     /// In-flight for a pool (test/observability accessor).
@@ -444,15 +770,17 @@ impl AdmissionController {
             .get(pool)
     }
 
-    fn dec_pool(&self, pool: PoolId) {
-        let mut c = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let e = c.get_mut(pool);
-        *e = e.saturating_sub(1);
-        self.set_gauges(pool, c.get(pool), c.total());
-    }
-
     pub fn with_metrics(mut self, metrics: Arc<AdmissionMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Set the post-commit grace (see [`commit_grace`](Self::commit_grace)). The
+    /// production path sets this from `GATEWAY_ADMISSION_RECONCILE_COMMIT_GRACE_SECS`;
+    /// `new` leaves it `Duration::ZERO` (no grace) so unit tests exercise the raw
+    /// streak logic unless they opt in.
+    pub fn with_commit_grace(mut self, grace: Duration) -> Self {
+        self.commit_grace = grace;
         self
     }
 
@@ -487,6 +815,24 @@ impl AdmissionController {
     fn metric_reaped(&self, pool: PoolId) {
         if let Some(m) = &self.metrics {
             m.reaped
+                .get_or_create(&PoolLabel {
+                    pool: pool.label().into(),
+                })
+                .inc();
+        }
+    }
+    fn metric_reconciled(&self, pool: PoolId) {
+        if let Some(m) = &self.metrics {
+            m.reconciled
+                .get_or_create(&PoolLabel {
+                    pool: pool.label().into(),
+                })
+                .inc();
+        }
+    }
+    fn metric_seeded(&self, pool: PoolId) {
+        if let Some(m) = &self.metrics {
+            m.seeded
                 .get_or_create(&PoolLabel {
                     pool: pool.label().into(),
                 })
@@ -578,9 +924,14 @@ pub struct SlotGuard<'a> {
 
 impl SlotGuard<'_> {
     /// Hand the slot off to the terminal-poll release path — the reservation
-    /// outlives this scope. Call only once the cluster has accepted the proof.
+    /// outlives this scope. Marks the slot COMMITTED so the reconciler may
+    /// resolve it against cluster state. Call once the cluster leg has run
+    /// (create returned OR errored — an errored create may still have registered
+    /// the proof, so keeping it committed lets the reconciler release it only if
+    /// it is truly absent, rather than under-counting a live proof).
     pub fn commit(mut self) {
         self.committed = true;
+        self.controller.mark_committed(self.proof_id);
     }
 }
 
@@ -617,6 +968,8 @@ pub struct AdmissionMetrics {
     rejected_global: Counter,
     would_reject: Family<PoolLabel, Counter>,
     reaped: Family<PoolLabel, Counter>,
+    reconciled: Family<PoolLabel, Counter>,
+    seeded: Family<PoolLabel, Counter>,
     unclassified: Counter,
     priority_yielded: Family<PoolLabel, Counter>,
     priority_would_yield: Family<PoolLabel, Counter>,
@@ -634,6 +987,8 @@ impl AdmissionMetrics {
         let rejected_global = Counter::default();
         let would_reject = Family::<PoolLabel, Counter>::default();
         let reaped = Family::<PoolLabel, Counter>::default();
+        let reconciled = Family::<PoolLabel, Counter>::default();
+        let seeded = Family::<PoolLabel, Counter>::default();
         let unclassified = Counter::default();
         let priority_yielded = Family::<PoolLabel, Counter>::default();
         let priority_would_yield = Family::<PoolLabel, Counter>::default();
@@ -675,6 +1030,16 @@ impl AdmissionMetrics {
             reaped.clone(),
         );
         registry.register(
+            "gateway_admission_reconciled",
+            "Slots released by the cluster-truth reconciler (proof no longer pending), per pool",
+            reconciled.clone(),
+        );
+        registry.register(
+            "gateway_admission_seeded",
+            "Slots seeded from cluster in-flight proofs at restart, per pool",
+            seeded.clone(),
+        );
+        registry.register(
             "gateway_admission_unclassified",
             "Requests passed through ungated",
             unclassified.clone(),
@@ -708,6 +1073,8 @@ impl AdmissionMetrics {
             rejected_global,
             would_reject,
             reaped,
+            reconciled,
+            seeded,
             unclassified,
             priority_yielded,
             priority_would_yield,
@@ -880,21 +1247,25 @@ mod tests {
 
     #[test]
     fn reaper_reclaims_expired() {
+        // Wide ttl (150ms) so commit→first-reap can't exceed it under CI
+        // scheduling jitter and flake the "not yet expired" assert (matches the
+        // margins in `touch_prevents_reap_of_polled_slot`).
         let c = AdmissionController::new(
             classifier(),
             1,
             2,
             None,
             true,
-            Duration::from_millis(30),
+            Duration::from_millis(150),
             std::collections::HashMap::new(),
             false,
             Duration::from_secs(90),
         );
         c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p1").commit(); // reap is committed-only; simulate the cluster handoff
         c.reap();
         assert_eq!(c.in_flight(PoolId::Range), 1); // not yet expired
-        std::thread::sleep(Duration::from_millis(45));
+        std::thread::sleep(Duration::from_millis(220));
         c.reap();
         assert_eq!(c.in_flight(PoolId::Range), 0);
     }
@@ -907,22 +1278,23 @@ mod tests {
             2,
             None,
             true,
-            Duration::from_millis(30),
+            Duration::from_millis(150), // ttl (wide margins so scheduling jitter can't flake it)
             std::collections::HashMap::new(),
             false,
             Duration::from_secs(90),
         );
         c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        c.touch("p1"); // still being polled → refresh
-        std::thread::sleep(Duration::from_millis(20)); // 40ms since acquire, but 20ms since touch
+        c.guard("p1").commit(); // reap is committed-only; simulate the cluster handoff
+        std::thread::sleep(Duration::from_millis(60));
+        c.touch("p1"); // still being polled → refresh deadline to now+150ms
+        std::thread::sleep(Duration::from_millis(60)); // 120ms since acquire, but 60ms since touch
         c.reap();
         assert_eq!(
             c.in_flight(PoolId::Range),
             1,
             "recently-touched slot must not be reaped"
         );
-        std::thread::sleep(Duration::from_millis(40)); // now >30ms since last touch
+        std::thread::sleep(Duration::from_millis(220)); // now well past ttl since last touch
         c.reap();
         assert_eq!(
             c.in_flight(PoolId::Range),
@@ -964,6 +1336,514 @@ mod tests {
     }
 
     #[test]
+    fn seeded_slot_is_committed_and_reconciled_by_cluster_truth() {
+        // A restart-seeded slot is COMMITTED: the reconciler is its authority —
+        // kept while the cluster still reports it Pending, released once absent.
+        // No seed_grace; no reliance on the TTL for the normal case.
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.seed("seeded-proof", PoolId::Range);
+        assert_eq!(c.in_flight(PoolId::Range), 1);
+
+        // Cluster still reports it Pending → reconcile keeps it.
+        let live: HashSet<String> = ["seeded-proof".to_string()].into_iter().collect();
+        c.reconcile(PendingObservation::Complete(live), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a seeded proof still Pending in the cluster is kept (it's genuinely running)"
+        );
+
+        // Cluster no longer reports it → reconcile releases it (threshold 1).
+        c.reconcile(PendingObservation::Complete(HashSet::new()), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "a seeded proof absent from the cluster is reconciled away"
+        );
+    }
+
+    #[test]
+    fn seeded_slot_reaped_by_backstop_ttl_when_reconcile_unavailable() {
+        // If the reconciler can't reach the cluster, the committed (seeded) slot
+        // is still bounded by the backstop TTL reaper.
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_millis(150), // ttl backstop (wide margin vs CI jitter)
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.seed("seeded-proof", PoolId::Range);
+        c.reap();
+        assert_eq!(c.in_flight(PoolId::Range), 1, "within ttl, kept");
+        std::thread::sleep(Duration::from_millis(220));
+        c.reap();
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "an unpolled committed slot is reclaimed by the backstop TTL"
+        );
+    }
+
+    #[test]
+    fn reap_never_reclaims_a_reserved_slot() {
+        // A RESERVED (uncommitted, in-flight handler) slot must NOT be reaped even
+        // past the TTL — it is owned by the request handler's guard. Reaping it
+        // would leave a live, about-to-be-created proof untracked → over-admit.
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_millis(30), // tiny ttl
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("reserved", 2, RANGE_VK, &[0x01]).unwrap(); // committed_at = None
+        std::thread::sleep(Duration::from_millis(45)); // well past ttl
+        c.reap();
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a reserved slot is guard-owned and must never be reaped"
+        );
+        assert!(c.slots.contains_key("reserved"));
+    }
+
+    #[test]
+    fn reconcile_releases_absent_proof_but_keeps_pending() {
+        // Range cap 2 so both admit. Threshold 1 → one absent observation releases.
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("p_live", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("p_gone", 2, RANGE_VK, &[0x01]).unwrap();
+        // Both are handed off to the cluster (committed); reconcile only ever
+        // touches committed slots.
+        c.guard("p_live").commit();
+        c.guard("p_gone").commit();
+        assert_eq!(c.in_flight(PoolId::Range), 2);
+
+        // Cluster now reports only p_live as Pending; p_gone finished/vanished.
+        let live: HashSet<String> = ["p_live".to_string()].into_iter().collect();
+        c.reconcile(PendingObservation::Complete(live), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "the absent proof's slot is released; the pending one is kept"
+        );
+        assert!(c.slots.contains_key("p_live"));
+        assert!(!c.slots.contains_key("p_gone"));
+    }
+
+    #[test]
+    fn reconcile_never_touches_a_reserved_uncommitted_slot() {
+        // A slot still RESERVED in the request_proof handler (uploading / about
+        // to create, not yet committed) has no cluster proof yet, so its absence
+        // from the live set must NOT reconcile it away — even at threshold 1.
+        // This is the regression guard for the upload-under-guard over-admit.
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("reserved", 2, RANGE_VK, &[0x01]).unwrap(); // committed_at = None
+        c.reconcile(PendingObservation::Complete(HashSet::new()), 1); // absent everywhere
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a reserved (uncommitted) slot must never be reconciled away"
+        );
+        assert!(c.slots.contains_key("reserved"));
+    }
+
+    #[test]
+    fn reconcile_spares_recently_committed_slot_even_if_absent() {
+        // A just-committed proof may not be visible in the cluster Pending list
+        // yet; with a threshold above 1, a single absent observation must spare it
+        // so reconcile can't race the create→registration window into an
+        // over-admit.
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("just_committed", 2, RANGE_VK, &[0x01])
+            .unwrap();
+        c.guard("just_committed").commit(); // committed_at = now
+        c.reconcile(PendingObservation::Complete(HashSet::new()), 2); // 1 absent < threshold 2 → spared
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a slot absent for fewer than the threshold observations must not be reconciled away"
+        );
+    }
+
+    #[test]
+    fn reconcile_requires_sustained_absence() {
+        // A committed slot is released only after being absent for
+        // `absent_observations` CONSECUTIVE Complete reconciles — a single absent
+        // observation isn't enough, and a reappearance resets the streak (so an
+        // anomalous/empty reply can't mass-release live slots).
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("p", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p").commit();
+        let empty: HashSet<String> = HashSet::new();
+        let n = 2; // release after 2 consecutive absent observations
+
+        // First absent observation: streak 1 < 2, does NOT release.
+        c.reconcile(PendingObservation::Complete(empty.clone()), n);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "one absent observation must not release"
+        );
+
+        // Reappears in the cluster set: streak resets to 0.
+        let live: HashSet<String> = ["p".to_string()].into_iter().collect();
+        c.reconcile(PendingObservation::Complete(live), n);
+        // A single absent observation after the reset is streak 1 < 2 → kept.
+        c.reconcile(PendingObservation::Complete(empty.clone()), n);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a reappearance resets the streak; a later single absent observation must not release"
+        );
+
+        // Second consecutive absent observation: streak 2 >= 2 → released.
+        c.reconcile(PendingObservation::Complete(empty), n);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "a slot absent for the full threshold of consecutive observations is released"
+        );
+    }
+
+    #[test]
+    fn skip_neither_resets_nor_advances_absent_streak() {
+        // A SKIPPED reconcile (query error/timeout/unimplemented) is a
+        // `PendingObservation::None`: a gap in observation. Because the streak is
+        // an OBSERVATION COUNT, a skip must leave it exactly as-is — neither reset
+        // (so a genuinely-gone proof still gets reclaimed across a flaky query,
+        // round-6 #3) nor advanced (so a gap can't forge absence).
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("p", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p").commit();
+        let empty: HashSet<String> = HashSet::new();
+        let n = 3;
+
+        // Absent #1 → streak 1.
+        c.reconcile(PendingObservation::Complete(empty.clone()), n);
+        assert_eq!(c.in_flight(PoolId::Range), 1);
+        // A skip must not release and must not touch the streak.
+        c.reconcile(PendingObservation::None, n);
+        assert_eq!(c.in_flight(PoolId::Range), 1, "a skip must not release");
+        // Absent #2 → streak 2 (< 3). If the skip had ADVANCED the streak, this
+        // would already be 3 and release — it must not.
+        c.reconcile(PendingObservation::Complete(empty.clone()), n);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a skip must not advance the streak"
+        );
+        // Absent #3 → streak 3 >= 3 → released. If the skip had RESET the streak,
+        // this would be only the 2nd post-skip absent and would not release — so
+        // reaching the threshold here proves absence accrued across the skip.
+        c.reconcile(PendingObservation::Complete(empty), n);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "absence accrues across the skip: 3 absent observations reach the threshold"
+        );
+    }
+
+    #[test]
+    fn reconcile_present_refreshes_reap_deadline() {
+        // A committed proof still in the cluster Pending set keeps the TTL reaper a
+        // TRUE backstop: reconcile seeing it Pending refreshes the reap deadline, so
+        // a genuinely-running-but-unpolled proof is NOT reaped out from under itself
+        // once its original TTL elapses.
+        let ttl = Duration::from_millis(80);
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            ttl,
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("p", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p").commit();
+        std::thread::sleep(Duration::from_millis(120)); // original deadline now passed
+        let live: HashSet<String> = ["p".to_string()].into_iter().collect();
+        c.reconcile(PendingObservation::Complete(live), 2); // present → deadline refreshed
+        c.reap(); // would reclaim on the stale deadline; refreshed one spares it
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a proof seen Pending by reconcile must not be reaped on its old deadline"
+        );
+    }
+
+    #[test]
+    fn seed_ghost_slot_released_by_reconcile_absence_not_ttl() {
+        // A restart-seeded slot for a proof that is NOT actually in the cluster (a
+        // stale/ghost seed) must be released by reconcile after the absence
+        // threshold — WITHOUT waiting for the (long) backstop TTL. This is the
+        // core "over-admit heals in minutes, not an hour" guarantee.
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600), // long TTL: reconcile must win, not this
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.seed("ghost", PoolId::Range);
+        assert_eq!(c.in_flight(PoolId::Range), 1);
+        let empty: HashSet<String> = HashSet::new();
+        // Absent #1 → streak 1 < 2, kept.
+        c.reconcile(PendingObservation::Complete(empty.clone()), 2);
+        assert_eq!(c.in_flight(PoolId::Range), 1);
+        // Absent #2 → streak 2 >= 2 → released, long before the 3600s TTL.
+        c.reconcile(PendingObservation::Complete(empty), 2);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "a ghost seed is reconciled away by cluster truth, not left to the TTL backstop"
+        );
+    }
+
+    #[test]
+    fn seed_over_cap_converges_via_reconcile() {
+        // Restart seed bypasses the cap (it reflects real backend in-flight), so
+        // counts can briefly exceed the cap. Reconcile against cluster truth
+        // converges them back down — the "#6 seed bypasses cap" behaviour is
+        // intentional and self-healing.
+        let c = enforce_ctrl(); // Range cap 1
+        c.seed("s1", PoolId::Range);
+        c.seed("s2", PoolId::Range);
+        c.seed("s3", PoolId::Range);
+        assert_eq!(c.in_flight(PoolId::Range), 3, "seed bypasses the cap");
+        // Cluster only still runs s2; s1/s3 are gone.
+        let live: HashSet<String> = ["s2".to_string()].into_iter().collect();
+        c.reconcile(PendingObservation::Complete(live), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "reconcile converges over-cap seeds back down to cluster truth"
+        );
+        assert!(c.slots.contains_key("s2"));
+    }
+
+    #[test]
+    fn partial_view_refreshes_present_but_never_releases_absent() {
+        // A truncated (Partial) Pending view is incomplete: it must NEVER release a
+        // slot merely absent from it (that slot may be on an unseen page), even at
+        // threshold 1 and across repeated Partials.
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("p_seen", 2, RANGE_VK, &[0x01]).unwrap();
+        c.try_acquire("p_unseen", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p_seen").commit();
+        c.guard("p_unseen").commit();
+        let partial: HashSet<String> = ["p_seen".to_string()].into_iter().collect();
+        c.reconcile(PendingObservation::Partial(partial.clone()), 1);
+        c.reconcile(PendingObservation::Partial(partial), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            2,
+            "a Partial (truncated) view must never release an absent slot"
+        );
+    }
+
+    #[test]
+    fn partial_view_refreshes_present_slot_deadline() {
+        // The slots a Partial view CAN see are trustworthy positive sightings, so
+        // their backstop reap deadline is refreshed (a genuinely-running proof
+        // visible on the page isn't reaped just because the page was truncated).
+        let ttl = Duration::from_millis(80);
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            ttl,
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("p", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p").commit();
+        std::thread::sleep(Duration::from_millis(120)); // original deadline passed
+        let partial: HashSet<String> = ["p".to_string()].into_iter().collect();
+        c.reconcile(PendingObservation::Partial(partial), 2); // present in partial → refreshed
+        c.reap();
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a slot present in a Partial view must have its reap deadline refreshed"
+        );
+    }
+
+    #[test]
+    fn reconcile_within_commit_grace_spares_absent_committed_slot() {
+        // A1: `commit` runs just before the cluster create, so during the create
+        // leg an absent committed slot must be SPARED until the commit grace
+        // elapses — otherwise an in-flight create is reconciled into an over-admit,
+        // even under an aggressive threshold (here 1). After the grace, absence
+        // counts normally.
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        )
+        .with_commit_grace(Duration::from_millis(120));
+        c.try_acquire("p", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p").commit(); // committed_at = now
+        let empty: HashSet<String> = HashSet::new();
+        // Absent while within the grace: NOT counted, even at threshold 1 across
+        // repeated reconciles.
+        c.reconcile(PendingObservation::Complete(empty.clone()), 1);
+        c.reconcile(PendingObservation::Complete(empty.clone()), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            1,
+            "a just-committed slot must be spared by the commit grace while its create leg runs"
+        );
+        // Past the grace: sustained absence now counts and (threshold 1) releases.
+        std::thread::sleep(Duration::from_millis(140));
+        c.reconcile(PendingObservation::Complete(empty), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "once past the commit grace, absence releases the slot"
+        );
+    }
+
+    #[test]
+    fn commit_grace_defaults_off_so_new_controllers_count_absence_immediately() {
+        // `new` leaves commit_grace = ZERO (opt-in via with_commit_grace), so a
+        // controller built without it counts absence from the first reconcile —
+        // the behaviour every other reconcile test here relies on.
+        let c = enforce_ctrl();
+        c.try_acquire("p", 2, RANGE_VK, &[0x01]).unwrap();
+        c.guard("p").commit();
+        c.reconcile(PendingObservation::Complete(HashSet::new()), 1);
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "with no commit grace, one absent Complete reconcile at threshold 1 releases"
+        );
+    }
+
+    #[test]
+    fn guard_drop_without_commit_releases_the_slot() {
+        // Every pre-commit early return in request_proof relies on the SlotGuard's
+        // Drop releasing the reserved slot.
+        let c = AdmissionController::new(
+            classifier(),
+            1,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        );
+        c.try_acquire("x", 2, RANGE_VK, &[0x01]).unwrap();
+        assert_eq!(c.in_flight(PoolId::Range), 1);
+        {
+            let _g = c.guard("x"); // dropped WITHOUT commit at end of scope
+        }
+        assert_eq!(
+            c.in_flight(PoolId::Range),
+            0,
+            "dropping an uncommitted guard must release the reserved slot"
+        );
+        assert!(!c.slots.contains_key("x"));
+    }
+
+    #[test]
     fn metrics_render_reflects_state() {
         let m = Arc::new(AdmissionMetrics::new());
         let c = AdmissionController::new(
@@ -981,9 +1861,17 @@ mod tests {
         c.try_acquire("p1", 2, RANGE_VK, &[0x01]).unwrap();
         let _ = c.try_acquire("p2", 2, RANGE_VK, &[0x01]); // rejected
         let out = m.render();
-        assert!(out.contains("gateway_admission_admitted"));
-        assert!(out.contains("gateway_admission_rejected"));
-        assert!(out.contains("pool=\"range\""));
+        // Assert the SAMPLE lines (label-set present ⇒ the counter actually
+        // incremented), not just the always-present `# TYPE` name — the latter
+        // would pass even if admit/reject accounting were dead.
+        assert!(
+            out.contains("gateway_admission_admitted_total{pool=\"range\"} 1"),
+            "admit must increment admitted_total for range:\n{out}"
+        );
+        assert!(
+            out.contains("gateway_admission_rejected_total{pool=\"range\"} 1"),
+            "over-cap shed must increment rejected_total for range:\n{out}"
+        );
     }
 
     const AA: &[u8] = &[0xAA]; // rank 0 (high)

@@ -217,40 +217,14 @@ where
             })?
             .to_string();
 
-        // Hot path: address the ELF by a deterministic id derived from vk_hash.
-        // While the cluster store still holds the bytes (Redis TTL = 4h), every
-        // subsequent prove() is a single `exists()` ping — no upload at all.
-        // Only on TTL miss do we re-upload from the durable `ProgramStore`.
-        let program_artifact_id = program_artifact_id(&body.vk_hash);
-        let warm = self
-            .client
-            .exists(&program_artifact_id, ArtifactType::Program)
-            .await
-            .map_err(|e| Status::internal(format!("artifact exists check failed: {e}")))?;
-        if !warm {
-            let (_vk_bytes, elf_bytes) = self
-                .program_store
-                .get(&body.vk_hash)
-                .await
-                .map_err(|e| Status::internal(format!("program store load failed: {e}")))?
-                .ok_or_else(|| {
-                    Status::failed_precondition(format!(
-                        "program not registered for vk_hash {}",
-                        hex::encode(&body.vk_hash)
-                    ))
-                })?;
-            self.client
-                .upload_raw(&program_artifact_id, ArtifactType::Program, elf_bytes)
-                .await
-                .map_err(|e| Status::internal(format!("upload program artifact failed: {e}")))?;
-        }
-
         let request_id = mint_request_id();
         let proof_id = proof_id_from_request_id(&request_id);
 
-        // Admission gate: shed overflow before it reaches the shared cluster.
-        // Keyed by the proof_id we just minted (single-phase — the id is known
-        // before the cluster create). Ungated requests take no slot.
+        // Admission gate: shed overflow BEFORE it touches the shared cluster —
+        // in particular BEFORE the program-ELF upload below, which on a cold
+        // cache is a multi-MB push over the WAN. mode/vk_hash/requester are all
+        // known here, so an over-cap request is shed without any cluster I/O.
+        // Keyed by the proof_id we just minted. Ungated requests take no slot.
         if let Err(rej) =
             self.admission
                 .try_acquire(&proof_id, body.mode, &body.vk_hash, requester.as_slice())
@@ -279,10 +253,41 @@ where
             return Err(admission_shed_status(&scope));
         }
 
-        // RAII: from here on, any early return releases the reserved slot. We
-        // `commit()` only once the cluster has accepted the request, handing
-        // the slot off to the terminal-poll release path.
+        // RAII: while the slot is RESERVED (up to and including the program
+        // upload / artifact create below), any early return or a dropped/
+        // cancelled future releases it via the guard's Drop — the reconciler and
+        // reaper never touch a reserved slot. It is `commit()`ed just before the
+        // cluster create (see below), after which the cluster Pending set is its
+        // authority.
         let slot = self.admission.guard(&proof_id);
+
+        // Hot path: address the ELF by a deterministic id derived from vk_hash.
+        // While the cluster store still holds the bytes (Redis TTL = 4h), every
+        // subsequent prove() is a single `exists()` ping — no upload at all.
+        // Only on TTL miss do we re-upload from the durable `ProgramStore`.
+        let program_artifact_id = program_artifact_id(&body.vk_hash);
+        let warm = self
+            .client
+            .exists(&program_artifact_id, ArtifactType::Program)
+            .await
+            .map_err(|e| Status::internal(format!("artifact exists check failed: {e}")))?;
+        if !warm {
+            let (_vk_bytes, elf_bytes) = self
+                .program_store
+                .get(&body.vk_hash)
+                .await
+                .map_err(|e| Status::internal(format!("program store load failed: {e}")))?
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "program not registered for vk_hash {}",
+                        hex::encode(&body.vk_hash)
+                    ))
+                })?;
+            self.client
+                .upload_raw(&program_artifact_id, ArtifactType::Program, elf_bytes)
+                .await
+                .map_err(|e| Status::internal(format!("upload program artifact failed: {e}")))?;
+        }
 
         let proof_artifact = self
             .client
@@ -302,11 +307,31 @@ where
             gas_limit: body.gas_limit,
             scheduled_by: None,
         };
+        // Commit the slot BEFORE the create await. From here the proof may reach
+        // the cluster, so NO create outcome may release the slot locally:
+        //  - Ok        → committed (the reconciler keeps it while it is Pending);
+        //  - Err       → the create may still have registered the proof and only
+        //                lost the response (ambiguous), so we keep it committed
+        //                and let the reconciler release it iff the cluster reports
+        //                it absent — no fragile error-string classification;
+        //  - cancelled → the future is dropped mid-await, but the guard was
+        //                already committed, so its Drop does NOT release either.
+        // The cluster Pending set is the single authority for a committed slot.
+        // Committing also stops the router's retry from double-creating (the slot
+        // stays held, so the retry is shed). The forward can't hang indefinitely:
+        // the shared ClusterServiceClient bounds it with its own request timeout.
+        slot.commit();
+        // `Internal` is deliberate here (NOT a passthrough of the cluster's gRPC
+        // code). The SP1 SDK treats Internal — like Unavailable/DeadlineExceeded —
+        // as a TRANSIENT error and retries the create in place; it treats
+        // ResourceExhausted as PERMANENT, which makes op-succinct give up and
+        // bisect the range. So mapping a cluster-forward failure (incl. a cluster
+        // ResourceExhausted from an overloaded backend) to Internal keeps it
+        // retryable and avoids spurious range bisection. Do not "preserve the code."
         self.cluster
             .create_proof_request(create)
             .await
             .map_err(|e| Status::internal(format!("cluster create_proof_request failed: {e}")))?;
-        slot.commit();
 
         info!(
             proof_id,
@@ -1795,20 +1820,13 @@ mod tests {
 
         let svc = mk_with_admission(admission.clone());
 
-        // The gate sits AFTER the program warm-up block (right after proof_id
-        // mint), so the request must clear that block first. Pre-warm the
-        // deterministic program artifact directly (mirrors an already-hot
-        // ELF from a prior prove()) so we don't need program_store
-        // registration to reach the gate.
+        // The gate now runs BEFORE the program exists()/upload block, so an
+        // over-cap request is shed without touching the shared cluster store.
+        // Deliberately DO NOT register or pre-warm the program: the vk_hash is
+        // unknown, so if the gate ran after the program check this would fail
+        // with FailedPrecondition (program not registered). Asserting the shed
+        // Unavailable below therefore proves the gate is ahead of the upload.
         let vk_hash = vec![0xbb; 4];
-        svc.client
-            .upload_raw(
-                &program_artifact_id(&vk_hash),
-                ArtifactType::Program,
-                b"\x7fELF fake".to_vec(),
-            )
-            .await
-            .unwrap();
 
         let body = pb::RequestProofRequestBody {
             nonce: 0,
@@ -1829,7 +1847,11 @@ mod tests {
             body: Some(body),
         };
         let err = svc.request_proof(Request::new(req)).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "over-cap request must be shed BEFORE the program-store check (gate precedes upload)"
+        );
     }
 
     #[tokio::test]

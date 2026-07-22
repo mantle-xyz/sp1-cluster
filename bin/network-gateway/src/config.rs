@@ -115,13 +115,68 @@ pub struct Config {
     #[arg(long, env = "GATEWAY_ADMISSION_REAP_PERIOD_SECS", default_value_t = 60)]
     pub admission_reap_period_secs: u64,
 
-    /// Slot TTL (seconds). A live proof is `touch`ed on every non-terminal
-    /// status/details poll, so this MUST exceed the maximum gap between a
-    /// client's consecutive polls — NOT the proof duration. A slot unpolled for
-    /// longer is treated as abandoned and reclaimed. The default (3600) clears
-    /// any realistic SDK poll backoff.
+    /// Slot TTL (seconds): the reap BACKSTOP for a committed slot. A live proof
+    /// refreshes it on every non-terminal status/details poll (`touch`) AND
+    /// whenever a reconcile sees it still Pending, so in normal operation the
+    /// reconciler frees finished/gone slots and this only fires when reconcile
+    /// CANNOT confirm liveness (cluster query persistently failing/truncated) AND
+    /// no client is polling. It must therefore exceed the maximum gap between a
+    /// slot's liveness signals (a client poll OR a reconcile-present observation),
+    /// NOT the proof duration. It also bounds a hung pre-commit upload (a RESERVED
+    /// slot is reclaimed once past this). The default (3600) clears any realistic
+    /// gap.
     #[arg(long, env = "GATEWAY_ADMISSION_SLOT_TTL_SECS", default_value_t = 3600)]
     pub admission_slot_ttl_secs: u64,
+
+    /// Reconcile absence threshold (count): a COMMITTED slot is released only
+    /// after the cluster's Pending set has shown it ABSENT for this many
+    /// CONSECUTIVE successful reconciles. A present observation or a client poll
+    /// resets the streak to 0; a SKIPPED reconcile (truncated / timeout / query
+    /// error / unimplemented) leaves the streak unchanged (it is an observation
+    /// count, not a wall clock, so a gap in observation neither advances nor
+    /// resets it). The wall-clock debounce window is therefore ≈ this count ×
+    /// reap period. Must be >= 2 (a single anomalous empty reply must never
+    /// release a live slot), and `count × reap_period` must stay below the slot
+    /// TTL (else the TTL backstop fires before reconcile can). Default 3.
+    #[arg(
+        long,
+        env = "GATEWAY_ADMISSION_RECONCILE_ABSENT_OBSERVATIONS",
+        default_value_t = 3
+    )]
+    pub admission_reconcile_absent_observations: u32,
+
+    /// Grace period (seconds) after a slot is COMMITTED before the reconciler may
+    /// begin counting it absent. `request_proof` commits the slot just BEFORE the
+    /// cluster `create_proof_request`, so during that create call the proof is not
+    /// in the cluster's Pending set yet and would otherwise look "absent" to
+    /// reconcile. This grace should meet or exceed the maximum create-leg latency
+    /// (bounded by the cluster client's request timeout; the default 60 matches
+    /// it, and the downstream absent-observation debounce adds further margin) so
+    /// an in-flight create can't be reconciled away into an over-admit. It is
+    /// independent of the reap cadence,
+    /// so it protects even an aggressively-fast reconcile config (small
+    /// `reap_period` × `absent_observations`). A committed slot is spared —
+    /// exactly like a RESERVED one — until it has been committed for this long.
+    /// Default 60 (matches the cluster client's channel timeout). 0 disables the
+    /// grace (only safe when `absent_observations × reap_period` already exceeds
+    /// the create-leg latency).
+    #[arg(
+        long,
+        env = "GATEWAY_ADMISSION_RECONCILE_COMMIT_GRACE_SECS",
+        default_value_t = 60
+    )]
+    pub admission_reconcile_commit_grace_secs: u64,
+
+    /// Per-tick timeout (seconds) for the reconcile Pending-set query, so a
+    /// slow/half-open cluster can't stretch the reaper cadence. Must stay within
+    /// one reap period (the fetch is awaited inline in the reaper loop). Default
+    /// 10.
+    #[arg(
+        long,
+        env = "GATEWAY_ADMISSION_RECONCILE_FETCH_TIMEOUT_SECS",
+        default_value_t = 10
+    )]
+    pub admission_reconcile_fetch_timeout_secs: u64,
 
     /// Enable priority-aware slot allocation (requires ENFORCE to actually
     /// hold; in dry-run it only emits `would_yield`). Default off.
