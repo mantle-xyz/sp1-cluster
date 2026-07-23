@@ -182,16 +182,20 @@ impl ClusterService for FakeCluster {
                 "simulated proof_request_list outage",
             ));
         }
-        // Honor the proof_status filter like the real cluster api, so the
-        // gateway's reconciler sees only the requested states (an empty filter
-        // means "no status filter"). Without this the reconciler would always
-        // see every proof as still-pending and never reconcile.
+        // Honor the proof_status AND minimum_deadline filters like the real
+        // cluster api (`bin/api/src/service.rs`: `AND deadline >= $min`), so the
+        // gateway's reconciler sees only the requested states and only NON-EXPIRED
+        // proofs. An empty status filter means "no status filter". Without the
+        // deadline filter the reconciler would count past-deadline zombie rows the
+        // cluster will never run — the bug `minimum_deadline = now` in
+        // `fetch_pending_proofs` fixes.
         let req = request.into_inner();
         let proof_requests = self
             .requests
             .iter()
             .map(|r| r.clone())
             .filter(|r| req.proof_status.is_empty() || req.proof_status.contains(&r.proof_status))
+            .filter(|r| req.minimum_deadline.is_none_or(|min| r.deadline >= min))
             .collect();
         Ok(tonic::Response::new(cluster_pb::ProofRequestListResponse {
             proof_requests,
@@ -879,6 +883,81 @@ async fn e2e_admission_reconcile_releases_completed_proof() {
     assert!(
         admitted,
         "the reconciler must release the completed proof's slot and re-admit"
+    );
+
+    stack.shutdown().await;
+}
+
+/// The reconciler releases a COMMITTED slot once its proof, though STILL
+/// `Pending`, has passed its cluster `deadline` — a ZOMBIE the cluster will never
+/// run (the coordinator's claimer and every fulfillment query gate on
+/// `deadline >= now`, so an expired row consumes zero capacity). Admit a Pending
+/// proof (holds the sole Range slot), rewrite its stored deadline into the past
+/// so the Pending query — which now sends `minimum_deadline = now` — no longer
+/// returns it, and confirm the reconciler frees the slot and re-admits. This is
+/// the regression guard for "admission occupancy must track the cluster's
+/// RUNNABLE set, not raw Pending status" (a zombie must not wedge the pool).
+#[tokio::test]
+async fn e2e_admission_reconcile_releases_expired_pending_proof() {
+    let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
+
+    let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
+        cfg.admission_enforce = true;
+        cfg.admission_range_max_inflight = 1;
+        cfg.admission_reap_period_secs = 1;
+        cfg.admission_reconcile_fetch_timeout_secs = 1;
+        cfg.admission_reconcile_absent_observations = 2;
+        // Long TTL so it's the (prompt) deadline-aware reconcile release — NOT the
+        // backstop reaper — that frees the slot. If the deadline filter were
+        // missing, the still-Pending proof would keep its slot until this TTL and
+        // the bounded poll below would time out, failing the test.
+        cfg.admission_slot_ttl_secs = 3600;
+    })
+    .await;
+
+    let vk_hash = vec![0xde; 32];
+    register_program(&mut stack, &vk_hash).await;
+
+    // Proof stays Pending (never auto-completes) and holds the sole Range slot.
+    stack.pending.store(true, Ordering::SeqCst);
+    let body1 = compressed_body(&mut stack, &vk_hash).await;
+    send_request_proof(&mut stack, body1)
+        .await
+        .expect("first request admitted");
+
+    // Cap 1 full → a 2nd request is shed.
+    let body2 = compressed_body(&mut stack, &vk_hash).await;
+    let shed = send_request_proof(&mut stack, body2)
+        .await
+        .expect_err("pool at capacity → shed");
+    assert_eq!(shed.code(), tonic::Code::Unavailable, "got {shed:?}");
+
+    // The proof is STILL Pending, but its deadline is now in the past — the
+    // cluster will never run it. Rewrite the stored deadline so the Pending query
+    // (minimum_deadline = now) drops it from the live/runnable set.
+    for mut r in stack.requests.iter_mut() {
+        r.value_mut().deadline = 1; // unix second 1 — long past
+    }
+
+    // The reconciler observes the committed slot absent from the RUNNABLE set and
+    // frees it; a follow-up then admits. Poll (bounded) rather than sleep a fixed
+    // time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut admitted = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let body = compressed_body(&mut stack, &vk_hash).await;
+        match send_request_proof(&mut stack, body).await {
+            Ok(_) => {
+                admitted = true;
+                break;
+            }
+            Err(e) => assert_eq!(e.code(), tonic::Code::Unavailable, "got {e:?}"),
+        }
+    }
+    assert!(
+        admitted,
+        "an expired-deadline Pending proof must be reconciled away — it consumes no cluster capacity"
     );
 
     stack.shutdown().await;

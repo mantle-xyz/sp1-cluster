@@ -404,8 +404,23 @@ fn classify_pending(proofs: Vec<cluster_pb::ProofRequest>, limit: usize) -> Pend
     }
 }
 
-/// Fetch the cluster's current in-flight (`Pending`) proof requests. Shared by
-/// the boot-time seed and the per-tick reconcile so both see the same view.
+/// Fetch the cluster's current LIVE (runnable) proof requests: `Pending` AND
+/// `deadline >= now`. Shared by the boot-time seed and the per-tick reconcile so
+/// both see the same view.
+///
+/// The `minimum_deadline = now` filter is load-bearing, not cosmetic. `Pending`
+/// alone conflates a proof the cluster is actually running/will run with a
+/// past-deadline ZOMBIE that no cluster component will ever touch: the
+/// coordinator's proof-claimer (`bin/coordinator/src/cluster.rs`) and every
+/// fulfillment query (`crates/fulfillment/src/lib.rs`) all gate on
+/// `minimum_deadline = now`, so an expired `Pending` row is claimed by no one and
+/// consumes zero backend capacity. Admission slots exist to bound proofs that
+/// actually consume the shared cluster, so the gate MUST define "occupying" the
+/// same way the cluster defines "runnable" — otherwise a stale `Pending` row
+/// (e.g. op-succinct abandoned a request_id and re-requested under a new one, and
+/// nothing ever moved the old row to a terminal status) wedges a scarce pool
+/// forever against a proof that isn't running. Filtering here makes such rows
+/// drop out of the live set → reconcile treats them absent → their slots release.
 ///
 /// Returns the cluster client's `eyre::Report` UNWRAPPED (no added context): the
 /// client builds it via `?` from the RPC's `tonic::Status`, so the report's root
@@ -415,11 +430,17 @@ fn classify_pending(proofs: Vec<cluster_pb::ProofRequest>, limit: usize) -> Pend
 async fn fetch_pending_proofs(
     cluster: &ClusterServiceClient,
 ) -> eyre::Result<Vec<cluster_pb::ProofRequest>> {
+    // Absolute unix SECONDS, matching how the cluster stores/compares `deadline`
+    // (coordinator + fulfillment both pass `now.as_secs()`).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     cluster
         .get_proof_requests(cluster_pb::ProofRequestListRequest {
             proof_status: vec![cluster_pb::ProofRequestStatus::Pending as i32],
             execution_status: vec![],
-            minimum_deadline: None,
+            minimum_deadline: Some(now_secs),
             handled: None,
             limit: Some(PENDING_QUERY_LIMIT),
             offset: None,

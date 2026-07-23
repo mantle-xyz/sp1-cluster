@@ -627,12 +627,18 @@ impl AdmissionController {
     /// reconciler releases finished/gone proofs; this only catches slots stranded
     /// by a prolonged cluster-query outage.
     ///
-    /// Consequence: while reconcile is working, a proof that stays Pending
-    /// forever (a cluster-side deadlock) keeps its deadline refreshed and is
-    /// therefore NEVER reaped — its slot is held until the proof resolves or the
-    /// gateway restarts. That is intentional: the proof genuinely occupies
-    /// cluster proving capacity, so freeing the slot would over-admit against it;
-    /// the `GatewayRangeSlotWedged` alert is the human-facing signal instead.
+    /// Consequence: while reconcile is working, a proof that stays Pending AND is
+    /// still within its deadline (a genuinely slow proof, or a cluster-side
+    /// deadlock the cluster still considers live) keeps its deadline refreshed and
+    /// is therefore NEVER reaped — its slot is held until the proof resolves, its
+    /// cluster `deadline` passes, or the gateway restarts. That is intentional:
+    /// such a proof still occupies cluster proving capacity, so freeing the slot
+    /// would over-admit against it; the `GatewayRangeSlotWedged` alert is the
+    /// human-facing signal instead. Note the reconcile's "live" set is the
+    /// cluster's RUNNABLE set (`Pending ∧ deadline ≥ now`, see `fetch_pending_proofs`),
+    /// NOT every `Pending` row: a past-deadline zombie the cluster will never run
+    /// drops out of the live set and is released by reconcile (not left to this
+    /// backstop), because it consumes no capacity.
     ///
     /// RESERVED slots are deliberately NOT reaped, even past their deadline: they
     /// are owned by the in-flight handler's [`SlotGuard`], and their proof may
