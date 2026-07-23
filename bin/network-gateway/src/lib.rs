@@ -228,7 +228,39 @@ where
                         PendingObservation::None
                     }
                 };
-                reaper.reconcile(obs, reconcile_absent_observations);
+                // One INFO line per reap period summarizing what reconcile saw
+                // and did. This is the operator's window into "why are slots not
+                // being released" — it distinguishes a starved reconcile
+                // (kind=skip: cluster query failing/timing out), a cluster that
+                // still reports the proofs Pending (kind=complete, present>0,
+                // released=0 → the proofs are genuinely/anomalously in the Pending
+                // set, not a gateway bug), and a working release (released>0). Its
+                // ABSENCE every tick means the reaper task itself is not running.
+                // Bounded snapshot of the RAW cluster Pending ids this tick, so the
+                // log shows exactly what the query returned — the ground truth to
+                // compare our tracked (seeded) slot ids against. If the seeds are
+                // absent here, they should be released; if present, the cluster is
+                // still reporting them Pending.
+                const PENDING_SAMPLE_CAP: usize = 64;
+                let pending_ids: Vec<String> = match &obs {
+                    PendingObservation::Complete(ids) | PendingObservation::Partial(ids) => {
+                        ids.iter().take(PENDING_SAMPLE_CAP).cloned().collect()
+                    }
+                    PendingObservation::None => Vec::new(),
+                };
+                let report = reaper.reconcile(obs, reconcile_absent_observations);
+                info!(
+                    kind = report.kind,
+                    live = report.live,
+                    committed = report.committed_tracked,
+                    present = report.present,
+                    absent = report.absent,
+                    released = report.released,
+                    pending_ids = ?pending_ids,
+                    present_ids = ?report.present_ids,
+                    absent_ids = ?report.absent_ids,
+                    "admission reconcile tick"
+                );
             }
             // Reap runs every tick (even when reconcile is skipped) as the TTL
             // backstop for committed slots reconcile couldn't confirm.

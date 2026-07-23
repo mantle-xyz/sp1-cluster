@@ -218,6 +218,35 @@ impl Slot {
     }
 }
 
+/// Per-tick summary of a [`reconcile`](AdmissionController::reconcile) pass,
+/// returned so the reaper loop can log — at INFO, once per reap period — exactly
+/// what the reconcile observed and did. This closes a real observability blind
+/// spot: previously a reconcile that saw every slot still Pending logged NOTHING
+/// (present-kept is silent) and a skipped query logged only at debug, so "slots
+/// held but nothing being released" was indistinguishable from "reconcile task
+/// dead" without recompiling. `kind` is `"complete"` | `"partial"` | `"skip"`.
+#[derive(Debug, Default, Clone)]
+pub struct ReconcileReport {
+    /// Which observation this tick processed.
+    pub kind: &'static str,
+    /// Size of the cluster Pending set seen this tick (0 for a skip).
+    pub live: usize,
+    /// COMMITTED slots examined (reserved slots are not the reconciler's business).
+    pub committed_tracked: usize,
+    /// Committed slots confirmed present in the cluster Pending set.
+    pub present: usize,
+    /// Committed slots absent from it (spared by partial/commit-grace, or counted).
+    pub absent: usize,
+    /// Slots released this tick (sustained-absence threshold reached).
+    pub released: usize,
+    /// Committed slot ids confirmed present in the Pending set (bounded, for logs).
+    pub present_ids: Vec<String>,
+    /// Committed slot ids absent from the Pending set (bounded, for logs) — the
+    /// ones the reconciler is (or would be) releasing. Seeing the seeded/wedged
+    /// ids here vs in the raw Pending set is the id-match diagnostic.
+    pub absent_ids: Vec<String>,
+}
+
 /// Global per-proof-type concurrency gate. Single-instance, in-memory.
 pub struct AdmissionController {
     caps: PerPool,
@@ -688,23 +717,41 @@ impl AdmissionController {
     /// query failures. `absent_observations` therefore just sets how many clean
     /// absent snapshots confirm a proof is gone; the effective debounce window is
     /// `absent_observations × reap_period`.
-    pub fn reconcile(&self, obs: PendingObservation, absent_observations: u32) {
-        let (live, partial) = match &obs {
+    pub fn reconcile(&self, obs: PendingObservation, absent_observations: u32) -> ReconcileReport {
+        let (live, partial, kind) = match &obs {
             // A gap in observation: leave every streak unchanged. Nothing to do.
-            PendingObservation::None => return,
-            PendingObservation::Complete(live) => (live, false),
-            PendingObservation::Partial(live) => (live, true),
+            PendingObservation::None => {
+                return ReconcileReport {
+                    kind: "skip",
+                    ..Default::default()
+                }
+            }
+            PendingObservation::Complete(live) => (live, false, "complete"),
+            PendingObservation::Partial(live) => (live, true, "partial"),
         };
         let now = Instant::now();
         // Pass 1: update each committed slot's absence streak (reserved slots are
-        // ignored). Collect the ids whose streak reached the release threshold.
+        // ignored). Collect the ids whose streak reached the release threshold, and
+        // tally present/absent among committed slots for the per-tick report.
         let mut stale: Vec<String> = Vec::new();
+        let mut committed_tracked = 0usize;
+        let mut present_ct = 0usize;
+        let mut absent_ct = 0usize;
+        // Bounded id samples for the per-tick log (committed slots only, so at most
+        // ~pool caps + seeds — already tiny; cap anyway to stay log-safe).
+        const ID_SAMPLE_CAP: usize = 64;
+        let mut present_ids: Vec<String> = Vec::new();
+        let mut absent_ids: Vec<String> = Vec::new();
         for mut e in self.slots.iter_mut() {
-            let present = live.contains(e.key());
+            // Clone the key up front: `e.key()` and `e.value_mut()` can't be held
+            // together, and the arms below both mutate the slot and record the id.
+            let key = e.key().clone();
+            let present = live.contains(&key);
             let s = e.value_mut();
             if !s.is_committed() {
                 continue; // RESERVED — not the reconciler's business
             }
+            committed_tracked += 1;
             if present {
                 // Confirmed live in the cluster → liveness signal (reset streak +
                 // refresh the backstop reap deadline). This keeps the TTL reaper a
@@ -712,6 +759,10 @@ impl AdmissionController {
                 // CAN'T confirm liveness, never one reconcile just saw Pending — so
                 // a genuinely-running-but-unpolled proof isn't reaped out from
                 // under itself.
+                present_ct += 1;
+                if present_ids.len() < ID_SAMPLE_CAP {
+                    present_ids.push(key.clone());
+                }
                 s.observe_live(now, self.ttl);
             } else if partial {
                 // Truncated (incomplete) view: a slot missing from a capped page
@@ -719,7 +770,10 @@ impl AdmissionController {
                 // streak — that would risk releasing a live slot we didn't see.
                 // Present slots above were still refreshed on the trustworthy
                 // positive sightings.
-                continue;
+                absent_ct += 1;
+                if absent_ids.len() < ID_SAMPLE_CAP {
+                    absent_ids.push(key.clone());
+                }
             } else if s
                 .committed_at
                 .is_some_and(|t| now.saturating_duration_since(t) < self.commit_grace)
@@ -732,9 +786,18 @@ impl AdmissionController {
                 // grace is wall-clock (independent of the reap cadence), so this
                 // holds even under an aggressively-fast `absent_observations ×
                 // reap_period` window.
-                continue;
-            } else if s.observe_absent() >= absent_observations {
-                stale.push(e.key().clone());
+                absent_ct += 1;
+                if absent_ids.len() < ID_SAMPLE_CAP {
+                    absent_ids.push(key.clone());
+                }
+            } else {
+                absent_ct += 1;
+                if absent_ids.len() < ID_SAMPLE_CAP {
+                    absent_ids.push(key.clone());
+                }
+                if s.observe_absent() >= absent_observations {
+                    stale.push(key);
+                }
             }
         }
         // Pass 2: release the slots that reached the threshold. remove_and_dec
@@ -746,18 +809,28 @@ impl AdmissionController {
         // are dropped before we lock counts, preserving the counts→slots order.
         let sustained_absent =
             |s: &Slot| s.is_committed() && s.absent_streak >= absent_observations;
-        let mut reclaimed = 0usize;
+        let mut released = 0usize;
         for id in stale {
             if let Some(pool) = self.remove_and_dec(&id, sustained_absent) {
                 self.metric_reconciled(pool);
-                reclaimed += 1;
+                released += 1;
             }
         }
-        if reclaimed > 0 {
+        if released > 0 {
             tracing::info!(
-                reclaimed,
+                released,
                 "admission reconciler released slots continuously absent from the cluster Pending set"
             );
+        }
+        ReconcileReport {
+            kind,
+            live: live.len(),
+            committed_tracked,
+            present: present_ct,
+            absent: absent_ct,
+            released,
+            present_ids,
+            absent_ids,
         }
     }
 
