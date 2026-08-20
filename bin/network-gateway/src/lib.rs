@@ -265,6 +265,9 @@ where
             // Reap runs every tick (even when reconcile is skipped) as the TTL
             // backstop for committed slots reconcile couldn't confirm.
             reaper.reap();
+            // Publish per-requester occupancy AFTER reclaiming, so a slot the
+            // reaper/reconciler just freed does not show up as still held.
+            reaper.report_slot_ages();
         }
     });
 
@@ -478,6 +481,33 @@ fn pending_query_unimplemented(e: &eyre::Report) -> bool {
 /// were only classified by an explicit `*_VK_HASHES` override won't be
 /// re-classified correctly by this path, but the default mode-based
 /// classification (Compressed → Range, Plonk/Groth16 → Agg) still applies.
+/// How long ago a proof was created, for back-dating a seeded slot's age.
+/// `None` when the cluster record gives no usable answer.
+///
+/// `created_at` is the cluster's wall clock (Postgres `NOW()` at insert) while
+/// `now_unix` is this host's, so the result carries whatever skew exists between
+/// them — seconds under NTP, which is immaterial against a 10-minute alert
+/// threshold.
+///
+/// The upper bound is the load-bearing part. Seeding runs exactly once, at boot,
+/// which is precisely when a host's clock is least trustworthy (unsynced RTC, or
+/// a container started before chrony's first step). A clock running ahead turns
+/// into a huge age, and since nothing downstream clamps it — `Instant::checked_sub`
+/// does not — it would sail past the wedged-slot threshold and page a P0 seconds
+/// after startup. A false P0 is indistinguishable from a real one, so anything
+/// beyond a generous multiple of the 4h PROVING_TIMEOUT is treated as garbage and
+/// the slot is reported as freshly admitted (under-reporting, the safe direction).
+fn backdated_age(created_at: u64, now_unix: std::time::Duration) -> Option<std::time::Duration> {
+    /// Well past any real proof (4h timeout), still far below a clock-skew value.
+    const MAX_PLAUSIBLE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+    if created_at == 0 {
+        return None; // field never set
+    }
+    now_unix
+        .checked_sub(std::time::Duration::from_secs(created_at)) // None if in the future
+        .filter(|age| *age <= MAX_PLAUSIBLE)
+}
+
 async fn seed_admission_from_cluster(
     admission: &AdmissionController,
     cluster: &ClusterServiceClient,
@@ -492,7 +522,15 @@ async fn seed_admission_from_cluster(
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         if let Some(pool) = admission.classify(mode, &[]) {
-            admission.seed(&proof.id, pool);
+            // Carry the cluster's own requester/created_at across the restart, so
+            // a proof that was already stuck keeps both its attribution and its
+            // real age instead of looking brand new.
+            let requester = (!proof.requester.is_empty()).then(|| proof.requester.clone());
+            let age = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|now| backdated_age(proof.created_at, now));
+            admission.seed(&proof.id, pool, requester, age);
             seeded += 1;
         }
     }
@@ -753,6 +791,46 @@ mod tests {
     #[test]
     fn build_admission_accepts_defaults() {
         assert!(build_admission(&base_cfg()).is_ok());
+    }
+
+    /// The wall-clock → age conversion behind seeded-slot back-dating.
+    ///
+    /// Covered here rather than through `seed()` because the admission tests pass
+    /// a `Duration` directly and so never exercise this arithmetic — where the
+    /// unit confusion (secs vs millis) and the clock-skew blow-up both live.
+    #[test]
+    fn backdated_age_handles_unset_skewed_and_normal_timestamps() {
+        let now = std::time::Duration::from_secs(1_700_000_000);
+
+        // Normal: created 20 minutes ago.
+        assert_eq!(
+            backdated_age(1_700_000_000 - 1200, now),
+            Some(std::time::Duration::from_secs(1200)),
+            "a 20-minute-old proof must report 1200 SECONDS (not millis)"
+        );
+
+        // Field never set.
+        assert_eq!(backdated_age(0, now), None);
+
+        // Created "in the future" — this host's clock is behind the cluster's.
+        assert_eq!(backdated_age(1_700_000_060, now), None);
+
+        // This host's clock is far ahead (unsynced RTC at boot). Without the
+        // plausibility bound this would be ~53 years of age and would page a P0
+        // immediately after startup.
+        assert_eq!(backdated_age(1, now), None);
+
+        // Boundaries of the 6h bound.
+        assert_eq!(
+            backdated_age(1_700_000_000 - 6 * 3600, now),
+            Some(std::time::Duration::from_secs(6 * 3600)),
+            "exactly at the bound is still plausible"
+        );
+        assert_eq!(
+            backdated_age(1_700_000_000 - (6 * 3600 + 1), now),
+            None,
+            "one second past the bound is treated as garbage"
+        );
     }
 
     #[test]

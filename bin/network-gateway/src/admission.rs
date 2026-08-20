@@ -169,6 +169,21 @@ impl PerPool {
 /// reconciled out from under a live-but-not-yet-registered proof.
 struct Slot {
     pool: PoolId,
+    /// Who holds this slot, for per-requester occupancy reporting. `None` only
+    /// when genuinely unknown — a seeded proof whose cluster record carries no
+    /// requester — which reports as `unknown`.
+    requester: Option<Vec<u8>>,
+    /// When this slot was acquired. Distinct from every other instant here on
+    /// purpose: `deadline` is refreshed by liveness signals and `committed_at`
+    /// marks the hand-off to the cluster, so neither can answer "how long has
+    /// this been held". Never refreshed.
+    ///
+    /// For a SEEDED slot this is back-dated from the cluster's `created_at` so
+    /// occupancy survives a gateway restart. That matters more than it sounds:
+    /// restarting the gateway is a common first move during an incident, and
+    /// without back-dating every stuck proof's age would reset to zero exactly
+    /// when someone is trying to find it.
+    admitted_at: Instant,
     /// Absolute backstop reap deadline (`now + ttl`), refreshed on commit/touch.
     /// Only consulted for COMMITTED slots and only as a backstop for when the
     /// reconciler can't reach the cluster; a live proof is `touch`ed so it never
@@ -482,11 +497,14 @@ impl AdmissionController {
             // the caps grow large enough that the sweep stall becomes measurable —
             // then switch reconcile to short per-id `get_mut`s instead of a long
             // `iter_mut`.
+            let now = Instant::now();
             self.slots.insert(
                 proof_id.to_string(),
                 Slot {
                     pool,
-                    deadline: Instant::now() + self.ttl,
+                    requester: Some(requester.to_vec()),
+                    admitted_at: now,
+                    deadline: now + self.ttl,
                     committed_at: None,
                     absent_streak: 0,
                 },
@@ -514,7 +532,17 @@ impl AdmissionController {
     /// running, i.e. present in its Pending set), so the reconciler is its
     /// authority: it is kept while the cluster still reports the proof Pending
     /// and released once it goes terminal/absent — no special grace needed.
-    pub fn seed(&self, proof_id: &str, pool: PoolId) {
+    /// `requester` / `age` come from the cluster's own record of the proof (its
+    /// `requester` and `created_at` fields), so a restart preserves both the
+    /// attribution and the true age. Pass `None` for either when the record does
+    /// not carry it.
+    pub fn seed(
+        &self,
+        proof_id: &str,
+        pool: PoolId,
+        requester: Option<Vec<u8>>,
+        age: Option<Duration>,
+    ) {
         if self.slots.contains_key(proof_id) {
             return;
         }
@@ -532,6 +560,18 @@ impl AdmissionController {
                 proof_id.to_string(),
                 Slot {
                     pool,
+                    requester,
+                    // Back-date to the proof's real admission, so a restart does
+                    // not reset a wedged proof's age to zero.
+                    //
+                    // On unix `Instant::checked_sub` does NOT clamp at the
+                    // monotonic origin — subtracting decades still returns Some
+                    // (measured) — so the back-date is exact and `unwrap_or(now)`
+                    // is only reachable on platforms where `Instant` is a bare
+                    // `Duration`. That also means nothing here bounds a bogus
+                    // `age`; the caller is responsible for rejecting implausible
+                    // ones, and does.
+                    admitted_at: age.and_then(|a| now.checked_sub(a)).unwrap_or(now),
                     deadline: now + self.ttl,
                     committed_at: Some(now),
                     absent_streak: 0,
@@ -633,8 +673,8 @@ impl AdmissionController {
     /// is therefore NEVER reaped — its slot is held until the proof resolves, its
     /// cluster `deadline` passes, or the gateway restarts. That is intentional:
     /// such a proof still occupies cluster proving capacity, so freeing the slot
-    /// would over-admit against it; the `GatewayRangeSlotWedged` alert is the
-    /// human-facing signal instead. Note the reconcile's "live" set is the
+    /// would over-admit against it; the `GatewaySlotWedged` alert (fed by
+    /// `report_slot_ages`) is the human-facing signal instead. Note the reconcile's "live" set is the
     /// cluster's RUNNABLE set (`Pending ∧ deadline ≥ now`, see `fetch_pending_proofs`),
     /// NOT every `Pending` row: a past-deadline zombie the cluster will never run
     /// drops out of the live set and is released by reconcile (not left to this
@@ -909,6 +949,56 @@ impl AdmissionController {
                 .inc();
         }
     }
+    /// Publish, per `(pool, requester)`, how long that requester's OLDEST slot
+    /// has been held. Call it on the reconcile tick.
+    ///
+    /// Answers "who is holding the pool right now, and for how long" — the
+    /// question a completed-proof latency metric cannot answer while the proof is
+    /// still running. It deliberately does not separate the reasons a slot is
+    /// held: a genuinely slow proof, a slot whose terminal release was lost, and
+    /// a RESERVED slot still uploading its stdin (a real cost here — the
+    /// gateway↔on-prem link is ~30 Mbit, so multi-MB inputs take a while) all
+    /// look the same. They should: each one means this requester is occupying
+    /// scarce capacity, which is what the operator acts on.
+    ///
+    /// The family is cleared first so a requester that released everything stops
+    /// exporting a series, rather than freezing at its last value forever. That
+    /// also bounds the `requester` label set to whoever currently holds a slot.
+    ///
+    /// Two things this deliberately does NOT expose, so they are not re-litigated:
+    /// a per-requester slot COUNT (the pool total is already
+    /// `gateway_admission_inflight`, and "how many" has not been the question
+    /// during an incident — "how long" has), and any historical distribution such
+    /// as a weekly p90 per requester (a gauge cannot answer it; the analytics
+    /// Postgres has per-proof rows and an ad-hoc query is the right tool at ~6
+    /// proofs/hour).
+    pub fn report_slot_ages(&self) {
+        let Some(m) = &self.metrics else { return };
+        let now = Instant::now();
+        // Oldest per (pool, requester): max age, since that is the one that would
+        // trip a "held too long" threshold.
+        let mut oldest: std::collections::HashMap<(PoolId, String), u64> =
+            std::collections::HashMap::new();
+        for entry in self.slots.iter() {
+            let slot = entry.value();
+            let requester = requester_label(slot.requester.as_deref());
+            let age = now.saturating_duration_since(slot.admitted_at).as_secs();
+            oldest
+                .entry((slot.pool, requester))
+                .and_modify(|a| *a = (*a).max(age))
+                .or_insert(age);
+        }
+        m.slot_held_seconds.clear();
+        for ((pool, requester), age) in oldest {
+            m.slot_held_seconds
+                .get_or_create(&PoolRequesterLabel {
+                    pool: pool.label().into(),
+                    requester,
+                })
+                .set(age as i64);
+        }
+    }
+
     fn metric_seeded(&self, pool: PoolId) {
         if let Some(m) = &self.metrics {
             m.seeded
@@ -1027,6 +1117,47 @@ pub struct PoolLabel {
     pub pool: String,
 }
 
+/// Render a slot's holder as a metric label value.
+///
+/// Three cases, deliberately distinguishable — an operator reading an alert has
+/// to be able to tell them apart:
+/// - `0x`-prefixed lowercase hex: a real address. The prefix is not cosmetic:
+///   this value gets pasted into the explorer, whose requester filter is an
+///   exact string match against `0x`-prefixed values written by the router. A
+///   bare hex string silently returns zero rows, which reads as "this requester
+///   has no proofs" and sends triage down the wrong path.
+/// - `unauthenticated`: the zero address, which is what `AuthMode::None`
+///   (the DEFAULT for `GATEWAY_AUTH_MODE`) hands every caller. Note what this
+///   does and does not buy: every proposer still collapses into ONE series, so
+///   attribution is genuinely unavailable until `GATEWAY_AUTH_MODE=verify` —
+///   naming it only stops the reader from chasing an address that does not
+///   exist. It is also, deliberately, the one label value that cannot be pasted
+///   into the explorer (which stores the zero address as `0x0000…0`); a reader
+///   who needs to search should fix auth first.
+/// - `unknown`: no requester recorded at all (a seeded proof whose cluster
+///   record carried none).
+fn requester_label(requester: Option<&[u8]>) -> String {
+    match requester {
+        None => "unknown".to_string(),
+        Some([]) => "unknown".to_string(),
+        Some(r) if r.iter().all(|b| *b == 0) => "unauthenticated".to_string(),
+        Some(r) => format!("0x{}", hex::encode(r)),
+    }
+}
+
+/// Labels for per-requester slot occupancy. See [`requester_label`] for the
+/// `requester` value's three forms.
+///
+/// Cardinality is the number of proposers holding slots (a handful, and bounded
+/// above by the pool caps at any instant). If the gateway is ever opened to
+/// arbitrary signers, this becomes an unbounded label and would need to fold to
+/// the configured `PRIORITY_ORDER` set.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PoolRequesterLabel {
+    pub pool: String,
+    pub requester: String,
+}
+
 /// Admission metrics + their registry. `render()` returns the OpenMetrics text
 /// body for the `/metrics` endpoint.
 ///
@@ -1054,6 +1185,14 @@ pub struct AdmissionMetrics {
     priority_would_yield: Family<PoolLabel, Counter>,
     priority_demand: Family<PoolLabel, Gauge>,
     priority_hold_open: Family<PoolLabel, Counter>,
+    /// Age of the OLDEST slot each requester currently holds in each pool.
+    ///
+    /// The in-flight counterpart to everything else here, which only moves on
+    /// state transitions: while a proof is stuck this number just keeps growing,
+    /// so a threshold on it is a direct read on pressure. A completed-proof duration
+    /// metric has the opposite behaviour — it goes quiet exactly when things are
+    /// worst, because a stuck proof never produces a sample.
+    slot_held_seconds: Family<PoolRequesterLabel, Gauge>,
 }
 
 impl AdmissionMetrics {
@@ -1143,8 +1282,15 @@ impl AdmissionMetrics {
             "Yield events (a free slot held for a higher-priority proposer), per pool",
             priority_hold_open.clone(),
         );
+        let slot_held_seconds = Family::<PoolRequesterLabel, Gauge>::default();
+        registry.register(
+            "gateway_admission_slot_held_seconds",
+            "Age of the oldest slot each requester currently holds, per pool",
+            slot_held_seconds.clone(),
+        );
         Self {
             registry,
+            slot_held_seconds,
             inflight,
             global_inflight,
             admitted,
@@ -1402,10 +1548,10 @@ mod tests {
     #[test]
     fn seed_bypasses_cap_and_is_idempotent() {
         let c = enforce_ctrl(); // Range cap = 1
-        c.seed("restart-1", PoolId::Range);
-        c.seed("restart-2", PoolId::Range); // over cap, but seed doesn't check it
+        c.seed("restart-1", PoolId::Range, None, None);
+        c.seed("restart-2", PoolId::Range, None, None); // over cap, but seed doesn't check it
         assert_eq!(c.in_flight(PoolId::Range), 2);
-        c.seed("restart-1", PoolId::Range); // already tracked → no double-count
+        c.seed("restart-1", PoolId::Range, None, None); // already tracked → no double-count
         assert_eq!(c.in_flight(PoolId::Range), 2);
         // A normal acquire still enforces the cap against the seeded count.
         assert!(c.try_acquire("p1", 2, RANGE_VK, &[0x01]).is_err());
@@ -1430,7 +1576,7 @@ mod tests {
             false,
             Duration::from_secs(90),
         );
-        c.seed("seeded-proof", PoolId::Range);
+        c.seed("seeded-proof", PoolId::Range, None, None);
         assert_eq!(c.in_flight(PoolId::Range), 1);
 
         // Cluster still reports it Pending → reconcile keeps it.
@@ -1466,7 +1612,7 @@ mod tests {
             false,
             Duration::from_secs(90),
         );
-        c.seed("seeded-proof", PoolId::Range);
+        c.seed("seeded-proof", PoolId::Range, None, None);
         c.reap();
         assert_eq!(c.in_flight(PoolId::Range), 1, "within ttl, kept");
         std::thread::sleep(Duration::from_millis(220));
@@ -1740,7 +1886,7 @@ mod tests {
             false,
             Duration::from_secs(90),
         );
-        c.seed("ghost", PoolId::Range);
+        c.seed("ghost", PoolId::Range, None, None);
         assert_eq!(c.in_flight(PoolId::Range), 1);
         let empty: HashSet<String> = HashSet::new();
         // Absent #1 → streak 1 < 2, kept.
@@ -1762,9 +1908,9 @@ mod tests {
         // converges them back down — the "#6 seed bypasses cap" behaviour is
         // intentional and self-healing.
         let c = enforce_ctrl(); // Range cap 1
-        c.seed("s1", PoolId::Range);
-        c.seed("s2", PoolId::Range);
-        c.seed("s3", PoolId::Range);
+        c.seed("s1", PoolId::Range, None, None);
+        c.seed("s2", PoolId::Range, None, None);
+        c.seed("s3", PoolId::Range, None, None);
         assert_eq!(c.in_flight(PoolId::Range), 3, "seed bypasses the cap");
         // Cluster only still runs s2; s1/s3 are gone.
         let live: HashSet<String> = ["s2".to_string()].into_iter().collect();
@@ -1920,6 +2066,180 @@ mod tests {
             "dropping an uncommitted guard must release the reserved slot"
         );
         assert!(!c.slots.contains_key("x"));
+    }
+
+    /// Per-requester occupancy is reported per pool, attributed to the holder,
+    /// and STOPS being reported once the slot is released.
+    ///
+    /// The release half is the part worth pinning: without the `clear()` in
+    /// `report_slot_ages` the gauge would freeze at its last value, so a
+    /// requester that finished long ago would keep looking like it was holding a
+    /// slot — and a "held too long" alert would latch on forever.
+    #[test]
+    fn slot_ages_are_reported_per_requester_and_cleared_on_release() {
+        let m = Arc::new(AdmissionMetrics::new());
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        )
+        .with_metrics(m.clone());
+
+        c.try_acquire("p1", 2, RANGE_VK, &[0xaa]).unwrap(); // range, requester aa
+        c.try_acquire("p2", 3, AGG_VK, &[0xbb]).unwrap(); // agg, requester bb
+        c.report_slot_ages();
+        let out = m.render();
+        assert!(
+            out.contains("gateway_admission_slot_held_seconds{pool=\"range\",requester=\"0xaa\"}"),
+            "range slot must be attributed to its holder:\n{out}"
+        );
+        assert!(
+            out.contains("gateway_admission_slot_held_seconds{pool=\"agg\",requester=\"0xbb\"}"),
+            "agg slot must be attributed to its holder:\n{out}"
+        );
+
+        c.release("p1");
+        c.report_slot_ages();
+        let out = m.render();
+        assert!(
+            !out.contains("requester=\"0xaa\""),
+            "a released slot must stop exporting a series, not freeze:\n{out}"
+        );
+        assert!(
+            out.contains("gateway_admission_slot_held_seconds{pool=\"agg\",requester=\"0xbb\"}"),
+            "the still-held slot must remain:\n{out}"
+        );
+    }
+
+    /// A seeded slot whose cluster record carried no requester still has to be
+    /// reported rather than silently dropped — it occupies real capacity.
+    #[test]
+    fn seeded_slots_report_as_unknown_requester() {
+        let m = Arc::new(AdmissionMetrics::new());
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        )
+        .with_metrics(m.clone());
+        c.seed("recovered", PoolId::Range, None, None);
+        c.report_slot_ages();
+        let out = m.render();
+        assert!(
+            out.contains(
+                "gateway_admission_slot_held_seconds{pool=\"range\",requester=\"unknown\"}"
+            ),
+            "a seeded slot must be visible as unknown-requester occupancy:\n{out}"
+        );
+    }
+
+    /// A restart must not lose attribution or age.
+    ///
+    /// The cluster's own record carries both `requester` and `created_at`, so a
+    /// seeded slot can be restored exactly. Without this, restarting the gateway
+    /// — a common first move during an incident — resets every stuck proof's age
+    /// to zero and drops its owner, blinding the alert for another ~15 minutes
+    /// precisely when someone is hunting for the stuck one.
+    #[test]
+    fn seeded_slots_keep_their_requester_and_backdated_age() {
+        let m = Arc::new(AdmissionMetrics::new());
+        let c = AdmissionController::new(
+            classifier(),
+            2,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        )
+        .with_metrics(m.clone());
+        // Recovered from the cluster: owned by 0xaa, already running for 20 min.
+        c.seed(
+            "recovered",
+            PoolId::Range,
+            Some(vec![0xaa]),
+            Some(Duration::from_secs(1200)),
+        );
+        c.report_slot_ages();
+        let out = m.render();
+        assert!(
+            out.contains(
+                "gateway_admission_slot_held_seconds{pool=\"range\",requester=\"0xaa\"} 1200\n"
+            ),
+            "a seeded slot must keep its owner and report its pre-restart age as \
+             exactly 1200 seconds. Matching only a leading '12' would also accept \
+             120, 1299, and — the one that matters — 1200000 from an as_millis() \
+             mix-up:\n{out}"
+        );
+    }
+
+    /// The zero address means `AuthMode::None` (the DEFAULT), not a real
+    /// proposer. Rendering it as an address would collapse every requester into
+    /// one all-zeroes series and silently kill attribution — so it gets a name
+    /// that tells the operator which of the two it is.
+    #[test]
+    fn zero_address_is_labelled_unauthenticated() {
+        assert_eq!(requester_label(Some(&[0u8; 20])), "unauthenticated");
+        assert_eq!(requester_label(None), "unknown");
+        assert_eq!(requester_label(Some(&[])), "unknown");
+        // Real addresses keep the 0x prefix the explorer's exact-match filter
+        // (and the rest of this system) expects.
+        assert_eq!(requester_label(Some(&[0xab, 0xcd])), "0xabcd");
+    }
+
+    /// The reported age is the OLDEST slot a requester holds, not the newest, so
+    /// one stuck proof cannot be masked by fresher ones from the same proposer.
+    ///
+    /// Ages are injected via `seed()` rather than produced by sleeping: an exact
+    /// expected value distinguishes max (100) from min (10), from
+    /// last-writer-wins (either), and from sum (110) — a sleep-based version can
+    /// only tell "not zero", and pays a second of wall time to do it.
+    #[test]
+    fn slot_age_reports_the_oldest_of_a_requesters_slots() {
+        let m = Arc::new(AdmissionMetrics::new());
+        let c = AdmissionController::new(
+            classifier(),
+            4,
+            2,
+            None,
+            true,
+            Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            Duration::from_secs(90),
+        )
+        .with_metrics(m.clone());
+        let who = Some(vec![0xaa]);
+        c.seed(
+            "old",
+            PoolId::Range,
+            who.clone(),
+            Some(Duration::from_secs(100)),
+        );
+        c.seed("new", PoolId::Range, who, Some(Duration::from_secs(10)));
+        c.report_slot_ages();
+        let out = m.render();
+        assert!(
+            out.contains(
+                "gateway_admission_slot_held_seconds{pool=\"range\",requester=\"0xaa\"} 100\n"
+            ),
+            "must report the oldest slot's age (100), not the newest (10) or the \
+             sum (110):\n{out}"
+        );
     }
 
     #[test]
