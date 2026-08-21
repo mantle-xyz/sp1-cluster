@@ -15,6 +15,15 @@ pub fn fulfillment_from_cluster(
     }
 }
 
+/// Whether an SDK `FulfillmentStatus` is terminal (the proof will not change
+/// state again). Single source of the predicate the admission gate uses to
+/// decide release-vs-touch, so a new terminal status can't be missed by a
+/// scattered `matches!` copy.
+pub fn is_terminal(status: sdk_pb::FulfillmentStatus) -> bool {
+    use sdk_pb::FulfillmentStatus as S;
+    matches!(status, S::Fulfilled | S::Unfulfillable)
+}
+
 /// Map cluster `ExecutionStatus` → SDK `ExecutionStatus`.
 ///
 /// Any cluster failure or cancellation maps to `Unexecutable`, which the SDK's

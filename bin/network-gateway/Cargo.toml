@@ -28,10 +28,12 @@ bincode = { workspace = true }
 clap = { workspace = true }
 dashmap = { workspace = true }
 dotenv = { workspace = true }
+eyre = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 mti = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+prometheus-client = "0.22"
 prost = { workspace = true }
 rustls = { workspace = true, features = ["ring"] }
 serde = { workspace = true }
@@ -45,6 +47,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 alloy-signer = "=1.1.3"
 alloy-signer-local = { workspace = true }
+backoff = { workspace = true }
 bincode = { workspace = true }
 reqwest = { workspace = true }
 tower = { workspace = true, features = ["util"] }

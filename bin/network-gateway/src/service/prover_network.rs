@@ -8,8 +8,29 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_stream::Stream;
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 use tracing::info;
+
+/// Marker attached to an admission-shed `Status` so the proof-router can tell a
+/// deliberate throttle from a genuine backend fault (and NOT trip its circuit
+/// breaker / fail over to Succinct, whose s3:// store can't take our http://
+/// artifact URIs). Set both as a gRPC trailer metadata key AND as a token in
+/// the message text, so it survives a proxy that strips custom trailers. Kept
+/// in sync with the router (`prove-network crates/proof-router/src/backend.rs`
+/// `ADMISSION_SHED_MARKER`).
+const ADMISSION_SHED_MARKER: &str = "x-sp1-admission-shed";
+
+/// Build the marked `Unavailable` used for every admission shed (capacity AND
+/// priority yield). The `x-sp1-admission-shed` marker (trailer + message prefix)
+/// is what the proof-router keys on to treat the shed as a neutral throttle, so
+/// there must be exactly ONE shed constructor — see backend.rs `is_admission_shed`.
+fn admission_shed_status(scope: &str) -> Status {
+    let mut st = Status::unavailable(format!("{ADMISSION_SHED_MARKER}: {scope}; retry shortly"));
+    st.metadata_mut()
+        .insert(ADMISSION_SHED_MARKER, MetadataValue::from_static("1"));
+    st
+}
 
 use crate::auth::Auth;
 use crate::ids::{
@@ -30,9 +51,11 @@ pub struct ProverNetworkImpl<A> {
     auth: Auth,
     program_store: Arc<dyn ProgramStore>,
     nonces: DashMap<Vec<u8>, AtomicU64>,
+    admission: Arc<crate::admission::AdmissionController>,
 }
 
 impl<A> ProverNetworkImpl<A> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: A,
         cluster: ClusterServiceClient,
@@ -40,6 +63,7 @@ impl<A> ProverNetworkImpl<A> {
         balance_amount: String,
         auth: Auth,
         program_store: Arc<dyn ProgramStore>,
+        admission: Arc<crate::admission::AdmissionController>,
     ) -> Self {
         Self {
             client,
@@ -49,6 +73,7 @@ impl<A> ProverNetworkImpl<A> {
             auth,
             program_store,
             nonces: DashMap::new(),
+            admission,
         }
     }
 
@@ -63,6 +88,18 @@ impl<A> ProverNetworkImpl<A> {
             .entry(address.to_vec())
             .or_insert_with(|| AtomicU64::new(0));
         current.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Release the admission slot on a terminal verdict, else `touch` it so the
+    /// reaper spares a still-live proof. Idempotent, and a no-op for ungated
+    /// proofs (which hold no slot). Called from every completion poll; the
+    /// terminal predicate lives in `status::is_terminal` so it can't drift.
+    fn settle_slot(&self, proof_id: &str, fulfillment: pb::FulfillmentStatus) {
+        if crate::status::is_terminal(fulfillment) {
+            self.admission.release(proof_id);
+        } else {
+            self.admission.touch(proof_id);
+        }
     }
 
     async fn load_cluster_proof(&self, proof_id: &str) -> Result<cluster_pb::ProofRequest, Status> {
@@ -186,6 +223,50 @@ where
             })?
             .to_string();
 
+        let request_id = mint_request_id();
+        let proof_id = proof_id_from_request_id(&request_id);
+
+        // Admission gate: shed overflow BEFORE it touches the shared cluster —
+        // in particular BEFORE the program-ELF upload below, which on a cold
+        // cache is a multi-MB push over the WAN. mode/vk_hash/requester are all
+        // known here, so an over-cap request is shed without any cluster I/O.
+        // Keyed by the proof_id we just minted. Ungated requests take no slot.
+        if let Err(rej) =
+            self.admission
+                .try_acquire(&proof_id, body.mode, &body.vk_hash, requester.as_slice())
+        {
+            let scope = match rej.reason {
+                crate::admission::RejectReason::GlobalCap => {
+                    "self-hosted backend at global capacity".to_string()
+                }
+                crate::admission::RejectReason::PoolCap => {
+                    format!("self-hosted {} proof pool at capacity", rej.pool.label())
+                }
+                crate::admission::RejectReason::PriorityYield => format!(
+                    "self-hosted {} slot held for a higher-priority proposer",
+                    rej.pool.label()
+                ),
+            };
+            tracing::warn!(
+                proof_id,
+                pool = rej.pool.label(),
+                reason = ?rej.reason,
+                "admission shed request"
+            );
+            // Mark the shed so the router treats it as a throttle (neutral),
+            // not a backend fault — see ADMISSION_SHED_MARKER. The marker token
+            // is also in the message as a proxy-robust fallback.
+            return Err(admission_shed_status(&scope));
+        }
+
+        // RAII: while the slot is RESERVED (up to and including the program
+        // upload / artifact create below), any early return or a dropped/
+        // cancelled future releases it via the guard's Drop — the reconciler and
+        // reaper never touch a reserved slot. It is `commit()`ed just before the
+        // cluster create (see below), after which the cluster Pending set is its
+        // authority.
+        let slot = self.admission.guard(&proof_id);
+
         // Hot path: address the ELF by a deterministic id derived from vk_hash.
         // While the cluster store still holds the bytes (Redis TTL = 4h), every
         // subsequent prove() is a single `exists()` ping — no upload at all.
@@ -214,8 +295,6 @@ where
                 .map_err(|e| Status::internal(format!("upload program artifact failed: {e}")))?;
         }
 
-        let request_id = mint_request_id();
-        let proof_id = proof_id_from_request_id(&request_id);
         let proof_artifact = self
             .client
             .create_artifact()
@@ -235,13 +314,38 @@ where
             scheduled_by: None,
             stdin_private: body.stdin_private,
         };
+        // Commit the slot BEFORE the create await. From here the proof may reach
+        // the cluster, so NO create outcome may release the slot locally:
+        //  - Ok        → committed (the reconciler keeps it while it is Pending);
+        //  - Err       → the create may still have registered the proof and only
+        //                lost the response (ambiguous), so we keep it committed
+        //                and let the reconciler release it iff the cluster reports
+        //                it absent — no fragile error-string classification;
+        //  - cancelled → the future is dropped mid-await, but the guard was
+        //                already committed, so its Drop does NOT release either.
+        // The cluster Pending set is the single authority for a committed slot.
+        // Committing also stops the router's retry from double-creating (the slot
+        // stays held, so the retry is shed). The forward can't hang indefinitely:
+        // the shared ClusterServiceClient bounds it with its own request timeout.
+        slot.commit();
         if let Err(e) = self.cluster.create_proof_request(create).await {
             // The id is minted in this call, so an existing row can only be an
-            // earlier attempt of this call that committed but timed out client-side.
+            // earlier attempt of this call that committed but timed out
+            // client-side. That is the concrete, non-ambiguous instance of the
+            // "Err but the cluster may already have it" case described above, so
+            // treat it as success rather than leaving it to the reconciler.
             let own_committed_attempt = e
                 .downcast_ref::<tonic::Status>()
                 .is_some_and(|s| s.code() == tonic::Code::AlreadyExists);
             if !own_committed_attempt {
+                // `Internal` is deliberate (NOT a passthrough of the cluster's
+                // gRPC code). The SP1 SDK treats Internal — like Unavailable /
+                // DeadlineExceeded — as a TRANSIENT error and retries the create
+                // in place; it treats ResourceExhausted as PERMANENT, which makes
+                // op-succinct give up and bisect the range. So mapping a
+                // cluster-forward failure (incl. a cluster ResourceExhausted from
+                // an overloaded backend) to Internal keeps it retryable and avoids
+                // spurious range bisection. Do not "preserve the code".
                 return Err(Status::internal(format!(
                     "cluster create_proof_request failed: {e}"
                 )));
@@ -307,6 +411,8 @@ where
         let proof = self.load_cluster_proof(&proof_id).await?;
 
         let fulfillment = fulfillment_from_cluster(proof.proof_status());
+        self.settle_slot(&proof_id, fulfillment);
+
         let execution = proof
             .execution_result
             .as_ref()
@@ -347,6 +453,10 @@ where
         let req = request.into_inner();
         let proof_id = proof_id_from_request_id(&req.request_id);
         let proof = self.load_cluster_proof(&proof_id).await?;
+
+        // Settle the admission slot, mirroring `get_proof_request_status`.
+        let fulfillment = fulfillment_from_cluster(proof.proof_status());
+        self.settle_slot(&proof_id, fulfillment);
 
         let details = self.build_sdk_proof_request(&req.request_id, proof);
         Ok(Response::new(pb::GetProofRequestDetailsResponse {
@@ -1510,6 +1620,20 @@ mod tests {
         }
     }
 
+    fn test_admission() -> std::sync::Arc<crate::admission::AdmissionController> {
+        std::sync::Arc::new(crate::admission::AdmissionController::new(
+            crate::admission::Classifier::new(Default::default(), Default::default()),
+            1,
+            2,
+            None,
+            true,
+            std::time::Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            std::time::Duration::from_secs(90),
+        ))
+    }
+
     fn mk() -> ProverNetworkImpl<InMemoryArtifactClient> {
         ProverNetworkImpl::new(
             InMemoryArtifactClient::new(),
@@ -1518,6 +1642,7 @@ mod tests {
             "42".into(),
             Auth::default(),
             Arc::new(InMemoryProgramStore::new()),
+            test_admission(),
         )
     }
 
@@ -1529,6 +1654,21 @@ mod tests {
             "42".into(),
             auth,
             Arc::new(InMemoryProgramStore::new()),
+            test_admission(),
+        )
+    }
+
+    fn mk_with_admission(
+        admission: std::sync::Arc<crate::admission::AdmissionController>,
+    ) -> ProverNetworkImpl<InMemoryArtifactClient> {
+        ProverNetworkImpl::new(
+            InMemoryArtifactClient::new(),
+            dummy_cluster_client(),
+            "http://gw.test".into(),
+            "42".into(),
+            Auth::default(),
+            Arc::new(InMemoryProgramStore::new()),
+            admission,
         )
     }
 
@@ -1714,6 +1854,61 @@ mod tests {
         };
         let err = svc.create_program(Request::new(req)).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn admission_sheds_over_cap_compressed() {
+        use crate::admission::{AdmissionController, Classifier};
+        let admission = std::sync::Arc::new(AdmissionController::new(
+            Classifier::new(Default::default(), Default::default()),
+            1,
+            2,
+            None,
+            true,
+            std::time::Duration::from_secs(3600),
+            std::collections::HashMap::new(),
+            false,
+            std::time::Duration::from_secs(90),
+        ));
+        admission
+            .try_acquire("req_preoccupied", 2, &[0xaa; 4], &[0x01])
+            .unwrap(); // fill Range cap 1
+
+        let svc = mk_with_admission(admission.clone());
+
+        // The gate now runs BEFORE the program exists()/upload block, so an
+        // over-cap request is shed without touching the shared cluster store.
+        // Deliberately DO NOT register or pre-warm the program: the vk_hash is
+        // unknown, so if the gate ran after the program check this would fail
+        // with FailedPrecondition (program not registered). Asserting the shed
+        // Unavailable below therefore proves the gate is ahead of the upload.
+        let vk_hash = vec![0xbb; 4];
+
+        let body = pb::RequestProofRequestBody {
+            nonce: 0,
+            vk_hash,
+            version: "v0".into(),
+            mode: pb::ProofMode::Compressed as i32,
+            strategy: pb::FulfillmentStrategy::Reserved as i32,
+            stdin_uri: "http://gw.test/artifacts/stdin/artifact_stdin".into(),
+            deadline: 0,
+            cycle_limit: 0,
+            gas_limit: 0,
+            min_auction_period: 0,
+            whitelist: vec![],
+            stdin_private: false,
+        };
+        let req = pb::RequestProofRequest {
+            format: 0,
+            signature: vec![],
+            body: Some(body),
+        };
+        let err = svc.request_proof(Request::new(req)).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "over-cap request must be shed BEFORE the program-store check (gate precedes upload)"
+        );
     }
 
     #[tokio::test]
