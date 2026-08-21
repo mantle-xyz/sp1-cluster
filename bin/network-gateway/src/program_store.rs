@@ -1,11 +1,13 @@
 //! Durable program registry, owned by the gateway.
 //!
 //! The cluster's `ArtifactClient` is *ephemeral scratch space*: on the Redis
-//! backend artifacts carry a 4 hour TTL (`Program` is the one type that skips
-//! it), some are additionally ref-counted, and the tier as a whole is an
-//! unreplicated cache that can be evicted or flushed. That's correct for the
-//! per-proof inputs/intermediates the cluster pipeline produces and consumes,
-//! but it's the wrong tier for programs, which we want to register once at
+//! backend artifacts expire after `ARTIFACT_TIMEOUT_SECONDS` (default 6h, and
+//! `Program` is the one type exempt from it — inline uploads set no expiry and
+//! chunked ones PERSIST the published key), some are additionally ref-counted,
+//! and the tier as a whole is an unreplicated cache that can be evicted or
+//! flushed. That's correct for the per-proof inputs/intermediates the cluster
+//! pipeline produces and consumes, but it's the wrong tier for programs, which
+//! we want to register once at
 //! `setup()` time and prove against indefinitely — skipping the TTL makes the
 //! warm copy long-lived, not durable.
 //!
