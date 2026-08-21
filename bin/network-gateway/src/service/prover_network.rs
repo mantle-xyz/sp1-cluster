@@ -268,9 +268,10 @@ where
         let slot = self.admission.guard(&proof_id);
 
         // Hot path: address the ELF by a deterministic id derived from vk_hash.
-        // While the cluster store still holds the bytes (Redis TTL = 4h), every
-        // subsequent prove() is a single `exists()` ping — no upload at all.
-        // Only on TTL miss do we re-upload from the durable `ProgramStore`.
+        // `Program` uploads skip the artifact TTL, so while the cluster store
+        // holds the bytes every subsequent prove() is a single `exists()` ping —
+        // no upload at all. Only on a miss (eviction, a flushed/replaced Redis,
+        // an S3 lifecycle rule) do we re-upload from the durable `ProgramStore`.
         let program_artifact_id = program_artifact_id(&body.vk_hash);
         let warm = self
             .client

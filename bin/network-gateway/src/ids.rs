@@ -67,10 +67,12 @@ pub fn artifact_id_from_uri(uri: &str) -> Option<&str> {
 ///
 /// The cluster artifact store is keyed by opaque strings, so we can sidestep
 /// `create_artifact()` minting and address the same ELF across many proofs.
-/// As long as the SDK proves at least once per Redis TTL window (4h), the ELF
-/// stays warm and `request_proof` can skip the re-upload entirely. On a cache
-/// miss `request_proof` re-uploads from `ProgramStore` under the same id,
-/// re-warming for subsequent calls.
+/// `ArtifactType::Program` uploads skip the artifact TTL (see
+/// `RedisArtifactClient::par_upload_file`), so the warm copy is not on a clock
+/// and `request_proof` can normally skip the re-upload entirely. It is still
+/// only a cache — eviction, a flushed/replaced Redis, or an S3 lifecycle rule
+/// can drop it — so on a miss `request_proof` re-uploads from `ProgramStore`
+/// under the same id, re-warming for subsequent calls.
 pub fn program_artifact_id(vk_hash: &[u8]) -> String {
     format!("program_{}", hex::encode(vk_hash))
 }
