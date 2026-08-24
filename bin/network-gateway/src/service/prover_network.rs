@@ -335,9 +335,18 @@ where
             // client-side. That is the concrete, non-ambiguous instance of the
             // "Err but the cluster may already have it" case described above, so
             // treat it as success rather than leaving it to the reconciler.
-            let own_committed_attempt = e
-                .downcast_ref::<tonic::Status>()
-                .is_some_and(|s| s.code() == tonic::Code::AlreadyExists);
+            // Walk the chain rather than downcasting the top error, matching
+            // `is_unimplemented` in lib.rs. `create_proof_request` currently
+            // returns the tonic::Status unwrapped, so a top-level downcast would
+            // work today — but one `.wrap_err` anywhere in that path would
+            // silently turn this into `false`, and the failure is expensive: the
+            // SDK would retry request_proof, mint a SECOND proof_id and take a
+            // SECOND slot, while the first stays committed until grace plus
+            // three reconcile ticks.
+            let own_committed_attempt = e.chain().any(|src| {
+                src.downcast_ref::<tonic::Status>()
+                    .is_some_and(|s| s.code() == tonic::Code::AlreadyExists)
+            });
             if !own_committed_attempt {
                 // `Internal` is deliberate (NOT a passthrough of the cluster's
                 // gRPC code). The SP1 SDK treats Internal — like Unavailable /

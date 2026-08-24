@@ -21,7 +21,17 @@ pub fn fulfillment_from_cluster(
 /// scattered `matches!` copy.
 pub fn is_terminal(status: sdk_pb::FulfillmentStatus) -> bool {
     use sdk_pb::FulfillmentStatus as S;
-    matches!(status, S::Fulfilled | S::Unfulfillable)
+    // `Reverted`/`Expired` arrived in SP1 6.4.0. Unreachable from this gateway
+    // today — every caller feeds the output of `fulfillment_from_cluster`, which
+    // is exhaustive over the cluster's four states and can only emit Fulfilled /
+    // Unfulfillable / Requested / Unspecified. Listed anyway because this
+    // function takes the SDK type: if an SDK-sourced status ever reaches it,
+    // omitting these would `touch()` the slot (refresh liveness) instead of
+    // releasing it, i.e. leak capacity until the TTL backstop.
+    matches!(
+        status,
+        S::Fulfilled | S::Unfulfillable | S::Reverted | S::Expired
+    )
 }
 
 /// Map cluster `ExecutionStatus` → SDK `ExecutionStatus`.
