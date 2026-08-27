@@ -1,41 +1,72 @@
-name: Release Docker to GHCR on tag
+name: Release network-gateway to GHCR on tag
+
+# Only the network-gateway is built here. Every change this fork carries on top
+# of upstream lives in bin/network-gateway/, so api / coordinator / node are run
+# from the official succinctlabs base image instead of being rebuilt. That image
+# must be the same generation as this gateway (base-v2.7.2), because the two
+# share a Redis artifact store whose chunked-artifact format changed between
+# v2.2.0 and v2.7.2.
 
 on:
   push:
     tags:
       - "*"
+  # Lets the workflow be exercised without cutting a tag.
+  workflow_dispatch:
 
-env:
-  GHCR_REPOSITORY: ghcr.io/${{ github.repository }}
-  # Set to 'true' to enable private cargo dependencies (requires PRIVATE_PULL_TOKEN secret)
-  # Defaults to false - private deps are opt-in
-  ENABLE_PRIVATE_DEPS: ${{ vars.ENABLE_PRIVATE_DEPS == 'true' }}
+concurrency:
+  group: release-gateway-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      SHORT_SHA: ${{ steps.short_sha.outputs.SHORT_SHA }}
-      TAG_NAME: ${{ steps.tag_name.outputs.TAG_NAME }}
+      SHORT_SHA: ${{ steps.meta.outputs.SHORT_SHA }}
+      TAG_NAME: ${{ steps.meta.outputs.TAG_NAME }}
+      IMAGE_TAGS: ${{ steps.meta.outputs.IMAGE_TAGS }}
     steps:
-      - name: Generate short SHA
-        id: short_sha
-        run: echo "SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-7`" >> $GITHUB_OUTPUT
-      - name: Extract tag name
-        id: tag_name
-        run: echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Compute short SHA, tag name and image tags
+        id: meta
+        run: |
+          set -euo pipefail
 
-  build-base:
+          SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+          # workflow_dispatch runs have no tag; fall back to the short SHA so the
+          # image is still uniquely addressable.
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/}" ]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            IS_TAG=1
+          else
+            TAG_NAME="${SHORT_SHA}"
+            IS_TAG=0
+          fi
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+          # GHCR requires a lowercase repository path.
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          # gateway-latest only ever moves on a real tag push. A manual
+          # workflow_dispatch build must not repoint a tag production may follow.
+          {
+            echo "IMAGE_TAGS<<__EOF__"
+            echo "${REPO}:gateway-${TAG_NAME}"
+            if [ "${IS_TAG}" = "1" ]; then
+              echo "${REPO}:gateway-latest"
+            fi
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+  build-gateway:
     needs: setup
-    runs-on:
-      [
-        "runs-on",
-        "runner=32cpu-linux-x64",
-        "run-id=${{ github.run_id }}",
-        "spot=false",
-        "tag=base",
-        "disk=large",
-      ]
+    # Stock GitHub-hosted runner. The upstream workflow asked for a runs-on.com
+    # third-party AWS runner ("runner=32cpu-linux-x64"), which is Succinct's
+    # integration and is not configured for this org - every tag build queued for
+    # the full 24h and was cancelled without ever producing an image.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
@@ -57,28 +88,6 @@ jobs:
       - name: Set up Docker
         uses: docker/setup-buildx-action@v3
 
-      - name: Cache
-        uses: actions/cache@v3
-        id: cache
-        with:
-          path: |
-            cargo-git
-            cargo-registry
-            target
-          key: cache-base-${{ hashFiles('infra/Dockerfile') }}
-          restore-keys: |
-            cache-base-
-
-      - name: inject cache into docker
-        uses: reproducible-containers/buildkit-cache-dance@v3.1.0
-        with:
-          cache-map: |
-            {
-              "cargo-git": "/usr/local/cargo/git",
-              "cargo-registry": "/usr/local/cargo/registry",
-              "target": "/app/target"
-            }
-
       - name: Log into GHCR
         uses: docker/login-action@v3
         with:
@@ -86,17 +95,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Base image to GHCR
+      # No build cache is configured on purpose. type=gha is partitioned by ref
+      # and this workflow only runs on tags, so nothing ever populates a scope a
+      # later tag could read - the cache would never hit. Persisting the cargo
+      # target directory via actions/cache is not an option either: the GitHub
+      # Actions cache is capped at 10 GB per repository and the runner only has
+      # ~14 GB of free disk. Every build here is a cold build.
+      - name: Build and push network-gateway image to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./infra/Dockerfile
+          file: ./infra/Dockerfile.network-gateway
           push: true
-          tags: |
-            ${{ env.GHCR_REPOSITORY }}:${{ needs.setup.outputs.TAG_NAME }}
+          tags: ${{ needs.setup.outputs.IMAGE_TAGS }}
           build-args: |
             VERGEN_GIT_SHA=${{ needs.setup.outputs.SHORT_SHA }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.setup.outputs.TAG_NAME }}
+            org.opencontainers.image.title=sp1-cluster-network-gateway
           secrets: |
             private_pull_token=${{ secrets.PRIVATE_PULL_TOKEN }}
-          cache-from: type=gha,scope=base
-          cache-to: type=gha,mode=max,scope=base
