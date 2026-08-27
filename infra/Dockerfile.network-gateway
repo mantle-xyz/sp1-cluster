@@ -4,6 +4,13 @@
 FROM --platform=linux/amd64 rustlang/rust:nightly-slim@sha256:1489939da2c8e707b56129b25417cb1f52f441d37f748f7e4d0550a56475a6ba AS build
 
 # Install dependencies
+#
+# This is the gateway-only build. Compared to the multi-binary infra/Dockerfile
+# it deliberately omits the Go toolchain, the SP1 RISC-V toolchain, libclang-dev
+# and m4; see the note above the cargo build below for why none of them are
+# reachable from this build's dependency graph. What stays is needed:
+# build-essential and gcc for zstd-sys, aws-lc-sys and sp1-jit; protoc for
+# prost-build and tonic-build.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
     # For Rust builds, OpenSSL, pkg-config
@@ -12,10 +19,8 @@ RUN apt-get update -y && \
     pkg-config \
     # General build tools for native dependencies
     build-essential \
-    libclang-dev \
     diffutils \
     gcc \
-    m4 \
     make \
     # Utilities
     wget \
@@ -27,18 +32,9 @@ RUN apt-get update -y && \
     && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Go
-ENV GO_VERSION=1.22.5
-RUN wget -q https://golang.org/dl/go${GO_VERSION}.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz && \
-    rm go${GO_VERSION}.linux-amd64.tar.gz
-ENV PATH="/usr/local/go/bin:${PATH}"
-
-# Install sp1 toolchain
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-RUN curl -L https://sp1.succinct.xyz | bash && ~/.sp1/bin/sp1up --version 6.1.0
 
-# Install protoc
+# Install protoc (required by prost-build / tonic-build)
 ENV PROTOC_ZIP=protoc-29.4-linux-x86_64.zip
 RUN curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v29.4/$PROTOC_ZIP && \
     unzip -o $PROTOC_ZIP -d /usr/local bin/protoc && \
@@ -62,9 +58,28 @@ ENV FEATURES=$FEATURES
 ARG VERGEN_GIT_SHA
 ENV VERGEN_GIT_SHA=$VERGEN_GIT_SHA
 
+# Drop debug info for the shipped binary. The workspace keeps
+# `[profile.release] debug = true` for local development; overriding it here via
+# the environment leaves Cargo.toml untouched (and so avoids diverging from
+# upstream). Measured on the v2.2.0 image: 717 MiB of the gateway's 781 MiB was
+# DWARF. Dropping it also keeps the cargo target directory small enough to build
+# on a stock GitHub-hosted runner.
+ENV CARGO_PROFILE_RELEASE_DEBUG=false
+
 # Build the application
 # Uses BuildKit secrets mount to securely pass private token without exposing it in image layers
 # The secret is mounted as a file and read during the RUN command, then never stored in layers
+#
+# The "-p sp1-cluster-network-gateway" below is load-bearing, not cosmetic.
+# Without it cargo selects every member of the virtual workspace, so the
+# resolver unifies native-gnark in from bin/cli and bin/node. That enables
+# sp1-recursion-gnark-ffi's "native" feature, whose build.rs shells out to
+# "go build -buildmode=c-archive", and it drags in bindgen/clang-sys plus
+# gmp-mpfr-sys/rug, which compile GMP and MPFR from C source. Restricting
+# package selection takes the unit graph from 907 units to 872 and removes the
+# need for Go, libclang-dev and m4 entirely. This is safe because the gateway
+# never calls gnark: its only groth16/plonk references are the enum tags in
+# ids.rs and the pool classification in admission.rs.
 RUN \
     --mount=type=ssh \
     --mount=type=secret,id=private_pull_token,required=false \
@@ -80,8 +95,10 @@ RUN \
     fi; \
     echo "Building with profile: $BUILD_PROFILE | features: $FEATURES | rustflags: $RUSTFLAGS" && \
     cargo build --profile $BUILD_PROFILE --features "$FEATURES" \
+    -p sp1-cluster-network-gateway \
     --bin sp1-cluster-network-gateway && \
     cp target/$BUILD_PROFILE/sp1-cluster-network-gateway /network-gateway && \
+    chmod 755 /network-gateway && \
     # Clean up any git credentials that might have been cached
     (git config --global --unset-all url."${GIT_URL_BASE}".insteadOf || true) && \
     (unset PRIVATE_TOKEN GIT_URL_BASE || true)
@@ -105,16 +122,16 @@ WORKDIR /app
 RUN groupadd --gid 1001 appgroup && \
     useradd --uid 1001 --gid appgroup --shell /bin/false --create-home appuser
 
-# Copy the built application binaries from the build stage
-COPY --from=build /network-gateway /network-gateway
+# Copy the built application binary from the build stage.
+#
+# Ownership is applied by COPY rather than a following `RUN chown`: changing a
+# file's metadata in a separate layer makes overlayfs copy the whole file up,
+# which stores the binary twice. The build stage already chmod 755's it.
+COPY --from=build --chown=appuser:appgroup /network-gateway /network-gateway
 
 # Create .sp1 directories with correct ownership for volume mounts
 RUN mkdir -p /home/appuser/.sp1/circuits && \
     chown -R appuser:appgroup /home/appuser/.sp1
-
-# Set ownership to the non-root user and ensure the binary is executable
-RUN chown appuser:appgroup /network-gateway && \
-    chmod +x /network-gateway
 
 # Set the user to the non-root user
 USER appuser
