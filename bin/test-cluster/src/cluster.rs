@@ -30,6 +30,7 @@ use crate::{env, utils};
 pub struct ClusterAddrs {
     pub gateway_grpc: String,
     pub gateway_http: String,
+    pub gateway_metrics: String,
     pub api_http: String,
     pub api_grpc: String,
     pub coordinator: String,
@@ -38,7 +39,7 @@ pub struct ClusterAddrs {
 
 impl ClusterAddrs {
     fn allocate() -> Result<Self> {
-        let listeners: Vec<std::net::TcpListener> = (0..6)
+        let listeners: Vec<std::net::TcpListener> = (0..7)
             .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))
             .collect::<std::io::Result<_>>()
             .context("allocating free ports")?;
@@ -48,10 +49,11 @@ impl ClusterAddrs {
             .collect::<std::io::Result<Vec<_>>>()
             .context("reading allocated ports")?
             .into_iter();
-        let mut next = move || addrs.next().expect("six listeners bound");
+        let mut next = move || addrs.next().expect("seven listeners bound");
         Ok(Self {
             gateway_grpc: next(),
             gateway_http: next(),
+            gateway_metrics: next(),
             api_http: next(),
             api_grpc: next(),
             coordinator: next(),
@@ -468,6 +470,7 @@ impl ClusterBuilder {
             let config = GatewayConfig {
                 grpc_addr: addrs.gateway_grpc.clone(),
                 http_addr: addrs.gateway_http.clone(),
+                metrics_addr: addrs.gateway_metrics.clone(),
                 public_http_url: format!("http://{}", addrs.gateway_http),
                 cluster_rpc: format!("http://{}", addrs.api_grpc),
                 artifact_store: artifact_store_name.to_string(),
@@ -481,6 +484,23 @@ impl ClusterBuilder {
                 auth_allowlist: None,
                 program_store: "memory".to_string(),
                 program_store_dir: None,
+                // Admission gate off, the rest at the CLI defaults: the test
+                // cluster exercises proving, not gateway admission (covered by
+                // the network-gateway e2e suite).
+                admission_enforce: false,
+                admission_range_max_inflight: 1,
+                admission_agg_max_inflight: 2,
+                admission_global_max_inflight: None,
+                admission_range_vk_hashes: None,
+                admission_agg_vk_hashes: None,
+                admission_reap_period_secs: 60,
+                admission_slot_ttl_secs: 3600,
+                admission_reconcile_absent_observations: 3,
+                admission_reconcile_commit_grace_secs: 60,
+                admission_reconcile_fetch_timeout_secs: 10,
+                admission_priority_enable: false,
+                admission_priority_order: None,
+                admission_priority_ttl_secs: 90,
             };
             let client = artifact_client.clone();
             let respawn = component_factory("gateway", root.clone(), move |token| {
