@@ -1,10 +1,11 @@
 # sp1-test-cluster
 
-Scenario-based e2e harness for sp1-cluster. Boots the whole cluster in-process
-(api, coordinator, gateway, worker nodes) against dockerized redis + postgres
-(+ MinIO for the S3 scenario) via testcontainers, submits proofs through the
-network gateway in hosted SDK mode, and asserts terminal API status, execution
-metadata, artifact availability, and local proof verification.
+Scenario-based e2e harness for sp1-cluster. Boots the API, gateway, and worker
+nodes in-process against dockerized redis + postgres (+ MinIO for the S3
+scenario) via testcontainers. The coordinator runs in-process by default and
+can run as a child process for crash tests. The harness submits proofs through
+the network gateway in hosted SDK mode and asserts terminal API status,
+execution metadata, artifact availability, and local proof verification.
 
 CI: `.github/workflows/e2e.yml` (smoke per-PR; full post-merge/manual).
 
@@ -19,6 +20,15 @@ The cpu-only flavor runs the same suite on machines without GPUs; workloads do
 not change (long/large scenarios prove rsp on CPU, which is slow).
 
 ## Usage
+
+Build the MinIO test image from the repository root before running a scenario:
+
+```bash
+docker build --platform linux/amd64 -f infra/Dockerfile.minio-test -t sp1-test-minio:RELEASE.2025-09-07T16-13-09Z .
+```
+
+The image uses the official release binary and verifies its pinned SHA-256 checksum.
+ARM hosts need Docker support for amd64 emulation.
 
 ```bash
 export RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"
@@ -40,6 +50,9 @@ RUST_LOG=info cargo run --release --bin sp1-test-cluster --features gpu -- suite
 SP1_CLUSTER_CPU_ONLY=1 RUST_LOG=info cargo run --release --bin sp1-test-cluster -- suite full
 ```
 
+Use `RUST_LOG=info,sp1=debug` to show debug logs from all SP1 crates. Add
+`,slop=debug` to include Slop crates.
+
 Suite logs: `target/test-cluster-logs/<scenario>.log` (relative to the working
 directory). Requirements: docker (testcontainers), network access on first run
 (circuit artifacts for CPU workers, container images).
@@ -57,16 +70,15 @@ directory). Requirements: docker (testcontainers), network access on first run
 | `fatal-failure` | cycle-limit-exceeded execution failure on the PROVING path → Failed + failure metadata |
 | `cancel-pending` | cancel with no workers: API row Cancelled, queue dropped, status holds |
 | `cancel-active` | cancel mid-proving (api + coordinator, mirroring the fulfiller): work drained, status holds |
-| `coordinator-restart` | kill+restart coordinator on the same port; workers rolled; new proof completes |
+| `coordinator-restart` | SIGKILL coordinator child mid-proof; existing workers reconnect; same proof completes |
 | `worker-restart` | graceful stop/drain + restart of a worker between proofs |
 | `api-outage` | stop API mid-proof, restore; terminal status recovered (#126 re-issue path) |
 | `shutdown-drain` | whole-cluster shutdown with work in flight; all fixed ports re-bindable (zombie regression guard) |
 | `s3-artifacts` | full pipeline on MinIO-backed S3 store (endpoint + path-style) |
 
-Known product gap (documented, not asserted): a proof claimed by a coordinator
-that crashes mid-flight is orphaned — the claimer only claims unhandled
-requests. `coordinator-restart` pins restart/rebind/reconnect, not mid-flight
-recovery.
+`coordinator-restart` runs the coordinator as a child process. SIGKILL closes
+its accepted connections and removes its in-memory state. The test does not
+restart workers or submit a second proof request.
 
 ## Tiers
 
