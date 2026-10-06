@@ -1,0 +1,162 @@
+# Mantle CI for the mantle_develop line.
+#
+# The upstream Lint / Integration / E2E workflows only trigger on main/staging
+# and run on runs-on.com third-party AWS runners ("runs-on", "runner=32cpu-..."),
+# Succinct's integration that is not configured for this org: their runs queue
+# for 24h and get cancelled without ever executing. This workflow mirrors the
+# Lint and Integration gates on stock GitHub-hosted runners instead.
+#
+# Kept as a separate file (rather than editing lint.yml / integration.yml) so
+# upstream syncs never conflict on it. E2E is not mirrored: it needs GPU runners.
+name: Mantle CI
+
+on:
+  push:
+    branches: [mantle_develop]
+  pull_request:
+    branches: [mantle_develop]
+  workflow_dispatch:
+
+concurrency:
+  group: mantle-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  lint:
+    name: Lint (fmt, clippy, test, sort)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      # The SP1 workspace build does not fit in the default runner disk.
+      # Must run before setup-go: it wipes the hosted tool cache.
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/share/boost \
+            /usr/local/lib/android "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.1"
+
+      # Needed for build.rs
+      - name: Install protoc
+        run: |
+          PROTOC_ZIP=protoc-29.4-linux-x86_64.zip
+          curl -sSOL https://github.com/protocolbuffers/protobuf/releases/download/v29.4/$PROTOC_ZIP
+          sudo unzip -o $PROTOC_ZIP -d /usr/local bin/protoc
+          sudo unzip -o $PROTOC_ZIP -d /usr/local 'include/*'
+          rm -f $PROTOC_ZIP
+
+      - name: Setup GCC
+        uses: Dup4/actions-setup-gcc@v1
+        with:
+          version: latest
+
+      # Toolchain comes from rust-toolchain.toml (nightly-2025-10-15).
+      - name: Setup Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mantle-ci-lint
+
+      - name: cargo fmt
+        run: cargo fmt --manifest-path Cargo.toml --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings -A incomplete-features
+
+      - name: cargo test
+        run: cargo test --manifest-path Cargo.toml
+
+      - name: cargo sort
+        run: |
+          cargo sort --help >/dev/null 2>&1 || cargo install cargo-sort --locked
+          cargo sort -g -w
+
+      - name: Error if changes
+        run: git diff --exit-code
+
+  integration:
+    name: Integration (artifact, api)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      REDIS_URL: redis://localhost:6379
+      # Compile against the committed .sqlx cache; DATABASE_URL is for the
+      # tests at runtime - the service DB has no schema until they migrate it.
+      SQLX_OFFLINE: "true"
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/share/boost \
+            /usr/local/lib/android "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          PROTOC_ZIP=protoc-29.4-linux-x86_64.zip
+          curl -sSOL https://github.com/protocolbuffers/protobuf/releases/download/v29.4/$PROTOC_ZIP
+          sudo unzip -o $PROTOC_ZIP -d /usr/local bin/protoc
+          sudo unzip -o $PROTOC_ZIP -d /usr/local 'include/*'
+          rm -f $PROTOC_ZIP
+
+      - name: Setup GCC
+        uses: Dup4/actions-setup-gcc@v1
+        with:
+          version: latest
+
+      - name: Setup Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mantle-ci-integration
+
+      - name: Artifact integration tests
+        run: cargo test --release -p sp1-cluster-artifact --tests -- --ignored --test-threads=1
+
+      - name: API integration tests
+        run: cargo test --release -p sp1-cluster-api --tests -- --ignored --test-threads=1
