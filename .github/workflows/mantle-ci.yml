@@ -27,6 +27,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # sp1-recursion-gnark-ffi's build script runs `go build`, which imports
+  # github.com/consensys/gnark-ignition-verifier. That repository is gone from
+  # GitHub and proxy.golang.org no longer serves it, so a cold module cache
+  # fails the build. goproxy.cn still serves the version go.sum pins, and go
+  # verifies the download against go.sum.
+  GOPROXY: https://proxy.golang.org,https://goproxy.cn,direct
 
 jobs:
   lint:
