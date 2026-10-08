@@ -3,9 +3,9 @@ name: Release network-gateway to GHCR on tag
 # Only the network-gateway is built here. Every change this fork carries on top
 # of upstream lives in bin/network-gateway/, so api / coordinator / node are run
 # from the official succinctlabs base image instead of being rebuilt. That image
-# must be the same generation as this gateway (base-v2.7.2), because the two
-# share a Redis artifact store whose chunked-artifact format changed between
-# v2.2.0 and v2.7.2.
+# must be the same generation as this gateway (base-v2.8.4, SP1 6.8.1), because
+# the two share a Redis artifact store whose chunked-artifact format changed
+# between v2.2.0 and v2.7.2, and both sides must agree on the SP1 version.
 
 on:
   push:

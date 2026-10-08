@@ -17,7 +17,7 @@ members = [
     "crates/worker",
 ]
 [workspace.package]
-version = "2.7.2"
+version = "2.8.4"
 edition = "2021"
 repository = "https://github.com/succinctlabs/sp1-cluster"
 keywords = []
@@ -39,6 +39,9 @@ p3-field = "=0.3.3-succinct"
 p3-matrix = "=0.3.3-succinct"
 
 # SPN
+#
+# spn-network-types is pinned to the network branch head that adds the bid price floor
+# fields. Move it back to branch = "main" after that PR merges.
 spn-artifacts = { git = "https://github.com/succinctlabs/network", branch = "main" }
 spn-bidding = { git = "https://github.com/succinctlabs/network", branch = "main" }
 spn-metrics = { git = "https://github.com/succinctlabs/network", branch = "main" }
@@ -47,21 +50,21 @@ spn-pricing = { git = "https://github.com/succinctlabs/network", branch = "main"
 spn-utils = { git = "https://github.com/succinctlabs/network", branch = "main" }
 
 # SP1
-# Keep the entire family on one exact release so crossing types share one source.
-sp1-core-executor = "=6.4.0"
-sp1-core-machine = { version = "=6.4.0", features = ["bigint-rug"] }
-sp1-hypercube = "=6.4.0"
-sp1-primitives = "=6.4.0"
-sp1-prover = "=6.4.0"
-sp1-prover-types = "=6.4.0"
-sp1-recursion-circuit = "=6.4.0"
-sp1-recursion-compiler = "=6.4.0"
-sp1-recursion-executor = "=6.4.0"
-sp1-sdk = { version = "=6.4.0", features = ["network"] }
+# Keep the entire family on one release so crossing types share one source.
+sp1-core-executor = "=6.8.1"
+sp1-core-machine = { version = "=6.8.1", features = ["bigint-rug"] }
+sp1-hypercube = "=6.8.1"
+sp1-primitives = "=6.8.1"
+sp1-prover = "=6.8.1"
+sp1-prover-types = "=6.8.1"
+sp1-recursion-circuit = "=6.8.1"
+sp1-recursion-compiler = "=6.8.1"
+sp1-recursion-executor = "=6.8.1"
+sp1-sdk = { version = "=6.8.1", features = ["network"] }
 
 # SP1 GPU
-sp1-gpu-cudart = "=6.4.0"
-sp1-gpu-prover = "=6.4.0"
+sp1-gpu-cudart = "=6.8.1"
+sp1-gpu-prover = "=6.8.1"
 
 # Misc
 alloy = { version = "=1.1.3", default-features = false, features = ["serde"] }
