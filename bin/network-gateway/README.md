@@ -260,11 +260,14 @@ A few things worth knowing when reading the code or debugging wire issues:
 - **Reserved mode only.** The gateway implements the `base` proto variant
   (Reserved/self-hosted). Auction methods (`bid`, `settle`, `cancel_request`,
   etc.) return `Unimplemented`.
-- **`get_filtered_proof_requests` honors a subset of filters.** The cluster's
-  `ProofRequestListRequest` doesn't carry `vk_hash`, `requester`, `fulfiller`,
-  `from`, `to`, `version`, or `mode` — those fields on the SDK request are
-  silently dropped. Status filters, `minimum_deadline`, and pagination
-  (`limit`, `page`) round-trip.
+- **`get_filtered_proof_requests` honors a subset of filters.** `requester`,
+  status filters, `minimum_deadline`, and pagination (`limit` capped at 100,
+  `page`) round-trip, and rows come newest-first like Succinct's network.
+  `vk_hash`, `fulfiller`, `from`, `to`, `version`, and `mode` are silently
+  dropped. Requester and order come from the Mantle `QueryProofRequests`
+  extension of the cluster API (`crates/common/src/mantle.rs`). Against an
+  API without it, the gateway falls back to upstream `ProofRequestList`,
+  which drops `requester` and returns rows oldest-first.
 
 ## Status mapping
 

@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 // Database models
 #[derive(Debug, sqlx::FromRow)]
 #[allow(dead_code)]
-struct DbProofRequest {
+pub(crate) struct DbProofRequest {
     id: String,
     proof_status: i32,
     requester: Vec<u8>,

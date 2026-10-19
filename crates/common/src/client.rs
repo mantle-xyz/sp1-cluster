@@ -1,4 +1,5 @@
 use crate::{
+    mantle::{mantle_cluster_service_client::MantleClusterServiceClient, ProofRequestQueryRequest},
     proto::{
         self, cluster_service_client::ClusterServiceClient as InnerClusterClient,
         ProofRequestCancelRequest, ProofRequestCreateRequest, ProofRequestGetRequest,
@@ -74,6 +75,8 @@ pub async fn reconnect_with_backoff(addr: &str) -> Result<Channel> {
 #[derive(Clone)]
 pub struct ClusterServiceClient {
     pub rpc: InnerClusterClient<Channel>,
+    /// Mantle-only extension service on the same channel (`crate::mantle`).
+    pub mantle: MantleClusterServiceClient<Channel>,
     pub backoff: ExponentialBackoff,
 }
 
@@ -84,8 +87,16 @@ impl ClusterServiceClient {
             .with_max_elapsed_time(Some(Duration::from_secs(10)))
             .build();
         let channel = reconnect_with_backoff(&addr).await?;
-        let rpc = InnerClusterClient::new(channel.clone());
-        Ok(Self { rpc, backoff })
+        Ok(Self::from_channel(channel, backoff))
+    }
+
+    /// Build a client over an existing channel. Tests use this with a lazy channel.
+    pub fn from_channel(channel: Channel, backoff: ExponentialBackoff) -> Self {
+        Self {
+            rpc: InnerClusterClient::new(channel.clone()),
+            mantle: MantleClusterServiceClient::new(channel),
+            backoff,
+        }
     }
 
     /// Shared call policy: retry transient failures within the backoff budget, each attempt bounded
@@ -129,6 +140,28 @@ impl ClusterServiceClient {
             })
             .await?;
         Ok(result.proof_requests)
+    }
+
+    /// One page of `MantleClusterService/QueryProofRequests` (requester filter,
+    /// optional newest-first order).
+    ///
+    /// Returns `Ok(None)` when the API server predates the extension and answers
+    /// `Unimplemented`, so the caller can fall back to [`Self::get_proof_requests`].
+    pub async fn query_proof_requests(
+        &self,
+        request: ProofRequestQueryRequest,
+    ) -> Result<Option<Vec<proto::ProofRequest>>> {
+        let result = backoff_retry(self.backoff.clone(), || {
+            let mut client = self.mantle.clone();
+            let request = request.clone();
+            with_timeout(async move { client.query_proof_requests(request).await })
+        })
+        .await;
+        match result {
+            Ok(resp) => Ok(Some(resp.proof_requests)),
+            Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
+            Err(status) => Err(status.into()),
+        }
     }
 
     /// Fetches all rows that match the filters in `request`. The server caps
