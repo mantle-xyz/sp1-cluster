@@ -1394,13 +1394,18 @@ fn sign_body(body: &impl prost::Message, signer: &alloy_signer_local::PrivateKey
 /// The fixed message `create_artifact` authenticates over (see
 /// `ArtifactStoreImpl`'s `CREATE_ARTIFACT_MESSAGE`). Unlike the proto-body RPCs,
 /// this signs a constant string, not the request body.
+/// Signs `create_artifact` exactly as sp1-sdk 6.8.1 does: `as_bytes()` puts v
+/// in Electrum form (27/28) and the SDK adds 27 again, so v is 54/55 on the
+/// wire. Signing with the standard v here hid a gateway bug that misread it.
 fn sign_create_artifact(signer: &alloy_signer_local::PrivateKeySigner) -> Vec<u8> {
     use alloy_signer::SignerSync;
-    signer
+    let mut sig = signer
         .sign_message_sync(b"create_artifact")
         .unwrap()
         .as_bytes()
-        .to_vec()
+        .to_vec();
+    sig[64] += 27;
+    sig
 }
 
 /// `create_artifact` + HTTP PUT, signed for `AuthMode::Verify`. Same as
@@ -1749,6 +1754,32 @@ async fn e2e_filtered_list_falls_back_without_extension() {
     ids.sort();
     assert_eq!(ids, ["req_mine_0", "req_other_0"]);
     assert!(stack.last_query.lock().unwrap().is_none());
+
+    stack.shutdown().await;
+}
+
+/// Under `AuthMode::Allowlist`, an allowlisted SDK client must be able to
+/// create artifacts. The SDK's `create_artifact` signature (v = 54/55) used to
+/// recover a wrong address, which the allowlist rejected.
+#[tokio::test]
+async fn e2e_allowlist_admits_sdk_signed_create_artifact() {
+    let signer = alloy_signer_local::PrivateKeySigner::random();
+    let allowlist = format!("{:#x}", signer.address());
+    let mut stack = spawn_gateway_stack(vec![], |cfg| {
+        cfg.auth_mode = AuthMode::Allowlist;
+        cfg.auth_allowlist = Some(allowlist);
+    })
+    .await;
+
+    let uri = create_artifact_put_signed(
+        &mut stack.artifact_rpc,
+        &stack.http,
+        SdkArtifactType::Stdin,
+        b"stdin",
+        &signer,
+    )
+    .await;
+    assert!(!uri.is_empty());
 
     stack.shutdown().await;
 }

@@ -53,6 +53,36 @@ impl Auth {
             }
         }
     }
+
+    /// [`Self::authorize`] for `create_artifact`, whose signature the SP1 SDK
+    /// builds differently from every other signed request.
+    ///
+    /// sp1-sdk's `network::utils::sign_message` (still in 6.8.1) takes
+    /// `Signature::as_bytes`, whose v is already in Electrum form (27/28), and
+    /// adds 27 again, so v arrives as 54/55. alloy reads any v >= 35 as EIP-155
+    /// and gets the parity backwards, so recovery yields a wrong address: the
+    /// same one every time for a local key (deterministic RFC 6979 signatures
+    /// over this fixed message), a different one per call for a KMS key
+    /// (randomized signatures). `Allowlist` then rejects the client and
+    /// `Verify` reports the wrong requester. Map 54/55 back to 27/28 here;
+    /// standard v values pass through. EIP-155 v has no meaning for a signed
+    /// message, so nothing valid is reinterpreted.
+    #[allow(clippy::result_large_err)] // matches tonic's Status return shape
+    pub fn authorize_create_artifact(
+        &self,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<Address, Status> {
+        match signature {
+            [rs @ .., v @ (54 | 55)] if signature.len() == 65 => {
+                let mut fixed = [0u8; 65];
+                fixed[..64].copy_from_slice(rs);
+                fixed[64] = v - 27;
+                self.authorize(message, &fixed)
+            }
+            _ => self.authorize(message, signature),
+        }
+    }
 }
 
 /// Parse a comma-separated list of 0x-prefixed addresses.
@@ -77,6 +107,70 @@ mod tests {
             .unwrap()
             .as_bytes()
             .to_vec()
+    }
+
+    /// A `create_artifact` signature exactly as sp1-sdk 6.8.1 builds it:
+    /// `as_bytes()` (v = 27/28), then `v + 27`.
+    fn sdk_create_artifact_signature(signer: &PrivateKeySigner) -> Vec<u8> {
+        let mut sig = sign(b"create_artifact", signer);
+        sig[64] += 27;
+        sig
+    }
+
+    /// Pins down why the remap exists: alloy misreads v = 54/55. The signature
+    /// here is built by this test, so it cannot tell whether the SDK still adds
+    /// the extra 27; on SDK upgrades, re-check `network::utils::sign_message`.
+    #[test]
+    fn generic_authorize_misreads_the_sdk_create_artifact_signature() {
+        let auth = Auth {
+            mode: AuthMode::Verify,
+            allowlist: Default::default(),
+        };
+        let signer = PrivateKeySigner::random();
+        let sig = sdk_create_artifact_signature(&signer);
+        assert!(matches!(sig[64], 54 | 55));
+        assert_ne!(
+            auth.authorize(b"create_artifact", &sig).unwrap(),
+            signer.address()
+        );
+    }
+
+    #[test]
+    fn create_artifact_recovers_the_sdk_signer() {
+        let auth = Auth {
+            mode: AuthMode::Verify,
+            allowlist: Default::default(),
+        };
+        // Random keys until both v = 54 and v = 55 have been checked.
+        let mut seen = HashSet::new();
+        while seen.len() < 2 {
+            let signer = PrivateKeySigner::random();
+            let sig = sdk_create_artifact_signature(&signer);
+            assert_eq!(
+                auth.authorize_create_artifact(b"create_artifact", &sig)
+                    .unwrap(),
+                signer.address(),
+                "v = {}",
+                sig[64]
+            );
+            seen.insert(sig[64]);
+        }
+        assert_eq!(seen, HashSet::from([54, 55]));
+    }
+
+    #[test]
+    fn create_artifact_still_accepts_a_standard_signature() {
+        let auth = Auth {
+            mode: AuthMode::Verify,
+            allowlist: Default::default(),
+        };
+        let signer = PrivateKeySigner::random();
+        let sig = sign(b"create_artifact", &signer);
+        assert_eq!(
+            auth.authorize_create_artifact(b"create_artifact", &sig)
+                .unwrap(),
+            signer.address()
+        );
     }
 
     #[test]
