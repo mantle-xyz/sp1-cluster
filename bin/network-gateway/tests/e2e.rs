@@ -13,11 +13,12 @@ use std::time::Duration;
 use sp1_cluster_artifact::{ArtifactClient, ArtifactType, InMemoryArtifactClient};
 use sp1_cluster_common::{
     client::ClusterServiceClient,
-    proto as cluster_pb,
-    proto::{
-        cluster_service_client::ClusterServiceClient as InnerClusterClient,
-        cluster_service_server::{ClusterService, ClusterServiceServer},
+    mantle::{
+        mantle_cluster_service_server::{MantleClusterService, MantleClusterServiceServer},
+        ProofRequestQueryRequest,
     },
+    proto as cluster_pb,
+    proto::cluster_service_server::{ClusterService, ClusterServiceServer},
 };
 use sp1_cluster_network_gateway::{
     auth::AuthMode,
@@ -67,6 +68,12 @@ struct FakeCluster {
     // Pending query is unavailable — so the reconciler can't run and the TTL
     // reaper is the only path that can reclaim a committed slot.
     list_fails: Arc<AtomicBool>,
+    // When set, the Mantle `QueryProofRequests` extension answers
+    // `Unimplemented`, like a cluster API that predates it.
+    query_unimplemented: Arc<AtomicBool>,
+    // Last `QueryProofRequests` request received, so a test can check what the
+    // gateway forwarded.
+    last_query: Arc<std::sync::Mutex<Option<ProofRequestQueryRequest>>>,
 }
 
 impl FakeCluster {
@@ -78,7 +85,45 @@ impl FakeCluster {
             fail_create: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(AtomicBool::new(false)),
             list_fails: Arc::new(AtomicBool::new(false)),
+            query_unimplemented: Arc::new(AtomicBool::new(false)),
+            last_query: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+}
+
+/// Mirrors `bin/api/src/mantle.rs`: requester / status / deadline filters,
+/// `(created_at, id)` order in the requested direction, then offset + limit.
+#[tonic::async_trait]
+impl MantleClusterService for FakeCluster {
+    async fn query_proof_requests(
+        &self,
+        request: tonic::Request<ProofRequestQueryRequest>,
+    ) -> Result<tonic::Response<cluster_pb::ProofRequestListResponse>, tonic::Status> {
+        if self.query_unimplemented.load(Ordering::SeqCst) {
+            return Err(tonic::Status::unimplemented("no QueryProofRequests"));
+        }
+        let req = request.into_inner();
+        *self.last_query.lock().unwrap() = Some(req.clone());
+        let mut rows: Vec<cluster_pb::ProofRequest> = self
+            .requests
+            .iter()
+            .map(|r| r.clone())
+            .filter(|r| req.requester.as_ref().is_none_or(|q| &r.requester == q))
+            .filter(|r| req.proof_status.is_empty() || req.proof_status.contains(&r.proof_status))
+            .filter(|r| req.minimum_deadline.is_none_or(|min| r.deadline >= min))
+            .collect();
+        rows.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        if req.newest_first {
+            rows.reverse();
+        }
+        let proof_requests = rows
+            .into_iter()
+            .skip(req.offset.unwrap_or(0) as usize)
+            .take(req.limit.unwrap_or(10) as usize)
+            .collect();
+        Ok(tonic::Response::new(cluster_pb::ProofRequestListResponse {
+            proof_requests,
+        }))
     }
 }
 
@@ -260,6 +305,9 @@ struct GatewayStack {
     // Shared with `FakeCluster`; toggling it makes proof_request_list error, so a
     // test can exercise the TTL reaper backstop with the reconciler unavailable.
     list_fails: Arc<AtomicBool>,
+    // Shared with `FakeCluster`; see its fields of the same names.
+    query_unimplemented: Arc<AtomicBool>,
+    last_query: Arc<std::sync::Mutex<Option<ProofRequestQueryRequest>>>,
 }
 
 impl GatewayStack {
@@ -292,10 +340,14 @@ async fn spawn_gateway_stack(
     let pending = fake.pending.clone();
     let requests = fake.requests.clone();
     let list_fails = fake.list_fails.clone();
+    let query_unimplemented = fake.query_unimplemented.clone();
+    let last_query = fake.last_query.clone();
+    let mantle_fake = fake.clone();
     let (cluster_shutdown_tx, cluster_shutdown_rx) = oneshot::channel::<()>();
     let cluster_server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(ClusterServiceServer::new(fake))
+            .add_service(MantleClusterServiceServer::new(mantle_fake))
             .serve_with_shutdown(cluster_addr, async move {
                 cluster_shutdown_rx.await.ok();
             })
@@ -320,10 +372,7 @@ async fn spawn_gateway_stack(
         .with_max_interval(Duration::from_millis(20))
         .with_max_elapsed_time(Some(Duration::from_millis(200)))
         .build();
-    let cluster = ClusterServiceClient {
-        rpc: InnerClusterClient::new(channel),
-        backoff,
-    };
+    let cluster = ClusterServiceClient::from_channel(channel, backoff);
 
     // ---- start the gateway ----
     let grpc_port = free_port();
@@ -423,6 +472,8 @@ async fn spawn_gateway_stack(
         pending,
         requests,
         list_fails,
+        query_unimplemented,
+        last_query,
     }
 }
 
@@ -1343,13 +1394,18 @@ fn sign_body(body: &impl prost::Message, signer: &alloy_signer_local::PrivateKey
 /// The fixed message `create_artifact` authenticates over (see
 /// `ArtifactStoreImpl`'s `CREATE_ARTIFACT_MESSAGE`). Unlike the proto-body RPCs,
 /// this signs a constant string, not the request body.
+/// Signs `create_artifact` exactly as sp1-sdk 6.8.1 does: `as_bytes()` puts v
+/// in Electrum form (27/28) and the SDK adds 27 again, so v is 54/55 on the
+/// wire. Signing with the standard v here hid a gateway bug that misread it.
 fn sign_create_artifact(signer: &alloy_signer_local::PrivateKeySigner) -> Vec<u8> {
     use alloy_signer::SignerSync;
-    signer
+    let mut sig = signer
         .sign_message_sync(b"create_artifact")
         .unwrap()
         .as_bytes()
-        .to_vec()
+        .to_vec();
+    sig[64] += 27;
+    sig
 }
 
 /// `create_artifact` + HTTP PUT, signed for `AuthMode::Verify`. Same as
@@ -1609,4 +1665,121 @@ async fn wait_for_port(port: u16) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("port {port} never became ready");
+}
+
+/// Seed a bare cluster row straight into the fake's store.
+fn seed_row(stack: &GatewayStack, id: &str, requester: u8, created_at: u64) {
+    stack.requests.insert(
+        id.to_string(),
+        cluster_pb::ProofRequest {
+            id: id.to_string(),
+            proof_status: cluster_pb::ProofRequestStatus::Completed as i32,
+            requester: vec![requester; 20],
+            stdin_artifact_id: "s".into(),
+            program_artifact_id: "p".into(),
+            deadline: u64::MAX,
+            created_at,
+            ..Default::default()
+        },
+    );
+}
+
+async fn filtered_ids(
+    stack: &mut GatewayStack,
+    requester: u8,
+    limit: u32,
+    page: u32,
+) -> Vec<String> {
+    stack
+        .network_rpc
+        .get_filtered_proof_requests(
+            sp1_sdk::network::proto::base::types::GetFilteredProofRequestsRequest {
+                requester: Some(vec![requester; 20]),
+                limit: Some(limit),
+                page: Some(page),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .requests
+        .into_iter()
+        .map(|r| String::from_utf8(r.request_id).unwrap())
+        .collect()
+}
+
+/// The admin history view regression: a requester's rows must come back
+/// filtered and newest-first, not as the requester's share of the cluster's
+/// oldest page.
+#[tokio::test]
+async fn e2e_filtered_list_forwards_requester_newest_first() {
+    let mut stack = spawn_gateway_stack(vec![], |_cfg| {}).await;
+    // Other requester owns the oldest rows, which used to fill the first page.
+    for i in 0..5 {
+        seed_row(&stack, &format!("req_other_{i}"), 0xbb, 100 + i);
+    }
+    for i in 0..5 {
+        seed_row(&stack, &format!("req_mine_{i}"), 0xaa, 200 + i);
+    }
+
+    let page1 = filtered_ids(&mut stack, 0xaa, 2, 1).await;
+    assert_eq!(page1, ["req_mine_4", "req_mine_3"]);
+    let page2 = filtered_ids(&mut stack, 0xaa, 2, 2).await;
+    assert_eq!(page2, ["req_mine_2", "req_mine_1"]);
+
+    let q = stack
+        .last_query
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("extension called");
+    assert_eq!(q.requester, Some(vec![0xaa; 20]));
+    assert!(q.newest_first);
+    assert_eq!((q.limit, q.offset), (Some(2), Some(2)));
+
+    stack.shutdown().await;
+}
+
+/// Against a cluster API without the extension, the gateway still answers
+/// through upstream `ProofRequestList` (requester dropped) instead of failing.
+#[tokio::test]
+async fn e2e_filtered_list_falls_back_without_extension() {
+    let mut stack = spawn_gateway_stack(vec![], |_cfg| {}).await;
+    stack.query_unimplemented.store(true, Ordering::SeqCst);
+    seed_row(&stack, "req_other_0", 0xbb, 100);
+    seed_row(&stack, "req_mine_0", 0xaa, 200);
+
+    let mut ids = filtered_ids(&mut stack, 0xaa, 10, 1).await;
+    ids.sort();
+    assert_eq!(ids, ["req_mine_0", "req_other_0"]);
+    assert!(stack.last_query.lock().unwrap().is_none());
+
+    stack.shutdown().await;
+}
+
+/// Under `AuthMode::Allowlist`, an allowlisted SDK client must be able to
+/// create artifacts. The SDK's `create_artifact` signature (v = 54/55) used to
+/// recover a wrong address, which the allowlist rejected.
+#[tokio::test]
+async fn e2e_allowlist_admits_sdk_signed_create_artifact() {
+    let signer = alloy_signer_local::PrivateKeySigner::random();
+    let allowlist = format!("{:#x}", signer.address());
+    let mut stack = spawn_gateway_stack(vec![], |cfg| {
+        cfg.auth_mode = AuthMode::Allowlist;
+        cfg.auth_allowlist = Some(allowlist);
+    })
+    .await;
+
+    let uri = create_artifact_put_signed(
+        &mut stack.artifact_rpc,
+        &stack.http,
+        SdkArtifactType::Stdin,
+        b"stdin",
+        &signer,
+    )
+    .await;
+    assert!(!uri.is_empty());
+
+    stack.shutdown().await;
 }

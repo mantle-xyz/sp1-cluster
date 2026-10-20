@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use sp1_cluster_common::proto::{TaskType, WorkerType};
 use spn_metrics::{
-    metrics::{self, counter, describe_counter, describe_histogram, histogram},
+    metrics::{
+        self, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
+    },
     server::{MetricServer, MetricServerConfig},
     version::VersionInfo,
     Metrics,
@@ -114,6 +116,25 @@ impl CoordinatorMetrics {
             "Terminal proof-status writes re-issued by the claimer after an earlier write was lost.",
         );
         counter!("coordinator_reissued_status_writes_total").increment(1);
+    }
+
+    /// Set the subscription gauges: handler entries held by the worker service
+    /// (one per sub_id, kept until the coordinator drops the subscriber) and
+    /// subscribers held by the coordinator. The two should track each other;
+    /// handlers staying above subscribers means handler entries are leaking.
+    /// Sampled periodically, so values can lag by one sample interval.
+    /// Observability-only.
+    pub fn set_subscription_counts(&self, handlers: usize, subscribers: usize) {
+        describe_gauge!(
+            "coordinator_sub_handlers",
+            "Subscriber handler entries held by the coordinator worker service.",
+        );
+        gauge!("coordinator_sub_handlers").set(handlers as f64);
+        describe_gauge!(
+            "coordinator_subscribers",
+            "Subscribers tracked by the coordinator.",
+        );
+        gauge!("coordinator_subscribers").set(subscribers as f64);
     }
 }
 

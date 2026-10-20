@@ -1,5 +1,7 @@
+pub mod mantle;
 pub mod service;
 
+pub use mantle::MantleClusterServiceImpl;
 pub use service::ClusterServiceImpl;
 use tokio_util::sync::CancellationToken;
 
@@ -9,6 +11,7 @@ use std::sync::Arc;
 use alloy::primitives::Bytes;
 use axum::{routing::get, Router};
 use serde::{Deserialize, Serialize};
+use sp1_cluster_common::mantle::mantle_cluster_service_server::MantleClusterServiceServer;
 use sp1_cluster_common::proto::cluster_service_server::ClusterServiceServer;
 use sqlx::{prelude::FromRow, types::time::OffsetDateTime};
 use tonic::transport::Server;
@@ -49,6 +52,8 @@ pub async fn run(config: ApiConfig, shutdown: CancellationToken) -> anyhow::Resu
     // Create the gRPC service
     let cluster_service = ClusterServiceImpl::new(pool.clone());
     let grpc_service = ClusterServiceServer::new(cluster_service);
+    let mantle_service =
+        MantleClusterServiceServer::new(MantleClusterServiceImpl::new(pool.clone()));
 
     // Set up the gRPC server
     let grpc_addr = config
@@ -62,6 +67,7 @@ pub async fn run(config: ApiConfig, shutdown: CancellationToken) -> anyhow::Resu
         Server::builder()
             .accept_http1(true)
             .add_service(tonic_web::enable(grpc_service))
+            .add_service(tonic_web::enable(mantle_service))
             .serve_with_shutdown(grpc_addr, grpc_shutdown.cancelled_owned())
             .await
             .unwrap_or_else(|e| {

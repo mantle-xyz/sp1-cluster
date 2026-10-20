@@ -41,7 +41,9 @@ where
         let req = request.into_inner();
         let requester = self
             .auth
-            .authorize(CREATE_ARTIFACT_MESSAGE, &req.signature)?;
+            // The SDK encodes this signature's v differently; see
+            // `Auth::authorize_create_artifact`.
+            .authorize_create_artifact(CREATE_ARTIFACT_MESSAGE, &req.signature)?;
         let artifact_type = proto_to_cluster_type(req.artifact_type);
 
         let artifact = self

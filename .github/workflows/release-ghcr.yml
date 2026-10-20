@@ -1,11 +1,16 @@
-name: Release network-gateway to GHCR on tag
+name: Release images to GHCR on tag
 
-# Only the network-gateway is built here. Every change this fork carries on top
-# of upstream lives in bin/network-gateway/, so api / coordinator / node are run
-# from the official succinctlabs base image instead of being rebuilt. That image
-# must be the same generation as this gateway (base-v2.8.4, SP1 6.8.1), because
-# the two share a Redis artifact store whose chunked-artifact format changed
-# between v2.2.0 and v2.7.2, and both sides must agree on the SP1 version.
+# Builds the components this fork changes: network-gateway, coordinator and api.
+# Workers (node) carry no fork changes and run from the official succinctlabs
+# base image, which must be the same generation as these images (base-v2.8.4,
+# SP1 6.8.1): they share a Redis artifact store whose chunked-artifact format
+# changed between v2.2.0 and v2.7.2, and all sides must agree on the SP1 version.
+#
+# What each image carries on top of upstream:
+# - gateway: the whole Mantle network gateway (bin/network-gateway).
+# - coordinator: the subscriber handler leak fix and its gauges.
+# - api: the Mantle QueryProofRequests extension the gateway's requester filter
+#   needs (without it the gateway falls back to the unfiltered upstream list).
 
 on:
   push:
@@ -15,7 +20,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: release-gateway-${{ github.ref }}
+  group: release-images-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -24,9 +29,9 @@ jobs:
     outputs:
       SHORT_SHA: ${{ steps.meta.outputs.SHORT_SHA }}
       TAG_NAME: ${{ steps.meta.outputs.TAG_NAME }}
-      IMAGE_TAGS: ${{ steps.meta.outputs.IMAGE_TAGS }}
+      IS_TAG: ${{ steps.meta.outputs.IS_TAG }}
     steps:
-      - name: Compute short SHA, tag name and image tags
+      - name: Compute short SHA and tag name
         id: meta
         run: |
           set -euo pipefail
@@ -37,29 +42,14 @@ jobs:
           # workflow_dispatch runs have no tag; fall back to the short SHA so the
           # image is still uniquely addressable.
           if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/}" ]; then
-            TAG_NAME="${GITHUB_REF#refs/tags/}"
-            IS_TAG=1
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "IS_TAG=1" >> "$GITHUB_OUTPUT"
           else
-            TAG_NAME="${SHORT_SHA}"
-            IS_TAG=0
+            echo "TAG_NAME=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "IS_TAG=0" >> "$GITHUB_OUTPUT"
           fi
-          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
 
-          # GHCR requires a lowercase repository path.
-          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
-
-          # gateway-latest only ever moves on a real tag push. A manual
-          # workflow_dispatch build must not repoint a tag production may follow.
-          {
-            echo "IMAGE_TAGS<<__EOF__"
-            echo "${REPO}:gateway-${TAG_NAME}"
-            if [ "${IS_TAG}" = "1" ]; then
-              echo "${REPO}:gateway-latest"
-            fi
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
-
-  build-gateway:
+  build:
     needs: setup
     # Stock GitHub-hosted runner. The upstream workflow asked for a runs-on.com
     # third-party AWS runner ("runner=32cpu-linux-x64"), which is Succinct's
@@ -70,7 +60,42 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      # One component failing must not cancel the others mid-build.
+      fail-fast: false
+      matrix:
+        include:
+          - component: gateway
+            dockerfile: ./infra/Dockerfile.network-gateway
+            title: sp1-cluster-network-gateway
+          - component: coordinator
+            dockerfile: ./infra/Dockerfile.coordinator
+            title: sp1-cluster-coordinator
+          - component: api
+            dockerfile: ./infra/Dockerfile.api
+            title: sp1-cluster-api
     steps:
+      - name: Compute image tags
+        id: tags
+        env:
+          COMPONENT: ${{ matrix.component }}
+          TAG_NAME: ${{ needs.setup.outputs.TAG_NAME }}
+          IS_TAG: ${{ needs.setup.outputs.IS_TAG }}
+        run: |
+          set -euo pipefail
+          # GHCR requires a lowercase repository path.
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          # <component>-latest only ever moves on a real tag push. A manual
+          # workflow_dispatch build must not repoint a tag production may follow.
+          {
+            echo "IMAGE_TAGS<<__EOF__"
+            echo "${REPO}:${COMPONENT}-${TAG_NAME}"
+            if [ "${IS_TAG}" = "1" ]; then
+              echo "${REPO}:${COMPONENT}-latest"
+            fi
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Cleanup disk space
         run: |
           df -h
@@ -101,19 +126,19 @@ jobs:
       # target directory via actions/cache is not an option either: the GitHub
       # Actions cache is capped at 10 GB per repository and the runner only has
       # ~14 GB of free disk. Every build here is a cold build.
-      - name: Build and push network-gateway image to GHCR
+      - name: Build and push ${{ matrix.component }} image to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./infra/Dockerfile.network-gateway
+          file: ${{ matrix.dockerfile }}
           push: true
-          tags: ${{ needs.setup.outputs.IMAGE_TAGS }}
+          tags: ${{ steps.tags.outputs.IMAGE_TAGS }}
           build-args: |
             VERGEN_GIT_SHA=${{ needs.setup.outputs.SHORT_SHA }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.setup.outputs.TAG_NAME }}
-            org.opencontainers.image.title=sp1-cluster-network-gateway
+            org.opencontainers.image.title=${{ matrix.title }}
           secrets: |
             private_pull_token=${{ secrets.PRIVATE_PULL_TOKEN }}

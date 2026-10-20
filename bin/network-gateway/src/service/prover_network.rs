@@ -1,7 +1,9 @@
 use dashmap::DashMap;
 use prost::Message;
 use sp1_cluster_artifact::{ArtifactClient, ArtifactType};
-use sp1_cluster_common::{client::ClusterServiceClient, proto as cluster_pb};
+use sp1_cluster_common::{
+    client::ClusterServiceClient, mantle::ProofRequestQueryRequest, proto as cluster_pb,
+};
 use sp1_sdk::network::proto::base::network::prover_network_server::ProverNetwork;
 use sp1_sdk::network::proto::base::types as pb;
 use std::pin::Pin;
@@ -480,9 +482,12 @@ where
     ) -> Result<Response<pb::GetFilteredProofRequestsResponse>, Status> {
         let req = request.into_inner();
 
-        // Best-effort: the cluster's ProofRequestListRequest doesn't carry
-        // vk_hash/requester/fulfiller/from/to/version/mode filters, so those
-        // are silently dropped. Status filters and pagination round-trip.
+        // Best-effort: requester, status filters, minimum_deadline and
+        // pagination round-trip; vk_hash/fulfiller/from/to/version/mode are
+        // silently dropped. Rows come newest-first, like Succinct's network.
+        // Requester and order need the Mantle `QueryProofRequests` extension.
+        // An older cluster API lacks it, and then the call falls back to
+        // upstream `ProofRequestList`: requester dropped, oldest-first.
         //
         // A fulfillment filter the cluster cannot express (Assigned, Reverted,
         // Expired) matches nothing. It must be answered here: the cluster API
@@ -501,7 +506,7 @@ where
             Some(Some(statuses)) => statuses.into_iter().map(|s| s as i32).collect(),
             Some(None) | None => vec![],
         };
-        let execution_status = req
+        let execution_status: Vec<i32> = req
             .execution_status
             .and_then(|s| pb::ExecutionStatus::try_from(s).ok())
             .map(cluster_execution_filter)
@@ -516,20 +521,41 @@ where
             _ => None,
         };
 
-        let list = cluster_pb::ProofRequestListRequest {
-            proof_status,
-            execution_status,
+        let query = ProofRequestQueryRequest {
+            proof_status: proof_status.clone(),
+            execution_status: execution_status.clone(),
             minimum_deadline: req.minimum_deadline,
-            handled: None,
             limit,
             offset,
-            scheduled_by: None,
+            requester: req.requester.filter(|r| !r.is_empty()),
+            newest_first: true,
         };
-        let proofs = self
+        let queried = self
             .cluster
-            .get_proof_requests(list)
+            .query_proof_requests(query)
             .await
-            .map_err(|e| Status::internal(format!("cluster get_proof_requests failed: {e}")))?;
+            .map_err(|e| Status::internal(format!("cluster query_proof_requests failed: {e}")))?;
+        let proofs = match queried {
+            Some(proofs) => proofs,
+            None => {
+                tracing::warn!(
+                    "cluster API lacks QueryProofRequests; listing without the \
+                     requester filter, oldest-first"
+                );
+                let list = cluster_pb::ProofRequestListRequest {
+                    proof_status,
+                    execution_status,
+                    minimum_deadline: req.minimum_deadline,
+                    handled: None,
+                    limit,
+                    offset,
+                    scheduled_by: None,
+                };
+                self.cluster.get_proof_requests(list).await.map_err(|e| {
+                    Status::internal(format!("cluster get_proof_requests failed: {e}"))
+                })?
+            }
+        };
 
         let requests = proofs
             .into_iter()
@@ -1616,7 +1642,6 @@ mod tests {
     use super::*;
     use crate::program_store::InMemoryProgramStore;
     use sp1_cluster_artifact::InMemoryArtifactClient;
-    use sp1_cluster_common::proto::cluster_service_client::ClusterServiceClient as InnerClusterClient;
     use tonic::transport::Endpoint;
 
     /// Cluster client that is never actually dialed — tests only exercise paths that
@@ -1624,10 +1649,7 @@ mod tests {
     /// it'll fail connecting to 127.0.0.1:1, which is the behavior we want for coverage.
     fn dummy_cluster_client() -> ClusterServiceClient {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        ClusterServiceClient {
-            rpc: InnerClusterClient::new(channel),
-            backoff: Default::default(),
-        }
+        ClusterServiceClient::from_channel(channel, Default::default())
     }
 
     fn test_admission() -> std::sync::Arc<crate::admission::AdmissionController> {
