@@ -29,7 +29,7 @@ jobs:
     outputs:
       SHORT_SHA: ${{ steps.meta.outputs.SHORT_SHA }}
       TAG_NAME: ${{ steps.meta.outputs.TAG_NAME }}
-      IS_TAG: ${{ steps.meta.outputs.IS_TAG }}
+      MOVE_LATEST: ${{ steps.meta.outputs.MOVE_LATEST }}
     steps:
       - name: Compute short SHA and tag name
         id: meta
@@ -42,11 +42,18 @@ jobs:
           # workflow_dispatch runs have no tag; fall back to the short SHA so the
           # image is still uniquely addressable.
           if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/}" ]; then
-            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-            echo "IS_TAG=1" >> "$GITHUB_OUTPUT"
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+            # A pre-release tag (v2.8.4-admission-gate-2-rc.1) is a real tag but
+            # must not move <component>-latest. Release tags carry hyphens too
+            # (v2.8.4-admission-gate-1), so match the pre-release suffix only.
+            case "${TAG_NAME}" in
+              *-rc*|*-alpha*|*-beta*) echo "MOVE_LATEST=0" >> "$GITHUB_OUTPUT" ;;
+              *) echo "MOVE_LATEST=1" >> "$GITHUB_OUTPUT" ;;
+            esac
           else
             echo "TAG_NAME=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-            echo "IS_TAG=0" >> "$GITHUB_OUTPUT"
+            echo "MOVE_LATEST=0" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -80,17 +87,18 @@ jobs:
         env:
           COMPONENT: ${{ matrix.component }}
           TAG_NAME: ${{ needs.setup.outputs.TAG_NAME }}
-          IS_TAG: ${{ needs.setup.outputs.IS_TAG }}
+          MOVE_LATEST: ${{ needs.setup.outputs.MOVE_LATEST }}
         run: |
           set -euo pipefail
           # GHCR requires a lowercase repository path.
           REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
-          # <component>-latest only ever moves on a real tag push. A manual
-          # workflow_dispatch build must not repoint a tag production may follow.
+          # <component>-latest only ever moves on a release tag push. A manual
+          # workflow_dispatch build or a pre-release tag must not repoint a tag
+          # production may follow.
           {
             echo "IMAGE_TAGS<<__EOF__"
             echo "${REPO}:${COMPONENT}-${TAG_NAME}"
-            if [ "${IS_TAG}" = "1" ]; then
+            if [ "${MOVE_LATEST}" = "1" ]; then
               echo "${REPO}:${COMPONENT}-latest"
             fi
             echo "__EOF__"
