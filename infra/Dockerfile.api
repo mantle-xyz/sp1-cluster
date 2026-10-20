@@ -62,6 +62,14 @@ ENV FEATURES=$FEATURES
 ARG VERGEN_GIT_SHA
 ENV VERGEN_GIT_SHA=$VERGEN_GIT_SHA
 
+# Keep only line tables. The workspace keeps `[profile.release] debug = true`
+# for local development; overriding it here via the environment leaves
+# Cargo.toml untouched (and so avoids diverging from upstream). Full DWARF does
+# not fit the cargo target directory on a stock GitHub-hosted runner (see the
+# same override, `false`, in Dockerfile.network-gateway). Line tables still give
+# file:line in the RUST_BACKTRACE=full backtraces production runs with.
+ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+
 # Build the application
 # Uses BuildKit secrets mount to securely pass private token without exposing it in image layers
 # The secret is mounted as a file and read during the RUN command, then never stored in layers
