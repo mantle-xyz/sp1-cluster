@@ -1,3 +1,4 @@
+use crate::auth::{AuthChannel, BearerInterceptor};
 use crate::{
     mantle::{mantle_cluster_service_client::MantleClusterServiceClient, ProofRequestQueryRequest},
     proto::{
@@ -74,27 +75,34 @@ pub async fn reconnect_with_backoff(addr: &str) -> Result<Channel> {
 
 #[derive(Clone)]
 pub struct ClusterServiceClient {
-    pub rpc: InnerClusterClient<Channel>,
-    /// Mantle-only extension service on the same channel (`crate::mantle`).
-    pub mantle: MantleClusterServiceClient<Channel>,
+    pub rpc: InnerClusterClient<AuthChannel>,
+    /// Mantle-only extension service on the same channel (`crate::mantle`), sending
+    /// the same bearer token as `rpc`.
+    pub mantle: MantleClusterServiceClient<AuthChannel>,
     pub backoff: ExponentialBackoff,
 }
 
 impl ClusterServiceClient {
-    pub async fn new(addr: String) -> Result<Self> {
+    pub async fn new(addr: String, token: Option<String>) -> Result<Self> {
         let backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_millis(100))
             .with_max_elapsed_time(Some(Duration::from_secs(10)))
             .build();
         let channel = reconnect_with_backoff(&addr).await?;
-        Ok(Self::from_channel(channel, backoff))
+        let auth = BearerInterceptor::new(token.as_deref())?;
+        Ok(Self::with_auth(channel, auth, backoff))
     }
 
-    /// Build a client over an existing channel. Tests use this with a lazy channel.
+    /// Build a client over an existing channel, sending no bearer token. Tests use this
+    /// with a lazy channel.
     pub fn from_channel(channel: Channel, backoff: ExponentialBackoff) -> Self {
+        Self::with_auth(channel, BearerInterceptor::default(), backoff)
+    }
+
+    fn with_auth(channel: Channel, auth: BearerInterceptor, backoff: ExponentialBackoff) -> Self {
         Self {
-            rpc: InnerClusterClient::new(channel.clone()),
-            mantle: MantleClusterServiceClient::new(channel),
+            rpc: InnerClusterClient::with_interceptor(channel.clone(), auth.clone()),
+            mantle: MantleClusterServiceClient::with_interceptor(channel, auth),
             backoff,
         }
     }

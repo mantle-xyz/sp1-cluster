@@ -385,6 +385,7 @@ async fn spawn_gateway_stack(
         metrics_addr: format!("127.0.0.1:{metrics_port}"),
         public_http_url: public_http_url.clone(),
         cluster_rpc: cluster_rpc.clone(),
+        cluster_access_token: None,
         artifact_store: "unused".into(),
         s3_bucket: None,
         s3_region: None,

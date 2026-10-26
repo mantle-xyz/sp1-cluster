@@ -1,5 +1,6 @@
 [package]
 name = "sp1-cluster-common"
+publish = false
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -14,6 +15,7 @@ tokio-blocked = ["dep:tokio-blocked"]
 backoff = { workspace = true, features = ["futures", "tokio"] }
 eyre.workspace = true
 futures.workspace = true
+http.workspace = true
 if-addrs.workspace = true
 lazy_static.workspace = true
 log.workspace = true
@@ -21,19 +23,30 @@ opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp = { workspace = true, features = ["tokio", "logs"] }
 opentelemetry_sdk = { workspace = true, features = ["logs", "logs_level_enabled", "rt-tokio"] }
+# Mantle: `crate::mantle` derives its request with prost and serves it
+# through tonic-prost's codec.
 prost.workspace = true
 rustls = { workspace = true, features = ["ring"] }
 serde.workspace = true
 serde_json.workspace = true
 sp1-prover-types = { workspace = true }
+subtle.workspace = true
 tokio.workspace = true
 tokio-blocked = { workspace = true, optional = true }
 tokio-util = { workspace = true }
 tonic.workspace = true
+tonic-prost.workspace = true
+tonic-web.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [build-dependencies]
 chrono.workspace = true
+# Mantle: generates `MantleClusterService` (see build.rs).
 tonic-build.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

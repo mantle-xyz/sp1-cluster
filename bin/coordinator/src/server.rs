@@ -5,7 +5,7 @@ use crate::cluster::{
 use crate::config::Settings;
 use crate::latency::print_latency;
 use crate::metrics::initialize_metrics;
-use crate::util::{spawn_coordinator_periodic_task, spawn_heartbeat_task, OkService};
+use crate::util::{middleware, spawn_coordinator_periodic_task, spawn_heartbeat_task};
 use dashmap::DashMap;
 use jemallocator::Jemalloc;
 use mti::prelude::{MagicTypeIdExt, V7};
@@ -21,7 +21,6 @@ use std::net::SocketAddr;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Server, Request, Response, Status};
-use tonic_web::GrpcWebLayer;
 
 #[global_allocator]
 pub static ALLOCATOR: Jemalloc = Jemalloc;
@@ -514,76 +513,45 @@ fn spawn_subscriber_channel_task<P: Send + Sync + 'static>(
                         }
                     },
                     _ = interval.tick() => {
-                        // If no more messages can be sent, stop sending and detach below.
-                        if tx.is_closed() {
+                        // A closed `tx` means the client stream is gone. Skip resends and
+                        // keep `map` intact for a reconnect.
+                        if !tx.is_closed() {
+                            // Loop over map and resend any messages that haven't been acked for 4 seconds.
+                            track_latency!("worker.sub.resend", {
+                                let now = SystemTime::now();
+                                map.retain(|_, (last_acked, msg, retries)| {
+                                    if now.duration_since(*last_acked).unwrap_or(Duration::from_secs(0)) > Duration::from_secs(4) {
+                                        *last_acked = now;
+                                        *retries += 1;
+                                        tracing::warn!("Resending message {}", msg.msg_id);
+                                        if tx.send(Ok(msg.clone())).is_err() {
+                                            // Channel is closed, so no message can be sent.
+                                            return false;
+                                        }
+                                        if *retries > 3 {
+                                            // Remove messages that have failed 3 times.
+                                            tracing::warn!("Max retries for message {} reached", msg.msg_id);
+                                            return false;
+                                        }
+                                    }
+                                    true
+                                });
+                            });
+                        }
+                        // Remove this handler from `subscribers` once the coordinator
+                        // evicts the subscriber, which closes `outer_rx`.
+                        let drained = map.is_empty() || tx.is_closed();
+                        if drained && outer_rx.is_closed() && outer_rx.is_empty() {
+                            // Only remove if this task is still the active one for this subscriber
+                            if let Some(task_id) = current_task_id {
+                                subscribers.remove_if(&sub_id, |_, subscriber| {
+                                    subscriber.sender_handle.id() == task_id
+                                });
+                            }
                             break;
                         }
-                        // Loop over map and resend any messages that haven't been acked for 4 seconds.
-                        track_latency!("worker.sub.resend", {
-                            let now = SystemTime::now();
-                            map.retain(|_, (last_acked, msg, retries)| {
-                                if now.duration_since(*last_acked).unwrap_or(Duration::from_secs(0)) > Duration::from_secs(4) {
-                                    *last_acked = now;
-                                    *retries += 1;
-                                    tracing::warn!("Resending message {}", msg.msg_id);
-                                    if tx.send(Ok(msg.clone())).is_err() {
-                                        // Channel is closed, so no message can be sent.
-                                        return false;
-                                    }
-                                    if *retries > 3 {
-                                        // Remove messages that have failed 3 times.
-                                        tracing::warn!("Max retries for message {} reached", msg.msg_id);
-                                        return false;
-                                    }
-                                }
-                                true
-                            });
-                            // If map is empty and outer_rx is closed, then we're done. Remove the
-                            // subscriber.
-                            if map.is_empty() && outer_rx.is_closed() && outer_rx.is_empty() {
-                                // Only remove if this task is still the active one for this subscriber
-                                if let Some(task_id) = current_task_id {
-                                    subscribers.remove_if(&sub_id, |_, subscriber| {
-                                        subscriber.sender_handle.id() == task_id
-                                    });
-                                }
-                                return;
-                            }
-                        });
                     },
                 }
-            }
-
-            // Detached: the client stream is gone. Keep the entry, since a reconnect
-            // with the same sub_id reuses its `unacked` map, until the coordinator
-            // gives up on the subscriber and outer_rx closes. Exiting on the closed
-            // stream instead leaked the entry: nothing else ever removes it.
-            while let Some(msg) = outer_rx.recv().await {
-                // Undeliverable. Heartbeats arrive here for a while after every
-                // normal disconnect, and shutdown sends every subscriber an
-                // EndOfStream; neither matters to a gone client. A dropped task
-                // result is worth a warning.
-                if !matches!(
-                    msg.message,
-                    Some(server_sub_message::Message::ServerHeartbeat(_))
-                        | Some(server_sub_message::Message::EndOfStream(_))
-                ) {
-                    tracing::warn!(
-                        "Dropping message {} for disconnected subscriber {}: {:?}",
-                        msg.msg_id,
-                        sub_id,
-                        msg.message
-                    );
-                }
-            }
-            // Remove even if `unacked` is not empty: the coordinator dropped the
-            // subscriber, so a reconnect re-sends its task ids and
-            // `add_subscriptions` re-issues their results. Only remove if this task
-            // is still the active one; a reconnect may have replaced it.
-            if let Some(task_id) = current_task_id {
-                subscribers.remove_if(&sub_id, |_, subscriber| {
-                    subscriber.sender_handle.id() == task_id
-                });
             }
         }
     })
@@ -667,7 +635,9 @@ pub async fn start_coordinator_server_custom<
 
     let (completed_tx, completed_rx) = mpsc::unbounded_channel::<ProofResult<P>>();
     let task_map = Arc::new(DashMap::<String, TaskState>::new());
-    let api_client = Arc::new(ClusterServiceClient::new(config.cluster_rpc.clone()).await?);
+    let api_client = Arc::new(
+        ClusterServiceClient::new(config.cluster_rpc.clone(), config.auth.token.clone()).await?,
+    );
 
     service.coordinator.set_proofs_tx(completed_tx).await;
     service
@@ -726,10 +696,6 @@ pub async fn start_coordinator_server_custom<
         addr
     );
 
-    let middleware = tower::ServiceBuilder::new()
-        .layer_fn(|s| OkService { inner: s })
-        .layer(GrpcWebLayer::new());
-
     let coordinator = service.coordinator.clone();
     let coordinator_for_shutdown = service.coordinator.clone();
 
@@ -738,7 +704,7 @@ pub async fn start_coordinator_server_custom<
         .tcp_keepalive(Some(Duration::from_secs(20)))
         .http2_keepalive_interval(Some(Duration::from_secs(15)))
         .http2_keepalive_timeout(Some(Duration::from_secs(35)))
-        .layer(middleware)
+        .layer(middleware(config.auth.clone()))
         .add_service(
             sp1_cluster_common::proto::worker_service_server::WorkerServiceServer::new(service),
         )
@@ -865,249 +831,117 @@ mod open_wiring_tests {
     }
 }
 
-/// Subscriber handler lifecycle. Most tests drive `spawn_subscriber_channel_task`
-/// directly so they own every channel end: the coordinator side (`outer_tx`),
-/// the client stream (`client_rx`) and the handler map. One test goes through
-/// the real `open_sub`. Only the 2 s tokio interval is time-driven here; the 4 s
-/// resend check and the coordinator's 20 s subscriber timeout read
-/// `SystemTime`, which a paused tokio clock does not move.
-///
-/// Timing rules for every test: the clock is paused and the tests only `yield`
-/// and `advance`, never await a timer, so the paused clock never auto-advances.
-/// The runtime is single-threaded, so a spawned task first runs at the first
-/// yield, after its handler entry is in place.
 #[cfg(test)]
-mod subscriber_channel_tests {
+mod subscriber_reconnect_tests {
     use super::*;
     use policy::default::DefaultPolicy;
     use sp1_cluster_common::proto::worker_service_server::WorkerService;
     use sp1_cluster_common::proto::OpenSubRequest;
+    use tokio_stream::StreamExt;
 
-    type Handlers = Arc<DashMap<String, GenericSubscriberHandler<()>>>;
-    type Unacked = Arc<DashMap<String, (SystemTime, ServerSubMessage, u32)>>;
+    const SUB: &str = "sub";
+    const PROOF: &str = "p1";
+    const TASK: &str = "t1";
 
-    const SUB: &str = "sub_test";
-
-    /// Test-held ends of one sender task.
-    struct Sub {
-        outer_tx: mpsc::UnboundedSender<ServerSubMessage>,
-        client_rx: mpsc::UnboundedReceiver<Result<ServerSubMessage, Status>>,
-        /// Kept by the test because the `JoinHandle` lives in (and is dropped
-        /// with) the handler entry.
-        abort: tokio::task::AbortHandle,
+    async fn open_sub(
+        service: &GenericWorkerService<DefaultPolicy>,
+    ) -> UnboundedReceiverStream<Result<ServerSubMessage, Status>> {
+        let request = Request::new(OpenSubRequest {
+            sub_id: SUB.into(),
+            proof_id: PROOF.into(),
+            task_ids: vec![TASK.into()],
+        });
+        WorkerService::open_sub(service, request)
+            .await
+            .unwrap()
+            .into_inner()
     }
 
-    /// Spawn a sender task and return the test's ends plus its `JoinHandle`,
-    /// which the caller stores in the handler map.
-    fn spawn_sub(unacked: &Unacked, handlers: &Handlers) -> (Sub, tokio::task::JoinHandle<()>) {
-        let (outer_tx, outer_rx) = mpsc::unbounded_channel();
-        let (tx, client_rx) = mpsc::unbounded_channel();
-        let handle = spawn_subscriber_channel_task(
-            SUB.to_string(),
-            outer_rx,
-            tx,
-            unacked.clone(),
-            handlers.clone(),
+    /// Mirrors `complete_task`: mark the task done and notify its subscribers.
+    async fn complete_task(service: &GenericWorkerService<DefaultPolicy>) {
+        let subscribers = {
+            let mut state = service.coordinator.state.write().await;
+            let task = state
+                .proofs
+                .get_mut(PROOF)
+                .unwrap()
+                .tasks
+                .get_mut(TASK)
+                .unwrap();
+            task.status = TaskStatus::Succeeded;
+            std::mem::take(&mut task.subscribers)
+        };
+        service.coordinator.notify_subscribers(
+            &subscribers,
+            PROOF.into(),
+            TASK.into(),
+            TaskStatus::Succeeded,
         );
-        let abort = handle.abort_handle();
-        (
-            Sub {
-                outer_tx,
-                client_rx,
-                abort,
-            },
-            handle,
-        )
     }
 
-    /// Spawn a sender task registered as the subscriber's handler, the way
-    /// `open_sub` does for a new sub_id, and let it consume its first tick
-    /// (a tokio interval completes the first one immediately).
-    async fn open(unacked: &Unacked, handlers: &Handlers) -> Sub {
-        let (sub, handle) = spawn_sub(unacked, handlers);
-        handlers.insert(
-            SUB.to_string(),
-            GenericSubscriberHandler::new(handle, unacked.clone()),
-        );
-        settle().await;
-        sub
-    }
-
-    /// A fixed number of yields is enough on the single-threaded test runtime.
-    /// A multi-threaded runtime would need explicit completion signals instead.
-    async fn settle() {
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
+    async fn next_task_result(
+        stream: &mut UnboundedReceiverStream<Result<ServerSubMessage, Status>>,
+    ) -> proto::TaskResult {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("no message within 5s")
+                .expect("stream ended")
+                .unwrap();
+            if let Some(server_sub_message::Message::TaskResult(result)) = msg.message {
+                return result;
+            }
         }
     }
 
-    /// Advance exactly one sender interval and let the tasks handle it.
-    async fn next_tick() {
-        tokio::time::advance(Duration::from_secs(2)).await;
-        settle().await;
-    }
-
-    fn msg(id: &str) -> ServerSubMessage {
-        ServerSubMessage {
-            msg_id: id.to_string(),
-            message: None,
-        }
-    }
-
-    fn unacked_msg(id: &str) -> (SystemTime, ServerSubMessage, u32) {
-        (SystemTime::now(), msg(id), 0)
-    }
-
-    /// The leak: the client disconnects first, then the coordinator drops the
-    /// subscriber. The entry must survive the disconnect (a reconnect may still
-    /// reuse it) and be removed once the coordinator gives up, even with an
-    /// unacked message still recorded.
+    /// The task finishes while the client is gone, and the client returns
+    /// after eviction removed its handler. Resubscribing still delivers the result.
     #[tokio::test(start_paused = true)]
-    async fn entry_is_removed_after_disconnect_once_coordinator_drops_subscriber() {
-        let handlers: Handlers = Arc::new(DashMap::new());
-        let unacked: Unacked = Arc::new(DashMap::new());
-        let sub = open(&unacked, &handlers).await;
-        // In flight when the stream broke; never acked.
-        unacked.insert("m1".into(), unacked_msg("m1"));
+    async fn late_reconnect_receives_result_missed_while_disconnected() {
+        let service = GenericWorkerService::<DefaultPolicy>::default();
+        crate::tests::register_running_task(&service.coordinator, TASK).await;
 
-        drop(sub.client_rx);
-        next_tick().await;
-        assert!(
-            !sub.abort.is_finished(),
-            "task exited on disconnect; nothing would remove its entry"
-        );
-        assert!(
-            handlers.contains_key(SUB),
-            "entry dropped before the coordinator gave up"
-        );
+        drop(open_sub(&service).await); // client disconnects
+        tokio::task::yield_now().await;
+        complete_task(&service).await;
+        // coordinator evicts the subscriber
+        service
+            .coordinator
+            .subscribers
+            .get_mut(SUB)
+            .unwrap()
+            .last_update = SystemTime::now() - Duration::from_secs(60);
+        service.coordinator.cleanup_dead_subscribers().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!service.subscribers.contains_key(SUB));
 
-        // The coordinator dropped the subscriber (its 20 s timeout).
-        drop(sub.outer_tx);
-        settle().await;
-        assert!(sub.abort.is_finished());
-        assert_eq!(unacked.len(), 1, "precondition: an unacked message remains");
-        assert!(
-            !handlers.contains_key(SUB),
-            "entry leaked after the coordinator gave up"
-        );
+        let mut stream = open_sub(&service).await;
+        let result = next_task_result(&mut stream).await;
+        assert_eq!(result.task_id, TASK);
+        assert_eq!(result.task_status, TaskStatus::Succeeded as i32);
     }
 
-    /// The real `open_sub` path: disconnect, reconnect with the same sub_id,
-    /// then time out. The reconnect must abort the old task and reuse the
-    /// entry's `unacked` map; the timeout must then remove the entry.
+    /// Same, but the client returns before eviction. The new stream reuses
+    /// the old handler's unacked map and still delivers the result.
     #[tokio::test(start_paused = true)]
-    async fn open_sub_reconnect_reuses_entry_and_timeout_removes_it() {
-        let service: GenericWorkerService<DefaultPolicy> = GenericWorkerService::default();
-        let open_sub = || {
-            WorkerService::open_sub(
-                &service,
-                Request::new(OpenSubRequest {
-                    sub_id: SUB.to_string(),
-                    proof_id: "proof_test".to_string(),
-                    task_ids: vec![],
-                }),
-            )
-        };
+    async fn early_reconnect_receives_result_missed_while_disconnected() {
+        let service = GenericWorkerService::<DefaultPolicy>::default();
+        crate::tests::register_running_task(&service.coordinator, TASK).await;
 
-        let first = open_sub().await.unwrap();
-        settle().await;
-        let (unacked, first_task) = {
-            let entry = service.subscribers.get(SUB).unwrap();
-            (entry.unacked.clone(), entry.sender_handle.abort_handle())
-        };
-        unacked.insert("m1".into(), unacked_msg("m1"));
+        drop(open_sub(&service).await); // client disconnects
+        tokio::task::yield_now().await;
+        complete_task(&service).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let unacked = service.subscribers.get(SUB).unwrap().unacked.clone();
+        assert!(!unacked.is_empty());
 
-        drop(first);
-        next_tick().await;
-        assert!(
-            !first_task.is_finished(),
-            "first task should be detached, not exited"
-        );
-
-        let second = open_sub().await.unwrap();
-        settle().await;
-        assert!(
-            first_task.is_finished(),
-            "reconnect must abort the old task"
-        );
-        let second_task = {
-            let entry = service.subscribers.get(SUB).unwrap();
-            assert!(
-                Arc::ptr_eq(&entry.unacked, &unacked),
-                "reconnect must reuse the entry's unacked map"
-            );
-            assert!(entry.unacked.contains_key("m1"));
-            assert_ne!(entry.sender_handle.id(), first_task.id());
-            entry.sender_handle.abort_handle()
-        };
-
-        // Client gone again, then the coordinator times the subscriber out.
-        drop(second);
-        next_tick().await;
-        assert!(!second_task.is_finished());
-        service.coordinator.subscribers.remove(SUB);
-        settle().await;
-        assert!(second_task.is_finished());
-        assert!(
-            !service.subscribers.contains_key(SUB),
-            "entry leaked after timeout"
-        );
-    }
-
-    /// Once detached, messages from the coordinator are dropped, not recorded.
-    /// On the old code this assertion holds trivially (the task had exited);
-    /// the leak regression itself is covered by the first test.
-    #[tokio::test(start_paused = true)]
-    async fn detached_task_does_not_record_messages() {
-        let handlers: Handlers = Arc::new(DashMap::new());
-        let unacked: Unacked = Arc::new(DashMap::new());
-        let sub = open(&unacked, &handlers).await;
-
-        drop(sub.client_rx);
-        next_tick().await;
-        // Detached: alive, entry kept.
-        assert!(!sub.abort.is_finished());
-        assert!(handlers.contains_key(SUB));
-
-        sub.outer_tx.send(msg("late")).unwrap();
-        settle().await;
-        assert!(
-            unacked.is_empty(),
-            "detached task recorded an undeliverable message"
-        );
-    }
-
-    /// A detached task whose entry was taken over by a newer task must not
-    /// remove that entry. Real `open_sub` aborts the old task; this test keeps
-    /// it running to exercise the task-id guard in `remove_if`.
-    #[tokio::test(start_paused = true)]
-    async fn detached_task_does_not_remove_replacement_entry() {
-        let handlers: Handlers = Arc::new(DashMap::new());
-        let unacked: Unacked = Arc::new(DashMap::new());
-        let old = open(&unacked, &handlers).await;
-
-        drop(old.client_rx);
-        next_tick().await;
-        assert!(!old.abort.is_finished());
-
-        // Swap in a new task. Dropping the old `JoinHandle` here only detaches
-        // it; the old task keeps running and `old.abort` still observes it.
-        let (new, handle) = spawn_sub(&unacked, &handlers);
-        let new_id = handle.id();
-        handlers.get_mut(SUB).unwrap().sender_handle = handle;
-        settle().await;
-
-        drop(old.outer_tx);
-        settle().await;
-        assert!(
-            old.abort.is_finished(),
-            "old task should exit once its outer_rx closes"
-        );
-        let entry = handlers
-            .get(SUB)
-            .expect("old task removed the replacement's entry");
-        assert_eq!(entry.sender_handle.id(), new_id);
-        drop(entry);
-        assert!(!new.abort.is_finished());
+        let mut stream = open_sub(&service).await;
+        assert!(Arc::ptr_eq(
+            &unacked,
+            &service.subscribers.get(SUB).unwrap().unacked
+        ));
+        let result = next_task_result(&mut stream).await;
+        assert_eq!(result.task_id, TASK);
+        assert_eq!(result.task_status, TaskStatus::Succeeded as i32);
     }
 }

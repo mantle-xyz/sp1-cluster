@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use axum::{routing::get, Router};
 use sp1_cluster_artifact::{ArtifactClient, CompressedUpload};
 use sp1_cluster_common::client::ClusterServiceClient;
+use sp1_cluster_common::grpc_web::grpc_web_layer;
 use sp1_cluster_common::proto as cluster_pb;
 use sp1_sdk::network::proto::artifact::artifact_store_server::ArtifactStoreServer;
 use sp1_sdk::network::proto::base::network::prover_network_server::ProverNetworkServer;
@@ -35,11 +36,12 @@ pub async fn run<A>(cfg: Config, client: A) -> Result<()>
 where
     A: ArtifactClient + CompressedUpload + 'static,
 {
-    let cluster = ClusterServiceClient::new(cfg.cluster_rpc.clone())
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("failed to connect to cluster RPC {}: {e}", cfg.cluster_rpc)
-        })?;
+    let cluster =
+        ClusterServiceClient::new(cfg.cluster_rpc.clone(), cfg.cluster_access_token.clone())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to connect to cluster RPC {}: {e}", cfg.cluster_rpc)
+            })?;
     let auth = build_auth(&cfg)?;
     let program_store = build_program_store(&cfg)?;
     serve(
@@ -64,11 +66,12 @@ pub async fn run_with_shutdown<A>(
 where
     A: ArtifactClient + CompressedUpload + 'static,
 {
-    let cluster = ClusterServiceClient::new(cfg.cluster_rpc.clone())
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("failed to connect to cluster RPC {}: {e}", cfg.cluster_rpc)
-        })?;
+    let cluster =
+        ClusterServiceClient::new(cfg.cluster_rpc.clone(), cfg.cluster_access_token.clone())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to connect to cluster RPC {}: {e}", cfg.cluster_rpc)
+            })?;
     let auth = build_auth(&cfg)?;
     let program_store = build_program_store(&cfg)?;
     serve(
@@ -150,8 +153,9 @@ where
         info!("gRPC server listening on {grpc_addr}");
         Server::builder()
             .accept_http1(true)
-            .add_service(tonic_web::enable(prover_network))
-            .add_service(tonic_web::enable(artifact_store))
+            .layer(grpc_web_layer())
+            .add_service(prover_network)
+            .add_service(artifact_store)
             .serve_with_shutdown(grpc_addr, grpc_shutdown)
             .await
             .unwrap_or_else(|e| warn!("gRPC server error: {e}"));

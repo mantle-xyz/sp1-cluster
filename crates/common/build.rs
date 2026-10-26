@@ -34,7 +34,7 @@ fn compile_mantle_cluster_service() {
                 .route_name("QueryProofRequests")
                 .input_type("crate::mantle::ProofRequestQueryRequest")
                 .output_type("crate::proto::ProofRequestListResponse")
-                .codec_path("tonic::codec::ProstCodec")
+                .codec_path("tonic_prost::ProstCodec")
                 .build(),
         )
         .build();

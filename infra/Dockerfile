@@ -33,10 +33,12 @@ RUN wget -q https://golang.org/dl/go${GO_VERSION}.linux-amd64.tar.gz && \
     tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz && \
     rm go${GO_VERSION}.linux-amd64.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct" \
+    GOSUMDB="sum.golang.org"
 
 # Install sp1 toolchain
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-RUN curl -L https://sp1.succinct.xyz | bash && ~/.sp1/bin/sp1up --version 6.8.1
+RUN curl -L https://sp1.succinct.xyz | bash && ~/.sp1/bin/sp1up --version 6.10.0
 
 # Install protoc
 ENV PROTOC_ZIP=protoc-29.4-linux-x86_64.zip
