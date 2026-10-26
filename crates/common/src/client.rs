@@ -1,5 +1,6 @@
+use crate::auth::{AuthChannel, BearerInterceptor};
 use crate::{
-    mantle::{mantle_cluster_service_client::MantleClusterServiceClient, ProofRequestQueryRequest},
+    mantle::mantle_cluster_service_client::MantleClusterServiceClient,
     proto::{
         self, cluster_service_client::ClusterServiceClient as InnerClusterClient,
         ProofRequestCancelRequest, ProofRequestCreateRequest, ProofRequestGetRequest,
@@ -74,34 +75,41 @@ pub async fn reconnect_with_backoff(addr: &str) -> Result<Channel> {
 
 #[derive(Clone)]
 pub struct ClusterServiceClient {
-    pub rpc: InnerClusterClient<Channel>,
-    /// Mantle-only extension service on the same channel (`crate::mantle`).
-    pub mantle: MantleClusterServiceClient<Channel>,
+    pub rpc: InnerClusterClient<AuthChannel>,
+    /// Mantle-only extension service on the same channel (`crate::mantle`), sending
+    /// the same bearer token as `rpc`.
+    pub mantle: MantleClusterServiceClient<AuthChannel>,
     pub backoff: ExponentialBackoff,
 }
 
 impl ClusterServiceClient {
-    pub async fn new(addr: String) -> Result<Self> {
+    pub async fn new(addr: String, token: Option<String>) -> Result<Self> {
         let backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_millis(100))
             .with_max_elapsed_time(Some(Duration::from_secs(10)))
             .build();
         let channel = reconnect_with_backoff(&addr).await?;
-        Ok(Self::from_channel(channel, backoff))
+        let auth = BearerInterceptor::new(token.as_deref())?;
+        Ok(Self::with_auth(channel, auth, backoff))
     }
 
-    /// Build a client over an existing channel. Tests use this with a lazy channel.
+    /// Build a client over an existing channel, sending no bearer token. Tests use this
+    /// with a lazy channel.
     pub fn from_channel(channel: Channel, backoff: ExponentialBackoff) -> Self {
+        Self::with_auth(channel, BearerInterceptor::default(), backoff)
+    }
+
+    fn with_auth(channel: Channel, auth: BearerInterceptor, backoff: ExponentialBackoff) -> Self {
         Self {
-            rpc: InnerClusterClient::new(channel.clone()),
-            mantle: MantleClusterServiceClient::new(channel),
+            rpc: InnerClusterClient::with_interceptor(channel.clone(), auth.clone()),
+            mantle: MantleClusterServiceClient::with_interceptor(channel, auth),
             backoff,
         }
     }
 
     /// Shared call policy: retry transient failures within the backoff budget, each attempt bounded
     /// by [`ATTEMPT_TIMEOUT`]. `make_call` builds one fresh attempt per try (cloning client/request).
-    async fn retry_call<T, Fut>(&self, make_call: impl Fn() -> Fut) -> Result<T>
+    pub(crate) async fn retry_call<T, Fut>(&self, make_call: impl Fn() -> Fut) -> Result<T>
     where
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
@@ -140,28 +148,6 @@ impl ClusterServiceClient {
             })
             .await?;
         Ok(result.proof_requests)
-    }
-
-    /// One page of `MantleClusterService/QueryProofRequests` (requester filter,
-    /// optional newest-first order).
-    ///
-    /// Returns `Ok(None)` when the API server predates the extension and answers
-    /// `Unimplemented`, so the caller can fall back to [`Self::get_proof_requests`].
-    pub async fn query_proof_requests(
-        &self,
-        request: ProofRequestQueryRequest,
-    ) -> Result<Option<Vec<proto::ProofRequest>>> {
-        let result = backoff_retry(self.backoff.clone(), || {
-            let mut client = self.mantle.clone();
-            let request = request.clone();
-            with_timeout(async move { client.query_proof_requests(request).await })
-        })
-        .await;
-        match result {
-            Ok(resp) => Ok(Some(resp.proof_requests)),
-            Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
-            Err(status) => Err(status.into()),
-        }
     }
 
     /// Fetches all rows that match the filters in `request`. The server caps

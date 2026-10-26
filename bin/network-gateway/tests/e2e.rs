@@ -23,7 +23,7 @@ use sp1_cluster_common::{
 use sp1_cluster_network_gateway::{
     auth::AuthMode,
     build_auth,
-    config::Config,
+    config::{AdmissionConfig, Config},
     program_store::{InMemoryProgramStore, ProgramStore},
     serve,
 };
@@ -236,12 +236,20 @@ impl ClusterService for FakeCluster {
         // cluster will never run — the bug `minimum_deadline = now` in
         // `fetch_pending_proofs` fixes.
         let req = request.into_inner();
-        let proof_requests = self
+        let mut proof_requests: Vec<_> = self
             .requests
             .iter()
             .map(|r| r.clone())
             .filter(|r| req.proof_status.is_empty() || req.proof_status.contains(&r.proof_status))
             .filter(|r| req.minimum_deadline.is_none_or(|min| r.deadline >= min))
+            .collect();
+        // Like the real api: oldest-first by (created_at, id), then offset and
+        // the clamped limit (`unwrap_or(10).min(1000)`).
+        proof_requests.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        let proof_requests = proof_requests
+            .into_iter()
+            .skip(req.offset.unwrap_or(0) as usize)
+            .take(req.limit.unwrap_or(10).min(1000) as usize)
             .collect();
         Ok(tonic::Response::new(cluster_pb::ProofRequestListResponse {
             proof_requests,
@@ -385,6 +393,7 @@ async fn spawn_gateway_stack(
         metrics_addr: format!("127.0.0.1:{metrics_port}"),
         public_http_url: public_http_url.clone(),
         cluster_rpc: cluster_rpc.clone(),
+        cluster_access_token: None,
         artifact_store: "unused".into(),
         s3_bucket: None,
         s3_region: None,
@@ -396,23 +405,14 @@ async fn spawn_gateway_stack(
         auth_allowlist: None,
         program_store: "memory".into(),
         program_store_dir: None,
-        admission_enforce: false,
-        admission_range_max_inflight: 1,
-        admission_agg_max_inflight: 2,
-        admission_global_max_inflight: None,
-        admission_range_vk_hashes: None,
-        admission_agg_vk_hashes: None,
-        admission_reap_period_secs: 60,
-        admission_slot_ttl_secs: 3600,
-        admission_reconcile_absent_observations: 3,
-        // 0 = no post-commit grace: the FakeCluster create is instant, so there's
-        // no create-window race to guard against, and the reconcile tests want
-        // prompt release. Production defaults this to 60s.
-        admission_reconcile_commit_grace_secs: 0,
-        admission_reconcile_fetch_timeout_secs: 5,
-        admission_priority_enable: false,
-        admission_priority_order: None,
-        admission_priority_ttl_secs: 90,
+        admission: AdmissionConfig {
+            // 0 = no post-commit grace: the FakeCluster create is instant, so
+            // there's no create-window race to guard against, and the reconcile
+            // tests want prompt release.
+            reconcile_commit_grace_secs: 0,
+            reconcile_fetch_timeout_secs: 5,
+            ..AdmissionConfig::default()
+        },
     };
     admission_overrides(&mut cfg);
     // Build `Auth` from the (possibly-overridden) config so tests can exercise
@@ -593,8 +593,8 @@ async fn e2e_admission_sheds_over_cap_then_readmits() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
 
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
     })
     .await;
 
@@ -750,14 +750,14 @@ async fn e2e_admission_create_failure_holds_slot_until_reconciled() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
 
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
         // Fast reconcile so the test doesn't wait the production cadence: reap
         // every 1s, release a committed-absent slot after 2 consecutive absent
         // observations (≈2s at a 1s reap period).
-        cfg.admission_reap_period_secs = 1;
-        cfg.admission_reconcile_fetch_timeout_secs = 1;
-        cfg.admission_reconcile_absent_observations = 2;
+        cfg.admission.reap_period_secs = 1;
+        cfg.admission.reconcile_fetch_timeout_secs = 1;
+        cfg.admission.reconcile_absent_observations = 2;
     })
     .await;
 
@@ -903,11 +903,11 @@ async fn e2e_admission_reconcile_releases_completed_proof() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
 
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
-        cfg.admission_reap_period_secs = 1;
-        cfg.admission_reconcile_fetch_timeout_secs = 1;
-        cfg.admission_reconcile_absent_observations = 2;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
+        cfg.admission.reap_period_secs = 1;
+        cfg.admission.reconcile_fetch_timeout_secs = 1;
+        cfg.admission.reconcile_absent_observations = 2;
     })
     .await;
 
@@ -971,16 +971,16 @@ async fn e2e_admission_reconcile_releases_expired_pending_proof() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
 
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
-        cfg.admission_reap_period_secs = 1;
-        cfg.admission_reconcile_fetch_timeout_secs = 1;
-        cfg.admission_reconcile_absent_observations = 2;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
+        cfg.admission.reap_period_secs = 1;
+        cfg.admission.reconcile_fetch_timeout_secs = 1;
+        cfg.admission.reconcile_absent_observations = 2;
         // Long TTL so it's the (prompt) deadline-aware reconcile release — NOT the
         // backstop reaper — that frees the slot. If the deadline filter were
         // missing, the still-Pending proof would keep its slot until this TTL and
         // the bounded poll below would time out, failing the test.
-        cfg.admission_slot_ttl_secs = 3600;
+        cfg.admission.slot_ttl_secs = 3600;
     })
     .await;
 
@@ -1114,8 +1114,8 @@ async fn send_request_proof(
 async fn e2e_admission_dry_run_admits_over_cap() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = false;
-        cfg.admission_range_max_inflight = 1;
+        cfg.admission.enforce = false;
+        cfg.admission.range_max_inflight = 1;
     })
     .await;
 
@@ -1150,8 +1150,8 @@ async fn e2e_admission_dry_run_admits_over_cap() {
 async fn e2e_admission_releases_on_details_terminal() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
     })
     .await;
 
@@ -1206,8 +1206,8 @@ async fn e2e_admission_releases_on_details_terminal() {
 async fn e2e_admission_metrics_endpoint() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
     })
     .await;
 
@@ -1259,20 +1259,20 @@ async fn e2e_admission_metrics_endpoint() {
 async fn e2e_admission_reaper_reclaims_abandoned() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
         // Reap sweeps every 1s; a committed slot's TTL backstop is 3s — the
         // smallest legal ttl here, since the absence debounce (2 observations) ×
         // reap (1s) = 2s must stay strictly below it. The reaper's first sweep
         // fires after ~1s and every period thereafter; sleeping ~4.7s below
         // guarantees a sweep observes the slot past its 3s ttl without being so
         // tight that jitter flakes it.
-        cfg.admission_reap_period_secs = 1;
-        cfg.admission_slot_ttl_secs = 3;
-        cfg.admission_reconcile_absent_observations = 2;
+        cfg.admission.reap_period_secs = 1;
+        cfg.admission.slot_ttl_secs = 3;
+        cfg.admission.reconcile_absent_observations = 2;
         // Fetch timeout must be <= the reap period (it is awaited inline in the
         // reaper loop).
-        cfg.admission_reconcile_fetch_timeout_secs = 1;
+        cfg.admission.reconcile_fetch_timeout_secs = 1;
     })
     .await;
     // Proof stays Pending (never terminal) AND the Pending query fails, so the
@@ -1314,18 +1314,18 @@ async fn e2e_admission_reaper_reclaims_abandoned() {
 async fn e2e_admission_touch_keeps_polled_slot() {
     let proof_bytes: Vec<u8> = (0..256u16).flat_map(|x| x.to_le_bytes()).collect();
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
         // reap every 1s against a 3s ttl — the smallest legal ttl, since the
         // absence debounce (2 observations) × reap (1s) = 2s must stay strictly
         // below it. The ~300ms poll loop below refreshes the slot well within the
         // 3s ttl on every sweep, while an unpolled slot would be reaped after 3s.
-        cfg.admission_reap_period_secs = 1;
-        cfg.admission_slot_ttl_secs = 3;
-        cfg.admission_reconcile_absent_observations = 2;
+        cfg.admission.reap_period_secs = 1;
+        cfg.admission.slot_ttl_secs = 3;
+        cfg.admission.reconcile_absent_observations = 2;
         // Fetch timeout must be <= the reap period (it is awaited inline in the
         // reaper loop).
-        cfg.admission_reconcile_fetch_timeout_secs = 1;
+        cfg.admission.reconcile_fetch_timeout_secs = 1;
     })
     .await;
     stack.pending.store(true, Ordering::SeqCst); // never reaches a terminal status on its own
@@ -1534,14 +1534,14 @@ async fn e2e_admission_priority_admits_higher_rank() {
 
     let mut stack = spawn_gateway_stack(proof_bytes, |cfg| {
         cfg.auth_mode = AuthMode::Verify;
-        cfg.admission_enforce = true;
-        cfg.admission_range_max_inflight = 1;
-        cfg.admission_priority_enable = true;
+        cfg.admission.enforce = true;
+        cfg.admission.range_max_inflight = 1;
+        cfg.admission.priority_enable = true;
         // `{:x}` renders the 20-byte address as 40 lowercase hex chars (no 0x);
         // the parser hex-decodes it and compares against the recovered signer.
-        cfg.admission_priority_order =
+        cfg.admission.priority_order =
             Some(vec![format!("{hi_addr:x}:0"), format!("{lo_addr:x}:1")]);
-        cfg.admission_priority_ttl_secs = 3600;
+        cfg.admission.priority_ttl_secs = 3600;
     })
     .await;
 
@@ -1714,7 +1714,8 @@ async fn filtered_ids(
 /// oldest page.
 #[tokio::test]
 async fn e2e_filtered_list_forwards_requester_newest_first() {
-    let mut stack = spawn_gateway_stack(vec![], |_cfg| {}).await;
+    // Verify mode: rows carry the real signer, as in production.
+    let mut stack = spawn_gateway_stack(vec![], |cfg| cfg.auth_mode = AuthMode::Verify).await;
     // Other requester owns the oldest rows, which used to fill the first page.
     for i in 0..5 {
         seed_row(&stack, &format!("req_other_{i}"), 0xbb, 100 + i);
@@ -1741,19 +1742,53 @@ async fn e2e_filtered_list_forwards_requester_newest_first() {
     stack.shutdown().await;
 }
 
-/// Against a cluster API without the extension, the gateway still answers
-/// through upstream `ProofRequestList` (requester dropped) instead of failing.
+/// Against a cluster API without the extension, the call fails with a clear
+/// `FailedPrecondition` instead of emulating requester filtering and newest-first
+/// paging over upstream `ProofRequestList` (which can do neither).
 #[tokio::test]
-async fn e2e_filtered_list_falls_back_without_extension() {
-    let mut stack = spawn_gateway_stack(vec![], |_cfg| {}).await;
+async fn e2e_filtered_list_fails_without_extension() {
+    let mut stack = spawn_gateway_stack(vec![], |cfg| cfg.auth_mode = AuthMode::Verify).await;
     stack.query_unimplemented.store(true, Ordering::SeqCst);
-    seed_row(&stack, "req_other_0", 0xbb, 100);
     seed_row(&stack, "req_mine_0", 0xaa, 200);
 
-    let mut ids = filtered_ids(&mut stack, 0xaa, 10, 1).await;
-    ids.sort();
-    assert_eq!(ids, ["req_mine_0", "req_other_0"]);
-    assert!(stack.last_query.lock().unwrap().is_none());
+    let err = stack
+        .network_rpc
+        .get_filtered_proof_requests(
+            sp1_sdk::network::proto::base::types::GetFilteredProofRequestsRequest {
+                requester: Some(vec![0xaa; 20]),
+                limit: Some(10),
+                page: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("must not answer without the extension");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    stack.shutdown().await;
+}
+
+/// Under `AuthMode::None` every row this gateway writes carries the zero
+/// address, so a requester filter (the SDK always sends its own address) must
+/// become a zero-address filter: the history view is not empty, and rows
+/// written by others (another gateway, a verify-mode writer) stay out.
+#[tokio::test]
+async fn e2e_filtered_list_maps_requester_to_zero_without_auth() {
+    let mut stack = spawn_gateway_stack(vec![], |cfg| cfg.auth_mode = AuthMode::None).await;
+    // What `request_proof` stores under AuthMode::None.
+    seed_row(&stack, "req_0", 0x00, 100);
+    seed_row(&stack, "req_1", 0x00, 200);
+    seed_row(&stack, "req_foreign", 0xbb, 300);
+
+    let ids = filtered_ids(&mut stack, 0xaa, 10, 1).await;
+    assert_eq!(ids, ["req_1", "req_0"]);
+    let q = stack
+        .last_query
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("extension called");
+    assert_eq!(q.requester, Some(vec![0u8; 20]));
 
     stack.shutdown().await;
 }

@@ -17,7 +17,7 @@ members = [
     "crates/worker",
 ]
 [workspace.package]
-version = "2.8.4"
+version = "2.9.0"
 edition = "2021"
 repository = "https://github.com/succinctlabs/sp1-cluster"
 keywords = []
@@ -39,9 +39,6 @@ p3-field = "=0.3.3-succinct"
 p3-matrix = "=0.3.3-succinct"
 
 # SPN
-#
-# spn-network-types is pinned to the network branch head that adds the bid price floor
-# fields. Move it back to branch = "main" after that PR merges.
 spn-artifacts = { git = "https://github.com/succinctlabs/network", branch = "main" }
 spn-bidding = { git = "https://github.com/succinctlabs/network", branch = "main" }
 spn-metrics = { git = "https://github.com/succinctlabs/network", branch = "main" }
@@ -51,20 +48,20 @@ spn-utils = { git = "https://github.com/succinctlabs/network", branch = "main" }
 
 # SP1
 # Keep the entire family on one release so crossing types share one source.
-sp1-core-executor = "=6.8.1"
-sp1-core-machine = { version = "=6.8.1", features = ["bigint-rug"] }
-sp1-hypercube = "=6.8.1"
-sp1-primitives = "=6.8.1"
-sp1-prover = "=6.8.1"
-sp1-prover-types = "=6.8.1"
-sp1-recursion-circuit = "=6.8.1"
-sp1-recursion-compiler = "=6.8.1"
-sp1-recursion-executor = "=6.8.1"
-sp1-sdk = { version = "=6.8.1", features = ["network"] }
+sp1-core-executor = "=6.10.0"
+sp1-core-machine = { version = "=6.10.0", features = ["bigint-rug"] }
+sp1-hypercube = "=6.10.0"
+sp1-primitives = "=6.10.0"
+sp1-prover = "=6.10.0"
+sp1-prover-types = "=6.10.0"
+sp1-recursion-circuit = "=6.10.0"
+sp1-recursion-compiler = "=6.10.0"
+sp1-recursion-executor = "=6.10.0"
+sp1-sdk = { version = "=6.10.0", features = ["network"] }
 
 # SP1 GPU
-sp1-gpu-cudart = "=6.8.1"
-sp1-gpu-prover = "=6.8.1"
+sp1-gpu-cudart = "=6.10.0"
+sp1-gpu-prover = "=6.10.0"
 
 # Misc
 alloy = { version = "=1.1.3", default-features = false, features = ["serde"] }
@@ -100,13 +97,12 @@ if-addrs = "0.13.4"
 jemallocator = "0.5.4"
 lazy_static = "1.5.0"
 log = "0.4.27"
-lru = "0.14.0"
 mti = "1.0.7-beta.1"
 opentelemetry = "0.23.0"
 opentelemetry-appender-tracing = "0.4.0"
 opentelemetry-otlp = "0.16.0"
 opentelemetry_sdk = "0.23.0"
-prost = "0.13.5"
+prost = "0.14"
 rand = "0.9.0"
 reqwest = "0.12.12"
 rustix = { version = "0.38", features = ["fs"] }
@@ -114,19 +110,22 @@ rustls = { version = "0.23.27", features = ["ring"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 sqlx = { version = "0.8.5", features = ["runtime-tokio", "tls-native-tls", "macros", "postgres", "time"] }
+subtle = "2.6"
 sys-info = "0.9.1"
 sysinfo = "0.33.1"
 tar = "0.4.44"
 testcontainers = "0.27.3"
 time = { version = "0.3.41", features = ["serde"] }
-tokio = { version = "1.45.0", features = ["full", "tracing", "rt-multi-thread"] }
+tokio = { version = "1.53.3", features = ["full", "tracing", "rt-multi-thread"] }
 tokio-blocked = "0.1.0"
 tokio-stream = "0.1"
 tokio-util = "0.7.18"
-tonic = { version = "0.12.3", features = ["tls"] }
-tonic-build = "0.12.3"
-tonic-web = "0.12.3"
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-native-roots"] }
+tonic-build = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-web = "0.14.6"
 tower = "0.5.2"
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1.41"
 tracing-opentelemetry = "0.24.0"
 tracing-subscriber = "0.3.19"

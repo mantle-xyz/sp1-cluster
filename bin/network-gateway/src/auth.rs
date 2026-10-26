@@ -57,7 +57,7 @@ impl Auth {
     /// [`Self::authorize`] for `create_artifact`, whose signature the SP1 SDK
     /// builds differently from every other signed request.
     ///
-    /// sp1-sdk's `network::utils::sign_message` (still in 6.8.1) takes
+    /// sp1-sdk's `network::utils::sign_message` (still in 6.10.0) takes
     /// `Signature::as_bytes`, whose v is already in Electrum form (27/28), and
     /// adds 27 again, so v arrives as 54/55. alloy reads any v >= 35 as EIP-155
     /// and gets the parity backwards, so recovery yields a wrong address: the
@@ -109,7 +109,7 @@ mod tests {
             .to_vec()
     }
 
-    /// A `create_artifact` signature exactly as sp1-sdk 6.8.1 builds it:
+    /// A `create_artifact` signature exactly as sp1-sdk 6.10.0 (unchanged since 6.8.1) builds it:
     /// `as_bytes()` (v = 27/28), then `v + 27`.
     fn sdk_create_artifact_signature(signer: &PrivateKeySigner) -> Vec<u8> {
         let mut sig = sign(b"create_artifact", signer);

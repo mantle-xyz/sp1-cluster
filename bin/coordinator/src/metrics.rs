@@ -119,11 +119,11 @@ impl CoordinatorMetrics {
     }
 
     /// Set the subscription gauges: handler entries held by the worker service
-    /// (one per sub_id, kept until the coordinator drops the subscriber) and
-    /// subscribers held by the coordinator. The two should track each other;
-    /// handlers staying above subscribers means handler entries are leaking.
-    /// Sampled periodically, so values can lag by one sample interval.
-    /// Observability-only.
+    /// (one per sub_id) and subscribers held by the coordinator. A handler can
+    /// outlive its subscriber for ~20s while it finishes resending unacked
+    /// messages, so handlers briefly above subscribers is normal; a gap that
+    /// persists across many samples means handler entries are leaking. Sampled
+    /// periodically, so values can lag by one sample interval. Observability-only.
     pub fn set_subscription_counts(&self, handlers: usize, subscribers: usize) {
         describe_gauge!(
             "coordinator_sub_handlers",

@@ -8,6 +8,9 @@ use sp1_cluster_api::ApiConfig;
 use sp1_cluster_artifact::redis::RedisArtifactClient;
 use sp1_cluster_artifact::s3::{S3ArtifactClient, S3DownloadMode};
 use sp1_cluster_artifact::{ArtifactClient, CompressedUpload};
+use sp1_cluster_common::auth::{
+    AuthChannel, AuthConfig, BearerInterceptor, REQUIRED_ENV, TOKEN_ENV,
+};
 use sp1_cluster_common::client::ClusterServiceClient;
 use sp1_cluster_common::proto::worker_service_client::WorkerServiceClient as RawCoordinatorClient;
 use sp1_cluster_common::proto::WorkerType;
@@ -22,6 +25,16 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
 use crate::{env, utils};
+
+/// Every server requires this token, so each test proves its clients send it.
+pub const TEST_TOKEN: &str = "test-cluster-token";
+
+fn test_auth() -> AuthConfig {
+    AuthConfig {
+        token: Some(TEST_TOKEN.to_string()),
+        required: true,
+    }
+}
 
 /// Listen addresses for the in-process components, on OS-assigned free ports so the
 /// cluster can't collide with whatever else is listening on the machine. Allocated once
@@ -143,15 +156,21 @@ impl<A: StoreClient> Cluster<A> {
     }
 
     pub async fn api_client(&self) -> Result<ClusterServiceClient> {
-        ClusterServiceClient::new(format!("http://{}", self.addrs.api_grpc))
-            .await
-            .map_err(|e| anyhow!("failed to connect to cluster api: {e}"))
+        ClusterServiceClient::new(
+            format!("http://{}", self.addrs.api_grpc),
+            Some(TEST_TOKEN.to_string()),
+        )
+        .await
+        .map_err(|e| anyhow!("failed to connect to cluster api: {e}"))
     }
 
-    pub async fn coordinator_client(&self) -> Result<RawCoordinatorClient<Channel>> {
-        RawCoordinatorClient::connect(format!("http://{}", self.addrs.coordinator))
+    pub async fn coordinator_client(&self) -> Result<RawCoordinatorClient<AuthChannel>> {
+        let channel = Channel::from_shared(format!("http://{}", self.addrs.coordinator))?
+            .connect()
             .await
-            .context("failed to connect to coordinator")
+            .context("failed to connect to coordinator")?;
+        let interceptor = BearerInterceptor::new(Some(TEST_TOKEN))?;
+        Ok(RawCoordinatorClient::with_interceptor(channel, interceptor))
     }
 
     /// Abruptly kill and reap the coordinator child, then start a fresh child with the
@@ -420,6 +439,7 @@ impl ClusterBuilder {
                     grpc_addr: grpc_addr.clone(),
                     postgres_uri: postgres_uri.clone(),
                     postgres_auto_migrate: true,
+                    auth: test_auth(),
                 };
                 async move {
                     sp1_cluster_api::run(config, token)
@@ -439,6 +459,7 @@ impl ClusterBuilder {
             disable_proof_status_update: false,
             execute_only_mode: self.coordinator == CoordinatorKind::ExecuteOnly,
             worker_heartbeat_timeout_secs: self.worker_heartbeat_timeout_secs,
+            auth: test_auth(),
         };
         let coordinator_process = if self.process_isolated_coordinator {
             let child = spawn_coordinator_process(&coordinator_settings)?;
@@ -473,6 +494,7 @@ impl ClusterBuilder {
                 metrics_addr: addrs.gateway_metrics.clone(),
                 public_http_url: format!("http://{}", addrs.gateway_http),
                 cluster_rpc: format!("http://{}", addrs.api_grpc),
+                cluster_access_token: Some(TEST_TOKEN.to_string()),
                 artifact_store: artifact_store_name.to_string(),
                 s3_bucket: None,
                 s3_region: None,
@@ -484,23 +506,10 @@ impl ClusterBuilder {
                 auth_allowlist: None,
                 program_store: "memory".to_string(),
                 program_store_dir: None,
-                // Admission gate off, the rest at the CLI defaults: the test
-                // cluster exercises proving, not gateway admission (covered by
-                // the network-gateway e2e suite).
-                admission_enforce: false,
-                admission_range_max_inflight: 1,
-                admission_agg_max_inflight: 2,
-                admission_global_max_inflight: None,
-                admission_range_vk_hashes: None,
-                admission_agg_vk_hashes: None,
-                admission_reap_period_secs: 60,
-                admission_slot_ttl_secs: 3600,
-                admission_reconcile_absent_observations: 3,
-                admission_reconcile_commit_grace_secs: 60,
-                admission_reconcile_fetch_timeout_secs: 10,
-                admission_priority_enable: false,
-                admission_priority_order: None,
-                admission_priority_ttl_secs: 90,
+                // Admission gate in dry-run at the CLI defaults: the test cluster
+                // exercises proving, not gateway admission (covered by the
+                // network-gateway e2e suite).
+                admission: Default::default(),
             };
             let client = artifact_client.clone();
             let respawn = component_factory("gateway", root.clone(), move |token| {
@@ -591,6 +600,10 @@ fn spawn_coordinator_process(settings: &CoordinatorSettings) -> Result<Child> {
             "COORDINATOR_WORKER_HEARTBEAT_TIMEOUT_SECS",
             settings.worker_heartbeat_timeout_secs.to_string(),
         )
+        .env(TOKEN_ENV, TEST_TOKEN)
+        // The prefixed variable wins. Set it so a developer's env cannot change the token.
+        .env(format!("COORDINATOR_{TOKEN_ENV}"), TEST_TOKEN)
+        .env(REQUIRED_ENV, "true")
         .kill_on_drop(true)
         .spawn()
         .context("spawn coordinator child process")
@@ -616,6 +629,7 @@ fn spawn_node<A: StoreClient>(
                     worker_id,
                     worker_type,
                     coordinator_rpc,
+                    cluster_access_token: Some(TEST_TOKEN.to_string()),
                     ..Default::default()
                 },
                 client,

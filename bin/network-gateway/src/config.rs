@@ -37,6 +37,10 @@ pub struct Config {
     #[arg(long, env = "GATEWAY_CLUSTER_RPC")]
     pub cluster_rpc: String,
 
+    /// Read from env in `main`, so the token stays out of `--help` and the process list.
+    #[arg(skip)]
+    pub cluster_access_token: Option<String>,
+
     /// Artifact store backend: "s3" or "redis".
     #[arg(long, env = "GATEWAY_ARTIFACT_STORE", default_value = "s3")]
     pub artifact_store: String,
@@ -81,125 +85,229 @@ pub struct Config {
     #[arg(long, env = "GATEWAY_PROGRAM_STORE_DIR")]
     pub program_store_dir: Option<PathBuf>,
 
+    /// Admission gate (`GATEWAY_ADMISSION_*`). Flattened, so the flags and env
+    /// vars are unchanged.
+    #[command(flatten)]
+    pub admission: AdmissionConfig,
+}
+
+/// Defaults shared by the CLI and [`AdmissionConfig::default`], so code that
+/// builds a config in-process (tests, test-cluster) cannot drift from the CLI.
+pub mod admission_defaults {
+    pub const RANGE_MAX_INFLIGHT: usize = 1;
+    pub const AGG_MAX_INFLIGHT: usize = 2;
+    pub const REAP_PERIOD_SECS: u64 = 60;
+    pub const SLOT_TTL_SECS: u64 = 3600;
+    pub const RECONCILE_ABSENT_OBSERVATIONS: u32 = 3;
+    pub const RECONCILE_COMMIT_GRACE_SECS: u64 = 60;
+    pub const RECONCILE_FETCH_TIMEOUT_SECS: u64 = 10;
+    pub const PRIORITY_TTL_SECS: u64 = 90;
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct AdmissionConfig {
     /// Enforce the admission gate. `false` (default) = dry-run: count + expose
     /// metrics but never reject; `true` = shed overflow with gRPC `Unavailable`.
-    #[arg(long, env = "GATEWAY_ADMISSION_ENFORCE", default_value_t = false)]
-    pub admission_enforce: bool,
+    #[arg(
+        long = "admission-enforce",
+        env = "GATEWAY_ADMISSION_ENFORCE",
+        default_value_t = false
+    )]
+    pub enforce: bool,
 
     /// Range-pool (GPU) max concurrent in-flight.
     #[arg(
-        long,
+        long = "admission-range-max-inflight",
         env = "GATEWAY_ADMISSION_RANGE_MAX_INFLIGHT",
-        default_value_t = 1
+        default_value_t = admission_defaults::RANGE_MAX_INFLIGHT
     )]
-    pub admission_range_max_inflight: usize,
+    pub range_max_inflight: usize,
 
     /// Agg-pool (cpunode) max concurrent in-flight.
-    #[arg(long, env = "GATEWAY_ADMISSION_AGG_MAX_INFLIGHT", default_value_t = 2)]
-    pub admission_agg_max_inflight: usize,
+    #[arg(
+        long = "admission-agg-max-inflight", env = "GATEWAY_ADMISSION_AGG_MAX_INFLIGHT",
+        default_value_t = admission_defaults::AGG_MAX_INFLIGHT)]
+    pub agg_max_inflight: usize,
 
     /// Optional cap across ALL pools combined. Unset = pools independent.
-    #[arg(long, env = "GATEWAY_ADMISSION_GLOBAL_MAX_INFLIGHT")]
-    pub admission_global_max_inflight: Option<usize>,
+    #[arg(
+        long = "admission-global-max-inflight",
+        env = "GATEWAY_ADMISSION_GLOBAL_MAX_INFLIGHT"
+    )]
+    pub global_max_inflight: Option<usize>,
 
     /// Comma-separated 0x-hex vk_hashes classified as Range (optional; mode is
     /// the fallback when empty).
-    #[arg(long, env = "GATEWAY_ADMISSION_RANGE_VK_HASHES", value_delimiter = ',')]
-    pub admission_range_vk_hashes: Option<Vec<String>>,
+    #[arg(
+        long = "admission-range-vk-hashes",
+        env = "GATEWAY_ADMISSION_RANGE_VK_HASHES",
+        value_delimiter = ','
+    )]
+    pub range_vk_hashes: Option<Vec<String>>,
 
     /// Comma-separated 0x-hex vk_hashes classified as Agg.
-    #[arg(long, env = "GATEWAY_ADMISSION_AGG_VK_HASHES", value_delimiter = ',')]
-    pub admission_agg_vk_hashes: Option<Vec<String>>,
+    #[arg(
+        long = "admission-agg-vk-hashes",
+        env = "GATEWAY_ADMISSION_AGG_VK_HASHES",
+        value_delimiter = ','
+    )]
+    pub agg_vk_hashes: Option<Vec<String>>,
 
     /// Reaper sweep period (seconds).
-    #[arg(long, env = "GATEWAY_ADMISSION_REAP_PERIOD_SECS", default_value_t = 60)]
-    pub admission_reap_period_secs: u64,
+    #[arg(
+        long = "admission-reap-period-secs", env = "GATEWAY_ADMISSION_REAP_PERIOD_SECS",
+        default_value_t = admission_defaults::REAP_PERIOD_SECS)]
+    pub reap_period_secs: u64,
 
     /// Slot TTL (seconds): the reap BACKSTOP for a committed slot. A live proof
     /// refreshes it on every non-terminal status/details poll (`touch`) AND
     /// whenever a reconcile sees it still Pending, so in normal operation the
     /// reconciler frees finished/gone slots and this only fires when reconcile
-    /// CANNOT confirm liveness (cluster query persistently failing/truncated) AND
+    /// CANNOT confirm liveness (cluster query persistently failing) AND
     /// no client is polling. It must therefore exceed the maximum gap between a
     /// slot's liveness signals (a client poll OR a reconcile-present observation),
     /// NOT the proof duration. It also bounds a hung pre-commit upload (a RESERVED
     /// slot is reclaimed once past this). The default (3600) clears any realistic
     /// gap.
-    #[arg(long, env = "GATEWAY_ADMISSION_SLOT_TTL_SECS", default_value_t = 3600)]
-    pub admission_slot_ttl_secs: u64,
+    #[arg(
+        long = "admission-slot-ttl-secs", env = "GATEWAY_ADMISSION_SLOT_TTL_SECS",
+        default_value_t = admission_defaults::SLOT_TTL_SECS)]
+    pub slot_ttl_secs: u64,
 
     /// Reconcile absence threshold (count): a COMMITTED slot is released only
     /// after the cluster's Pending set has shown it ABSENT for this many
     /// CONSECUTIVE successful reconciles. A present observation or a client poll
-    /// resets the streak to 0; a SKIPPED reconcile (truncated / timeout / query
-    /// error / unimplemented) leaves the streak unchanged (it is an observation
+    /// resets the streak to 0; a SKIPPED reconcile (timeout / query error /
+    /// unimplemented) leaves the streak unchanged (it is an observation
     /// count, not a wall clock, so a gap in observation neither advances nor
     /// resets it). The wall-clock debounce window is therefore ≈ this count ×
     /// reap period. Must be >= 2 (a single anomalous empty reply must never
     /// release a live slot), and `count × reap_period` must stay below the slot
     /// TTL (else the TTL backstop fires before reconcile can). Default 3.
     #[arg(
-        long,
+        long = "admission-reconcile-absent-observations",
         env = "GATEWAY_ADMISSION_RECONCILE_ABSENT_OBSERVATIONS",
-        default_value_t = 3
+        default_value_t = admission_defaults::RECONCILE_ABSENT_OBSERVATIONS
     )]
-    pub admission_reconcile_absent_observations: u32,
+    pub reconcile_absent_observations: u32,
 
     /// Grace period (seconds) after a slot is COMMITTED before the reconciler may
     /// begin counting it absent. `request_proof` commits the slot just BEFORE the
     /// cluster `create_proof_request`, so during that create call the proof is not
     /// in the cluster's Pending set yet and would otherwise look "absent" to
-    /// reconcile. This grace should meet or exceed the maximum create-leg latency
-    /// (bounded by the cluster client's request timeout; the default 60 matches
-    /// it, and the downstream absent-observation debounce adds further margin) so
-    /// an in-flight create can't be reconciled away into an over-admit. It is
-    /// independent of the reap cadence,
-    /// so it protects even an aggressively-fast reconcile config (small
+    /// reconcile. The grace must cover the create leg: the cluster client bounds
+    /// each attempt at 5s and retries within a 10s backoff budget, so a create
+    /// settles within ~15s (a slow server-side insert can land later). The
+    /// default 60 leaves a wide margin over that, and the downstream
+    /// absent-observation debounce adds more, so an in-flight create
+    /// can't be reconciled away into an over-admit. It is independent of the reap
+    /// cadence, so it protects even an aggressively-fast reconcile config (small
     /// `reap_period` × `absent_observations`). A committed slot is spared —
     /// exactly like a RESERVED one — until it has been committed for this long.
-    /// Default 60 (matches the cluster client's channel timeout). 0 disables the
-    /// grace (only safe when `absent_observations × reap_period` already exceeds
-    /// the create-leg latency).
+    /// 0 disables the grace (only safe when `absent_observations × reap_period`
+    /// already exceeds the create-leg latency).
     #[arg(
-        long,
+        long = "admission-reconcile-commit-grace-secs",
         env = "GATEWAY_ADMISSION_RECONCILE_COMMIT_GRACE_SECS",
-        default_value_t = 60
+        default_value_t = admission_defaults::RECONCILE_COMMIT_GRACE_SECS
     )]
-    pub admission_reconcile_commit_grace_secs: u64,
+    pub reconcile_commit_grace_secs: u64,
 
     /// Per-tick timeout (seconds) for the reconcile Pending-set query, so a
     /// slow/half-open cluster can't stretch the reaper cadence. Must stay within
     /// one reap period (the fetch is awaited inline in the reaper loop). Default
     /// 10.
     #[arg(
-        long,
+        long = "admission-reconcile-fetch-timeout-secs",
         env = "GATEWAY_ADMISSION_RECONCILE_FETCH_TIMEOUT_SECS",
-        default_value_t = 10
+        default_value_t = admission_defaults::RECONCILE_FETCH_TIMEOUT_SECS
     )]
-    pub admission_reconcile_fetch_timeout_secs: u64,
+    pub reconcile_fetch_timeout_secs: u64,
 
     /// Enable priority-aware slot allocation (requires ENFORCE to actually
     /// hold; in dry-run it only emits `would_yield`). Default off.
     #[arg(
-        long,
+        long = "admission-priority-enable",
         env = "GATEWAY_ADMISSION_PRIORITY_ENABLE",
         default_value_t = false
     )]
-    pub admission_priority_enable: bool,
+    pub priority_enable: bool,
 
     /// Per-proposer priority ranks: comma-separated `0xADDR:RANK` pairs. Lower
     /// rank = higher priority; ties allowed (equal rank → first-come-first-served
     /// among fresh demanders). Requesters not listed get the lowest priority.
-    #[arg(long, env = "GATEWAY_ADMISSION_PRIORITY_ORDER", value_delimiter = ',')]
-    pub admission_priority_order: Option<Vec<String>>,
+    #[arg(
+        long = "admission-priority-order",
+        env = "GATEWAY_ADMISSION_PRIORITY_ORDER",
+        value_delimiter = ','
+    )]
+    pub priority_order: Option<Vec<String>>,
 
     /// Priority demand freshness / max hold-open idle (seconds). A demander is
     /// "still waiting" while it retried within this window; a held slot idles at
     /// most this long waiting for a higher-priority retry. Default 90.
     #[arg(
-        long,
+        long = "admission-priority-ttl-secs",
         env = "GATEWAY_ADMISSION_PRIORITY_TTL_SECS",
-        default_value_t = 90
+        default_value_t = admission_defaults::PRIORITY_TTL_SECS
     )]
-    pub admission_priority_ttl_secs: u64,
+    pub priority_ttl_secs: u64,
+}
+
+impl Default for AdmissionConfig {
+    /// The CLI defaults, with the gate in dry-run.
+    fn default() -> Self {
+        use admission_defaults as d;
+        Self {
+            enforce: false,
+            range_max_inflight: d::RANGE_MAX_INFLIGHT,
+            agg_max_inflight: d::AGG_MAX_INFLIGHT,
+            global_max_inflight: None,
+            range_vk_hashes: None,
+            agg_vk_hashes: None,
+            reap_period_secs: d::REAP_PERIOD_SECS,
+            slot_ttl_secs: d::SLOT_TTL_SECS,
+            reconcile_absent_observations: d::RECONCILE_ABSENT_OBSERVATIONS,
+            reconcile_commit_grace_secs: d::RECONCILE_COMMIT_GRACE_SECS,
+            reconcile_fetch_timeout_secs: d::RECONCILE_FETCH_TIMEOUT_SECS,
+            priority_enable: false,
+            priority_order: None,
+            priority_ttl_secs: d::PRIORITY_TTL_SECS,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Default` must equal what the CLI parses with no admission flags set.
+    #[test]
+    fn admission_default_matches_cli_defaults() {
+        // clap reads `GATEWAY_ADMISSION_*` from the environment, so a value
+        // exported in the developer's shell would make this compare non-defaults.
+        if let Some((k, _)) = std::env::vars().find(|(k, _)| k.starts_with("GATEWAY_ADMISSION_")) {
+            eprintln!("skipping: {k} is set in the environment");
+            return;
+        }
+        let cfg = Config::try_parse_from(["network-gateway", "--cluster-rpc", "http://x"]).unwrap();
+        let d = AdmissionConfig::default();
+        assert_eq!(format!("{:?}", cfg.admission), format!("{d:?}"));
+    }
+
+    /// Flattening must keep the historical flag and env names.
+    #[test]
+    fn admission_flags_keep_their_names() {
+        let cfg = Config::try_parse_from([
+            "network-gateway",
+            "--cluster-rpc",
+            "http://x",
+            "--admission-enforce",
+            "--admission-range-max-inflight",
+            "4",
+        ])
+        .unwrap();
+        assert!(cfg.admission.enforce);
+        assert_eq!(cfg.admission.range_max_inflight, 4);
+    }
 }
