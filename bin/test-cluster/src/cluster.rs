@@ -506,23 +506,10 @@ impl ClusterBuilder {
                 auth_allowlist: None,
                 program_store: "memory".to_string(),
                 program_store_dir: None,
-                // Admission gate off, the rest at the CLI defaults: the test
-                // cluster exercises proving, not gateway admission (covered by
-                // the network-gateway e2e suite).
-                admission_enforce: false,
-                admission_range_max_inflight: 1,
-                admission_agg_max_inflight: 2,
-                admission_global_max_inflight: None,
-                admission_range_vk_hashes: None,
-                admission_agg_vk_hashes: None,
-                admission_reap_period_secs: 60,
-                admission_slot_ttl_secs: 3600,
-                admission_reconcile_absent_observations: 3,
-                admission_reconcile_commit_grace_secs: 60,
-                admission_reconcile_fetch_timeout_secs: 10,
-                admission_priority_enable: false,
-                admission_priority_order: None,
-                admission_priority_ttl_secs: 90,
+                // Admission gate in dry-run at the CLI defaults: the test cluster
+                // exercises proving, not gateway admission (covered by the
+                // network-gateway e2e suite).
+                admission: Default::default(),
             };
             let client = artifact_client.clone();
             let respawn = component_factory("gateway", root.clone(), move |token| {

@@ -1,6 +1,6 @@
 use crate::auth::{AuthChannel, BearerInterceptor};
 use crate::{
-    mantle::{mantle_cluster_service_client::MantleClusterServiceClient, ProofRequestQueryRequest},
+    mantle::mantle_cluster_service_client::MantleClusterServiceClient,
     proto::{
         self, cluster_service_client::ClusterServiceClient as InnerClusterClient,
         ProofRequestCancelRequest, ProofRequestCreateRequest, ProofRequestGetRequest,
@@ -109,7 +109,7 @@ impl ClusterServiceClient {
 
     /// Shared call policy: retry transient failures within the backoff budget, each attempt bounded
     /// by [`ATTEMPT_TIMEOUT`]. `make_call` builds one fresh attempt per try (cloning client/request).
-    async fn retry_call<T, Fut>(&self, make_call: impl Fn() -> Fut) -> Result<T>
+    pub(crate) async fn retry_call<T, Fut>(&self, make_call: impl Fn() -> Fut) -> Result<T>
     where
         Fut: Future<Output = Result<Response<T>, Status>>,
     {
@@ -148,28 +148,6 @@ impl ClusterServiceClient {
             })
             .await?;
         Ok(result.proof_requests)
-    }
-
-    /// One page of `MantleClusterService/QueryProofRequests` (requester filter,
-    /// optional newest-first order).
-    ///
-    /// Returns `Ok(None)` when the API server predates the extension and answers
-    /// `Unimplemented`, so the caller can fall back to [`Self::get_proof_requests`].
-    pub async fn query_proof_requests(
-        &self,
-        request: ProofRequestQueryRequest,
-    ) -> Result<Option<Vec<proto::ProofRequest>>> {
-        let result = backoff_retry(self.backoff.clone(), || {
-            let mut client = self.mantle.clone();
-            let request = request.clone();
-            with_timeout(async move { client.query_proof_requests(request).await })
-        })
-        .await;
-        match result {
-            Ok(resp) => Ok(Some(resp.proof_requests)),
-            Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
-            Err(status) => Err(status.into()),
-        }
     }
 
     /// Fetches all rows that match the filters in `request`. The server caps

@@ -267,8 +267,10 @@ A few things worth knowing when reading the code or debugging wire issues:
   `vk_hash`, `fulfiller`, `from`, `to`, `version`, and `mode` are silently
   dropped. Requester and order come from the Mantle `QueryProofRequests`
   extension of the cluster API (`crates/common/src/mantle.rs`). Against an
-  API without it, the gateway falls back to upstream `ProofRequestList`,
-  which drops `requester` and returns rows oldest-first.
+  API without it the call fails with `FailedPrecondition`, so deploy the api
+  and gateway images from the same tag. Under `GATEWAY_AUTH_MODE=none`, a
+  `requester` filter matches the zero address that unauthenticated requests
+  are stored under.
 
 ## Status mapping
 

@@ -34,7 +34,7 @@ fn admission_shed_status(scope: &str) -> Status {
     st
 }
 
-use crate::auth::Auth;
+use crate::auth::{Auth, AuthMode};
 use crate::ids::{
     artifact_id_from_uri, artifact_uri, mint_request_id, program_artifact_id,
     proof_id_from_request_id,
@@ -485,9 +485,10 @@ where
         // Best-effort: requester, status filters, minimum_deadline and
         // pagination round-trip; vk_hash/fulfiller/from/to/version/mode are
         // silently dropped. Rows come newest-first, like Succinct's network.
-        // Requester and order need the Mantle `QueryProofRequests` extension.
-        // An older cluster API lacks it, and then the call falls back to
-        // upstream `ProofRequestList`: requester dropped, oldest-first.
+        // Requester and order need the Mantle `QueryProofRequests` extension,
+        // which ships in the same release as this gateway. An API without it
+        // gets a clear error rather than an emulation: upstream
+        // `ProofRequestList` can filter neither by requester nor newest-first.
         //
         // A fulfillment filter the cluster cannot express (Assigned, Reverted,
         // Expired) matches nothing. It must be answered here: the cluster API
@@ -521,13 +522,26 @@ where
             _ => None,
         };
 
+        // Under GATEWAY_AUTH_MODE=none `request_proof` stores every row with the
+        // zero address (`Auth::authorize`), so the SDK's own address would match
+        // nothing. A requester filter becomes a zero-address filter instead,
+        // which scopes it to rows written without auth. A call without a
+        // requester is unfiltered in every mode.
+        let requester = req.requester.filter(|r| !r.is_empty()).map(|r| {
+            if self.auth.mode == AuthMode::None {
+                alloy_primitives::Address::ZERO.to_vec()
+            } else {
+                r
+            }
+        });
+
         let query = ProofRequestQueryRequest {
-            proof_status: proof_status.clone(),
-            execution_status: execution_status.clone(),
+            proof_status,
+            execution_status,
             minimum_deadline: req.minimum_deadline,
             limit,
             offset,
-            requester: req.requester.filter(|r| !r.is_empty()),
+            requester,
             newest_first: true,
         };
         let queried = self
@@ -535,26 +549,18 @@ where
             .query_proof_requests(query)
             .await
             .map_err(|e| Status::internal(format!("cluster query_proof_requests failed: {e}")))?;
-        let proofs = match queried {
-            Some(proofs) => proofs,
-            None => {
-                tracing::warn!(
-                    "cluster API lacks QueryProofRequests; listing without the \
-                     requester filter, oldest-first"
-                );
-                let list = cluster_pb::ProofRequestListRequest {
-                    proof_status,
-                    execution_status,
-                    minimum_deadline: req.minimum_deadline,
-                    handled: None,
-                    limit,
-                    offset,
-                    scheduled_by: None,
-                };
-                self.cluster.get_proof_requests(list).await.map_err(|e| {
-                    Status::internal(format!("cluster get_proof_requests failed: {e}"))
-                })?
-            }
+        // FailedPrecondition, not Unimplemented: this RPC is implemented, the
+        // deployment is mismatched. Callers such as proof-router count
+        // Unimplemented as a benign reply, which would hide the problem.
+        let Some(proofs) = queried else {
+            tracing::warn!(
+                "get_filtered_proof_requests: cluster API lacks QueryProofRequests; \
+                 the api image is older than this gateway"
+            );
+            return Err(Status::failed_precondition(
+                "cluster API lacks mantle.cluster.MantleClusterService/QueryProofRequests; \
+                 deploy the api image from the same release as this gateway",
+            ));
         };
 
         let requests = proofs
@@ -1653,17 +1659,13 @@ mod tests {
     }
 
     fn test_admission() -> std::sync::Arc<crate::admission::AdmissionController> {
-        std::sync::Arc::new(crate::admission::AdmissionController::new(
-            crate::admission::Classifier::new(Default::default(), Default::default()),
-            1,
-            2,
-            None,
-            true,
-            std::time::Duration::from_secs(3600),
-            std::collections::HashMap::new(),
-            false,
-            std::time::Duration::from_secs(90),
-        ))
+        std::sync::Arc::new(
+            crate::build_admission(&crate::config::AdmissionConfig {
+                enforce: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
     }
 
     fn mk() -> ProverNetworkImpl<InMemoryArtifactClient> {
@@ -1890,18 +1892,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_sheds_over_cap_compressed() {
-        use crate::admission::{AdmissionController, Classifier};
-        let admission = std::sync::Arc::new(AdmissionController::new(
-            Classifier::new(Default::default(), Default::default()),
-            1,
-            2,
-            None,
-            true,
-            std::time::Duration::from_secs(3600),
-            std::collections::HashMap::new(),
-            false,
-            std::time::Duration::from_secs(90),
-        ));
+        let admission = test_admission();
         admission
             .try_acquire("req_preoccupied", 2, &[0xaa; 4], &[0x01])
             .unwrap(); // fill Range cap 1

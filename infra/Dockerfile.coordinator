@@ -27,16 +27,11 @@ RUN apt-get update -y && \
     && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Go
-ENV GO_VERSION=1.22.5
-RUN wget -q https://golang.org/dl/go${GO_VERSION}.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz && \
-    rm go${GO_VERSION}.linux-amd64.tar.gz
-ENV PATH="/usr/local/go/bin:${PATH}"
-
-# Install sp1 toolchain
+# No Go toolchain or SP1 RISC-V toolchain: the build below selects only this
+# package (`-p`), so cargo does not unify in other workspace members' features
+# (e.g. gnark-ffi's `native`, which runs `go build`), and nothing here compiles
+# a guest program. That also keeps this file out of every SP1 version bump.
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-RUN curl -L https://sp1.succinct.xyz | bash && ~/.sp1/bin/sp1up --version 6.8.1
 
 # Install protoc
 ENV PROTOC_ZIP=protoc-29.4-linux-x86_64.zip
@@ -88,6 +83,7 @@ RUN \
     fi; \
     echo "Building with profile: $BUILD_PROFILE | features: $FEATURES | rustflags: $RUSTFLAGS" && \
     cargo build --profile $BUILD_PROFILE --features "$FEATURES" \
+    -p sp1-cluster-coordinator \
     --bin sp1-cluster-coordinator && \
     cp target/$BUILD_PROFILE/sp1-cluster-coordinator /coordinator && \
     # Clean up any git credentials that might have been cached

@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use crate::admission::{AdmissionController, Classifier, PendingObservation};
 use crate::artifact_http::ArtifactHttpState;
 use crate::auth::{parse_allowlist, Auth, AuthMode};
-use crate::config::Config;
+use crate::config::{AdmissionConfig, Config};
 use crate::program_store::{FilesystemProgramStore, InMemoryProgramStore, ProgramStore};
 use crate::service::artifact_store::ArtifactStoreImpl;
 use crate::service::prover_network::ProverNetworkImpl;
@@ -127,7 +127,8 @@ where
     .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
     .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
     let admission_metrics = Arc::new(crate::admission::AdmissionMetrics::new());
-    let admission = Arc::new(build_admission(&cfg)?.with_metrics(admission_metrics.clone()));
+    let admission =
+        Arc::new(build_admission(&cfg.admission)?.with_metrics(admission_metrics.clone()));
     log_admission_config(&cfg);
 
     // Handles for the best-effort restart seed, spawned off the boot path
@@ -149,6 +150,21 @@ where
     .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE)
     .max_encoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
+    // Bind every listener before spawning any task, so a bind failure returns
+    // before anything is running (no stray gRPC server or reaper to leak).
+    // nodelay matches what `Server::serve_with_shutdown(addr)` would set.
+    let grpc_incoming = tonic::transport::server::TcpIncoming::bind(grpc_addr)
+        .with_context(|| format!("bind gRPC {grpc_addr}"))?
+        .with_nodelay(Some(true));
+    let http_listener = tokio::net::TcpListener::bind(&cfg.http_addr)
+        .await
+        .with_context(|| format!("bind {}", cfg.http_addr))?;
+    info!("HTTP server listening on {}", cfg.http_addr);
+    let metrics_listener = tokio::net::TcpListener::bind(&cfg.metrics_addr)
+        .await
+        .with_context(|| format!("bind metrics {}", cfg.metrics_addr))?;
+    info!("metrics server listening on {}", cfg.metrics_addr);
+
     let grpc_task = tokio::spawn(async move {
         info!("gRPC server listening on {grpc_addr}");
         Server::builder()
@@ -156,7 +172,7 @@ where
             .layer(grpc_web_layer())
             .add_service(prover_network)
             .add_service(artifact_store)
-            .serve_with_shutdown(grpc_addr, grpc_shutdown)
+            .serve_with_incoming_shutdown(grpc_incoming, grpc_shutdown)
             .await
             .unwrap_or_else(|e| warn!("gRPC server error: {e}"));
     });
@@ -169,10 +185,10 @@ where
     // pool for the whole TTL. The enforce path relies on this to not leak
     // capacity.
     let reaper = admission.clone();
-    let reap_period = std::time::Duration::from_secs(cfg.admission_reap_period_secs);
-    let reconcile_absent_observations = cfg.admission_reconcile_absent_observations;
+    let reap_period = std::time::Duration::from_secs(cfg.admission.reap_period_secs);
+    let reconcile_absent_observations = cfg.admission.reconcile_absent_observations;
     let reconcile_fetch_timeout =
-        std::time::Duration::from_secs(cfg.admission_reconcile_fetch_timeout_secs);
+        std::time::Duration::from_secs(cfg.admission.reconcile_fetch_timeout_secs);
     let reaper_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(reap_period);
         tick.tick().await; // skip the immediate first tick
@@ -310,11 +326,6 @@ where
         .route("/healthz", get(|| async { "OK" }))
         .merge(artifact_http::router(http_state));
 
-    let http_listener = tokio::net::TcpListener::bind(&cfg.http_addr)
-        .await
-        .with_context(|| format!("bind {}", cfg.http_addr))?;
-    info!("HTTP server listening on {}", cfg.http_addr);
-
     // `/metrics` is served on its own loopback-bound listener (default
     // 127.0.0.1:9091), deliberately kept off the public artifact HTTP
     // surface so admission telemetry isn't exposed to SDK clients.
@@ -326,14 +337,15 @@ where
             async move { m.render_response() }
         }),
     );
-    let metrics_listener = tokio::net::TcpListener::bind(&cfg.metrics_addr)
-        .await
-        .with_context(|| format!("bind metrics {}", cfg.metrics_addr))?;
-    info!("metrics server listening on {}", cfg.metrics_addr);
-    let metrics_task = tokio::spawn(async move {
-        axum::serve(metrics_listener, metrics_app)
-            .await
-            .unwrap_or_else(|e| warn!("metrics server error: {e}"));
+    let metrics_stop = tokio_util::sync::CancellationToken::new();
+    let metrics_task = tokio::spawn({
+        let stop = metrics_stop.clone();
+        async move {
+            axum::serve(metrics_listener, metrics_app)
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .unwrap_or_else(|e| warn!("metrics server error: {e}"));
+        }
     });
 
     // Best-effort restart seed, deliberately off the boot path: the in-memory
@@ -360,19 +372,32 @@ where
         .with_graceful_shutdown(http_shutdown)
         .await;
 
-    // Tear down the background tasks even if `serve` errored, so `serve()`
-    // (driven directly by integration tests on a shared runtime) never leaks
-    // the reaper/metrics loops, the one-shot restart seed, or a still-running
-    // gRPC server.
+    // Tear down the background tasks even if `serve` errored, and wait for each
+    // to finish. `abort()` only schedules cancellation, so without the awaits the
+    // metrics listener could still be bound when `serve()` returns, breaking
+    // `run_with_shutdown`'s "callers can rebind the ports" contract (test-cluster
+    // respawns the gateway on the same addresses).
     reaper_task.abort();
-    metrics_task.abort();
     seed_task.abort();
+    metrics_stop.cancel();
+    let _ = reaper_task.await;
+    let _ = seed_task.await;
+    // /metrics requests are short; bound the wait so a stuck scraper can't hang
+    // shutdown.
+    let mut metrics_task = metrics_task;
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut metrics_task)
+        .await
+        .is_err()
+    {
+        warn!("metrics server did not drain within 5s; aborting it");
+        metrics_task.abort();
+        let _ = metrics_task.await;
+    }
     if serve_result.is_err() {
         grpc_task.abort();
-        serve_result?;
     }
-
-    grpc_task.await.ok();
+    let _ = grpc_task.await;
+    serve_result?;
     info!("network-gateway shut down cleanly");
     Ok(())
 }
@@ -381,31 +406,31 @@ where
 /// enforce=true + cap=0 footgun (all requests for that pool would be shed).
 fn log_admission_config(cfg: &Config) {
     info!(
-        enforce = cfg.admission_enforce,
-        range_cap = cfg.admission_range_max_inflight,
-        agg_cap = cfg.admission_agg_max_inflight,
-        global_cap = ?cfg.admission_global_max_inflight,
+        enforce = cfg.admission.enforce,
+        range_cap = cfg.admission.range_max_inflight,
+        agg_cap = cfg.admission.agg_max_inflight,
+        global_cap = ?cfg.admission.global_max_inflight,
         "admission gate configured (single-instance authoritative; do not run >1 gateway replica)"
     );
     info!(
-        priority_enable = cfg.admission_priority_enable,
-        ranked_proposers = cfg.admission_priority_order.as_ref().map_or(0, |v| v.len()),
-        priority_ttl_secs = cfg.admission_priority_ttl_secs,
+        priority_enable = cfg.admission.priority_enable,
+        ranked_proposers = cfg.admission.priority_order.as_ref().map_or(0, |v| v.len()),
+        priority_ttl_secs = cfg.admission.priority_ttl_secs,
         "admission priority policy configured"
     );
-    if cfg.admission_enforce
-        && (cfg.admission_range_max_inflight == 0 || cfg.admission_agg_max_inflight == 0)
+    if cfg.admission.enforce
+        && (cfg.admission.range_max_inflight == 0 || cfg.admission.agg_max_inflight == 0)
     {
         warn!(
             "admission enforce=true with a pool cap of 0 — all requests for that pool will be shed"
         );
     }
-    if cfg.admission_priority_enable && !cfg.admission_enforce {
+    if cfg.admission.priority_enable && !cfg.admission.enforce {
         warn!(
             "admission priority enabled but ENFORCE=false — priority is observed only (would_yield metrics); set GATEWAY_ADMISSION_ENFORCE=true to actually hold slots"
         );
     }
-    if cfg.admission_priority_enable && cfg.auth_mode == AuthMode::None {
+    if cfg.admission.priority_enable && cfg.auth_mode == AuthMode::None {
         warn!(
             "admission priority enabled but GATEWAY_AUTH_MODE=none — all requesters collapse to the zero address, so priority cannot distinguish proposers and is a no-op; set GATEWAY_AUTH_MODE=verify"
         );
@@ -592,52 +617,52 @@ pub fn build_program_store(cfg: &Config) -> Result<Arc<dyn ProgramStore>> {
 /// Build the admission controller from `GATEWAY_ADMISSION_*` config.
 /// This only constructs the counting/classifying core — `serve` attaches
 /// metrics (`with_metrics`), spawns the reaper task, and mounts `/metrics`.
-pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
+pub fn build_admission(cfg: &AdmissionConfig) -> Result<AdmissionController> {
     // A zero reap period would panic `tokio::time::interval`, silently killing
     // the reaper task (slots would then leak until never). A zero TTL would
     // reap live slots on the first sweep. Reject both at boot.
-    if cfg.admission_reap_period_secs == 0 {
+    if cfg.reap_period_secs == 0 {
         anyhow::bail!("GATEWAY_ADMISSION_REAP_PERIOD_SECS must be > 0");
     }
-    if cfg.admission_slot_ttl_secs == 0 {
+    if cfg.slot_ttl_secs == 0 {
         anyhow::bail!("GATEWAY_ADMISSION_SLOT_TTL_SECS must be > 0");
     }
     // A zero reconcile fetch timeout makes `tokio::time::timeout(0, fetch)` elapse
     // on every tick before the query can return, silently disabling reconcile
     // (the same silent-disable footgun guarded for reap_period==0).
-    if cfg.admission_reconcile_fetch_timeout_secs == 0 {
+    if cfg.reconcile_fetch_timeout_secs == 0 {
         anyhow::bail!("GATEWAY_ADMISSION_RECONCILE_FETCH_TIMEOUT_SECS must be > 0 (0 makes the reconcile query time out every tick → reconcile never runs)");
     }
     // The reconcile fetch is awaited inline in the reaper loop, so a fetch
     // timeout longer than the reap period would let a slow/half-open cluster
     // stretch the reap (TTL-backstop) cadence to the timeout. Keep it within one
     // reap period.
-    if cfg.admission_reconcile_fetch_timeout_secs > cfg.admission_reap_period_secs {
+    if cfg.reconcile_fetch_timeout_secs > cfg.reap_period_secs {
         anyhow::bail!(
             "GATEWAY_ADMISSION_RECONCILE_FETCH_TIMEOUT_SECS ({}) must be <= GATEWAY_ADMISSION_REAP_PERIOD_SECS ({}), else a slow cluster query stalls the reap cadence",
-            cfg.admission_reconcile_fetch_timeout_secs,
-            cfg.admission_reap_period_secs
+            cfg.reconcile_fetch_timeout_secs,
+            cfg.reap_period_secs
         );
     }
     // The TTL is the backstop for committed slots when reconcile can't run; a
     // reap period at or above it means the backstop never fires before the slot
     // would already be considered expired on the sweep it's finally seen — keep
     // the reaper sweeping well inside the TTL.
-    if cfg.admission_reap_period_secs >= cfg.admission_slot_ttl_secs {
+    if cfg.reap_period_secs >= cfg.slot_ttl_secs {
         anyhow::bail!(
             "GATEWAY_ADMISSION_REAP_PERIOD_SECS ({}) must be < GATEWAY_ADMISSION_SLOT_TTL_SECS ({})",
-            cfg.admission_reap_period_secs,
-            cfg.admission_slot_ttl_secs
+            cfg.reap_period_secs,
+            cfg.slot_ttl_secs
         );
     }
     // Upper-bound the TTL: `Instant::now() + Duration::from_secs(ttl)` panics on
     // overflow, and no realistic slot TTL exceeds a day. Reject an absurd value
     // at boot rather than panicking inside a request handler.
     const MAX_TTL_SECS: u64 = 86_400;
-    if cfg.admission_slot_ttl_secs > MAX_TTL_SECS {
+    if cfg.slot_ttl_secs > MAX_TTL_SECS {
         anyhow::bail!(
             "GATEWAY_ADMISSION_SLOT_TTL_SECS must be <= {MAX_TTL_SECS} (got {})",
-            cfg.admission_slot_ttl_secs
+            cfg.slot_ttl_secs
         );
     }
     // `absent_observations` is the CONSECUTIVE-absence threshold: reconcile
@@ -647,24 +672,22 @@ pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
     // Require >= 2 so a single anomalous empty reply can never release a live
     // slot — the whole point of debouncing. (1 would release on the first absent
     // tick, which is the round-6 over-admit footgun this replaces.)
-    if cfg.admission_reconcile_absent_observations < 2 {
+    if cfg.reconcile_absent_observations < 2 {
         anyhow::bail!(
             "GATEWAY_ADMISSION_RECONCILE_ABSENT_OBSERVATIONS ({}) must be >= 2 (1 would release a slot on the first absent reconcile, defeating debounce)",
-            cfg.admission_reconcile_absent_observations
+            cfg.reconcile_absent_observations
         );
     }
     // The effective debounce window is `absent_observations × reap_period`. If it
     // reaches the slot TTL, the TTL backstop reaper fires before reconcile can
     // confirm sustained absence, making the (prompter, cheaper) reconcile release
     // path dead code. Keep the window strictly inside the TTL.
-    if (cfg.admission_reconcile_absent_observations as u64) * cfg.admission_reap_period_secs
-        >= cfg.admission_slot_ttl_secs
-    {
+    if (cfg.reconcile_absent_observations as u64) * cfg.reap_period_secs >= cfg.slot_ttl_secs {
         anyhow::bail!(
             "GATEWAY_ADMISSION_RECONCILE_ABSENT_OBSERVATIONS ({}) × GATEWAY_ADMISSION_REAP_PERIOD_SECS ({}) must be < GATEWAY_ADMISSION_SLOT_TTL_SECS ({}), else the TTL backstop fires before reconcile can release a gone proof",
-            cfg.admission_reconcile_absent_observations,
-            cfg.admission_reap_period_secs,
-            cfg.admission_slot_ttl_secs
+            cfg.reconcile_absent_observations,
+            cfg.reap_period_secs,
+            cfg.slot_ttl_secs
         );
     }
     // The post-commit grace spares a just-committed slot from reconcile until the
@@ -673,14 +696,14 @@ pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
     // even elapses, so reconcile could never act on it — the same dead-code class
     // as the debounce-window bound above. Keep it strictly inside the TTL. (0 is
     // allowed: it disables the grace.)
-    if cfg.admission_reconcile_commit_grace_secs >= cfg.admission_slot_ttl_secs {
+    if cfg.reconcile_commit_grace_secs >= cfg.slot_ttl_secs {
         anyhow::bail!(
             "GATEWAY_ADMISSION_RECONCILE_COMMIT_GRACE_SECS ({}) must be < GATEWAY_ADMISSION_SLOT_TTL_SECS ({}), else the TTL backstop reaps a committed slot before the post-commit grace elapses",
-            cfg.admission_reconcile_commit_grace_secs,
-            cfg.admission_slot_ttl_secs
+            cfg.reconcile_commit_grace_secs,
+            cfg.slot_ttl_secs
         );
     }
-    if cfg.admission_priority_enable && cfg.admission_priority_ttl_secs == 0 {
+    if cfg.priority_enable && cfg.priority_ttl_secs == 0 {
         anyhow::bail!("GATEWAY_ADMISSION_PRIORITY_TTL_SECS must be > 0 when priority is enabled (0 makes every demand instantly stale → priority never fires)");
     }
     // Under enforce, a zero pool cap sheds that entire proof type forever, and a
@@ -688,37 +711,37 @@ pub fn build_admission(cfg: &Config) -> Result<AdmissionController> {
     // that only a warn() previously guarded (and global==0 wasn't guarded at
     // all). Reject at boot; disabling a proof type is not a realistic intent for
     // a protective throttle. (Dry-run admits regardless, so it is unaffected.)
-    if cfg.admission_enforce {
-        if cfg.admission_range_max_inflight == 0 {
+    if cfg.enforce {
+        if cfg.range_max_inflight == 0 {
             anyhow::bail!("GATEWAY_ADMISSION_RANGE_MAX_INFLIGHT must be > 0 when GATEWAY_ADMISSION_ENFORCE=true (0 sheds every range proof)");
         }
-        if cfg.admission_agg_max_inflight == 0 {
+        if cfg.agg_max_inflight == 0 {
             anyhow::bail!("GATEWAY_ADMISSION_AGG_MAX_INFLIGHT must be > 0 when GATEWAY_ADMISSION_ENFORCE=true (0 sheds every aggregation proof)");
         }
-        if cfg.admission_global_max_inflight == Some(0) {
+        if cfg.global_max_inflight == Some(0) {
             anyhow::bail!("GATEWAY_ADMISSION_GLOBAL_MAX_INFLIGHT must be > 0 when set with GATEWAY_ADMISSION_ENFORCE=true (0 sheds every classified proof)");
         }
     }
-    let range_vks = parse_vk_hashes(cfg.admission_range_vk_hashes.as_deref())
+    let range_vks = parse_vk_hashes(cfg.range_vk_hashes.as_deref())
         .context("GATEWAY_ADMISSION_RANGE_VK_HASHES")?;
-    let agg_vks = parse_vk_hashes(cfg.admission_agg_vk_hashes.as_deref())
-        .context("GATEWAY_ADMISSION_AGG_VK_HASHES")?;
+    let agg_vks =
+        parse_vk_hashes(cfg.agg_vk_hashes.as_deref()).context("GATEWAY_ADMISSION_AGG_VK_HASHES")?;
     let classifier = Classifier::new(range_vks, agg_vks);
-    let priorities = parse_priority_order(cfg.admission_priority_order.as_deref())
+    let priorities = parse_priority_order(cfg.priority_order.as_deref())
         .context("GATEWAY_ADMISSION_PRIORITY_ORDER")?;
     Ok(AdmissionController::new(
         classifier,
-        cfg.admission_range_max_inflight,
-        cfg.admission_agg_max_inflight,
-        cfg.admission_global_max_inflight,
-        cfg.admission_enforce,
-        std::time::Duration::from_secs(cfg.admission_slot_ttl_secs),
+        cfg.range_max_inflight,
+        cfg.agg_max_inflight,
+        cfg.global_max_inflight,
+        cfg.enforce,
+        std::time::Duration::from_secs(cfg.slot_ttl_secs),
         priorities,
-        cfg.admission_priority_enable,
-        std::time::Duration::from_secs(cfg.admission_priority_ttl_secs),
+        cfg.priority_enable,
+        std::time::Duration::from_secs(cfg.priority_ttl_secs),
     )
     .with_commit_grace(std::time::Duration::from_secs(
-        cfg.admission_reconcile_commit_grace_secs,
+        cfg.reconcile_commit_grace_secs,
     )))
 }
 
@@ -823,7 +846,7 @@ mod tests {
 
     #[test]
     fn build_admission_accepts_defaults() {
-        assert!(build_admission(&base_cfg()).is_ok());
+        assert!(build_admission(&base_cfg().admission).is_ok());
     }
 
     /// The wall-clock → age conversion behind seeded-slot back-dating.
@@ -870,16 +893,16 @@ mod tests {
     fn build_admission_rejects_zero_reap_period() {
         // A zero period would panic tokio's interval and silently kill the reaper.
         let mut cfg = base_cfg();
-        cfg.admission_reap_period_secs = 0;
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.reap_period_secs = 0;
+        assert!(build_admission(&cfg.admission).is_err());
     }
 
     #[test]
     fn build_admission_rejects_zero_ttl() {
         // A zero TTL would reap live slots on the first sweep.
         let mut cfg = base_cfg();
-        cfg.admission_slot_ttl_secs = 0;
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.slot_ttl_secs = 0;
+        assert!(build_admission(&cfg.admission).is_err());
     }
 
     #[test]
@@ -887,8 +910,8 @@ mod tests {
         // An over-large TTL would overflow `Instant::now() + ttl` and panic in a
         // request handler; reject at boot.
         let mut cfg = base_cfg();
-        cfg.admission_slot_ttl_secs = u64::MAX;
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.slot_ttl_secs = u64::MAX;
+        assert!(build_admission(&cfg.admission).is_err());
     }
 
     #[test]
@@ -896,11 +919,11 @@ mod tests {
         // 1 (or 0) would release a slot on the first absent reconcile — no
         // debounce, the round-6 over-admit footgun.
         let mut one = base_cfg();
-        one.admission_reconcile_absent_observations = 1;
-        assert!(build_admission(&one).is_err());
+        one.admission.reconcile_absent_observations = 1;
+        assert!(build_admission(&one.admission).is_err());
         let mut zero = base_cfg();
-        zero.admission_reconcile_absent_observations = 0;
-        assert!(build_admission(&zero).is_err());
+        zero.admission.reconcile_absent_observations = 0;
+        assert!(build_admission(&zero.admission).is_err());
     }
 
     #[test]
@@ -909,29 +932,14 @@ mod tests {
         // TTL backstop fires before reconcile can release a gone proof (making the
         // reconcile release path dead code).
         let mut cfg = base_cfg();
-        cfg.admission_reap_period_secs = 60;
-        cfg.admission_slot_ttl_secs = 120;
-        cfg.admission_reconcile_absent_observations = 2; // 2×60 = 120 >= 120 → reject
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.reap_period_secs = 60;
+        cfg.admission.slot_ttl_secs = 120;
+        cfg.admission.reconcile_absent_observations = 2; // 2×60 = 120 >= 120 → reject
+        assert!(build_admission(&cfg.admission).is_err());
 
         // A window comfortably inside the TTL passes.
-        cfg.admission_slot_ttl_secs = 3600; // 2×60 = 120 < 3600
-        assert!(build_admission(&cfg).is_ok());
-    }
-
-    #[test]
-    fn build_admission_rejects_commit_grace_reaching_ttl() {
-        // The post-commit grace must stay < ttl, else the TTL reaper fires before
-        // the grace elapses (reconcile could never act). 0 is allowed (disabled).
-        let mut cfg = base_cfg();
-        cfg.admission_reap_period_secs = 10; // keep obs(3)×reap(30) < ttl below
-        cfg.admission_slot_ttl_secs = 100;
-        cfg.admission_reconcile_commit_grace_secs = 100; // == ttl → reject
-        assert!(build_admission(&cfg).is_err());
-        cfg.admission_reconcile_commit_grace_secs = 60; // < ttl → ok
-        assert!(build_admission(&cfg).is_ok());
-        cfg.admission_reconcile_commit_grace_secs = 0; // disabled → ok
-        assert!(build_admission(&cfg).is_ok());
+        cfg.admission.slot_ttl_secs = 3600; // 2×60 = 120 < 3600
+        assert!(build_admission(&cfg.admission).is_ok());
     }
 
     #[test]
@@ -969,14 +977,29 @@ mod tests {
     }
 
     #[test]
+    fn build_admission_rejects_commit_grace_reaching_ttl() {
+        // The post-commit grace must stay < ttl, else the TTL reaper fires before
+        // the grace elapses (reconcile could never act). 0 is allowed (disabled).
+        let mut cfg = base_cfg();
+        cfg.admission.reap_period_secs = 10; // keep obs(3)×reap(30) < ttl below
+        cfg.admission.slot_ttl_secs = 100;
+        cfg.admission.reconcile_commit_grace_secs = 100; // == ttl → reject
+        assert!(build_admission(&cfg.admission).is_err());
+        cfg.admission.reconcile_commit_grace_secs = 60; // < ttl → ok
+        assert!(build_admission(&cfg.admission).is_ok());
+        cfg.admission.reconcile_commit_grace_secs = 0; // disabled → ok
+        assert!(build_admission(&cfg.admission).is_ok());
+    }
+
+    #[test]
     fn build_admission_rejects_fetch_timeout_above_reap_period() {
         // The reconcile fetch is awaited inline in the reaper loop, so a fetch
         // timeout longer than the reap period would stretch the whole reaper
         // cadence past its configured value.
         let mut cfg = base_cfg();
-        cfg.admission_reap_period_secs = 5;
-        cfg.admission_reconcile_fetch_timeout_secs = 10;
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.reap_period_secs = 5;
+        cfg.admission.reconcile_fetch_timeout_secs = 10;
+        assert!(build_admission(&cfg.admission).is_err());
     }
 
     #[test]
@@ -1010,17 +1033,17 @@ mod tests {
         // fetch_timeout==0 makes tokio::time::timeout elapse every tick →
         // reconcile silently never runs.
         let mut cfg = base_cfg();
-        cfg.admission_reconcile_fetch_timeout_secs = 0;
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.reconcile_fetch_timeout_secs = 0;
+        assert!(build_admission(&cfg.admission).is_err());
     }
 
     #[test]
     fn build_admission_rejects_reap_period_not_below_ttl() {
         // reap_period must sweep well inside the TTL backstop.
         let mut cfg = base_cfg();
-        cfg.admission_reap_period_secs = 3600;
-        cfg.admission_slot_ttl_secs = 3600;
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.reap_period_secs = 3600;
+        cfg.admission.slot_ttl_secs = 3600;
+        assert!(build_admission(&cfg.admission).is_err());
     }
 
     #[test]
@@ -1045,26 +1068,26 @@ mod tests {
         // Under enforce, a zero pool/global cap sheds an entire proof type (or
         // everything) forever — reject at boot.
         let mut range0 = base_cfg();
-        range0.admission_enforce = true;
-        range0.admission_range_max_inflight = 0;
-        assert!(build_admission(&range0).is_err());
+        range0.admission.enforce = true;
+        range0.admission.range_max_inflight = 0;
+        assert!(build_admission(&range0.admission).is_err());
 
         let mut agg0 = base_cfg();
-        agg0.admission_enforce = true;
-        agg0.admission_agg_max_inflight = 0;
-        assert!(build_admission(&agg0).is_err());
+        agg0.admission.enforce = true;
+        agg0.admission.agg_max_inflight = 0;
+        assert!(build_admission(&agg0.admission).is_err());
 
         let mut global0 = base_cfg();
-        global0.admission_enforce = true;
-        global0.admission_global_max_inflight = Some(0);
-        assert!(build_admission(&global0).is_err());
+        global0.admission.enforce = true;
+        global0.admission.global_max_inflight = Some(0);
+        assert!(build_admission(&global0.admission).is_err());
 
         // Dry-run admits regardless of caps, so a zero cap is harmless there.
         let mut dry = base_cfg();
-        dry.admission_enforce = false;
-        dry.admission_range_max_inflight = 0;
-        dry.admission_global_max_inflight = Some(0);
-        assert!(build_admission(&dry).is_ok());
+        dry.admission.enforce = false;
+        dry.admission.range_max_inflight = 0;
+        dry.admission.global_max_inflight = Some(0);
+        assert!(build_admission(&dry.admission).is_ok());
     }
 
     #[test]
@@ -1072,13 +1095,13 @@ mod tests {
         // A zero priority TTL makes every demand instantly stale → priority
         // never fires. Reject at boot when priority is enabled.
         let mut cfg = base_cfg();
-        cfg.admission_priority_enable = true;
-        cfg.admission_priority_ttl_secs = 0;
-        assert!(build_admission(&cfg).is_err());
+        cfg.admission.priority_enable = true;
+        cfg.admission.priority_ttl_secs = 0;
+        assert!(build_admission(&cfg.admission).is_err());
         // ...but a zero TTL is harmless (ignored) while priority is disabled.
         let mut cfg_off = base_cfg();
-        cfg_off.admission_priority_enable = false;
-        cfg_off.admission_priority_ttl_secs = 0;
-        assert!(build_admission(&cfg_off).is_ok());
+        cfg_off.admission.priority_enable = false;
+        cfg_off.admission.priority_ttl_secs = 0;
+        assert!(build_admission(&cfg_off.admission).is_ok());
     }
 }

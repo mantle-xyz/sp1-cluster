@@ -2,15 +2,17 @@ name: Release images to GHCR on tag
 
 # Builds the components this fork changes: network-gateway, coordinator and api.
 # Workers (node) carry no fork changes and run from the official succinctlabs
-# base image, which must be the same generation as these images (base-v2.8.4,
-# SP1 6.8.1): they share a Redis artifact store whose chunked-artifact format
+# base image, which must be the same generation as these images (base-v2.9.0,
+# SP1 6.10.0): they share a Redis artifact store whose chunked-artifact format
 # changed between v2.2.0 and v2.7.2, and all sides must agree on the SP1 version.
 #
 # What each image carries on top of upstream:
 # - gateway: the whole Mantle network gateway (bin/network-gateway).
-# - coordinator: the subscriber handler leak fix and its gauges.
+# - coordinator: the coordinator_sub_handlers / coordinator_subscribers gauges
+#   (the subscriber leak fix itself is upstream's since v2.8.5).
 # - api: the Mantle QueryProofRequests extension the gateway's requester filter
-#   needs (without it the gateway falls back to the unfiltered upstream list).
+#   needs (without it the gateway's get_filtered_proof_requests fails with
+#   FailedPrecondition), so deploy api and gateway from the same tag.
 
 on:
   push:

@@ -352,37 +352,34 @@ impl<P: AssignmentPolicy + Send + Sync + 'static>
                 )),
             }));
 
-            // One entry lookup for check-and-insert: two concurrent opens of the
-            // same sub_id must not both insert and orphan an un-aborted task.
-            match self.subscribers.entry(request.sub_id.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                    // If the subscriber already exists, replace the handler.
-                    let sub = entry.get_mut();
-                    sub.sender_handle.abort();
+            if let Some(mut sub) = self.subscribers.get_mut(&request.sub_id) {
+                // If the subscriber already exists, replace the handler.
+                sub.sender_handle.abort();
 
-                    // Spawn new task with old map.
-                    sub.sender_handle = spawn_subscriber_channel_task(
-                        request.sub_id.clone(),
-                        outer_rx,
-                        tx,
-                        sub.unacked.clone(),
-                        self.subscribers.clone(),
-                    );
-                }
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    let map = Arc::new(DashMap::new());
+                // Spawn new task with old map.
+                sub.sender_handle = spawn_subscriber_channel_task(
+                    request.sub_id.clone(),
+                    outer_rx,
+                    tx,
+                    sub.unacked.clone(),
+                    self.subscribers.clone(),
+                );
+            } else {
+                let map = Arc::new(DashMap::new());
 
-                    // Spawn a task to forward messages to the stream and resend any unacked messages.
-                    let handle = spawn_subscriber_channel_task(
-                        request.sub_id.clone(),
-                        outer_rx,
-                        tx,
-                        map.clone(),
-                        self.subscribers.clone(),
-                    );
+                // Spawn a task to forward messages to the stream and resend any unacked messages.
+                let handle = spawn_subscriber_channel_task(
+                    request.sub_id.clone(),
+                    outer_rx,
+                    tx,
+                    map.clone(),
+                    self.subscribers.clone(),
+                );
 
-                    entry.insert(GenericSubscriberHandler::new(handle, map));
-                }
+                self.subscribers.insert(
+                    request.sub_id.clone(),
+                    GenericSubscriberHandler::new(handle, map),
+                );
             }
 
             coordinator
@@ -561,11 +558,13 @@ fn spawn_subscriber_channel_task<P: Send + Sync + 'static>(
 const SUBSCRIPTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Periodically publish the size of the worker service's subscriber handler map
-/// and of the coordinator's subscriber map. A handler entry outlives its
-/// coordinator subscriber only until the sender task sees outer_rx close, so the
-/// two track each other; handlers staying above subscribers means a leak.
-/// Sampling keeps the metrics off the RPC paths. The first sample is taken when
-/// the task starts.
+/// and of the coordinator's subscriber map. A handler outlives its coordinator
+/// subscriber until its sender task sees outer_rx close AND has nothing left to
+/// deliver (or its client is gone), so with a connected client and unacked
+/// messages handlers can exceed subscribers for ~20s (4 resends x 4s, plus the
+/// tick and this sample interval). Only a gap that persists across many samples
+/// means a leak. Sampling keeps the metrics off the RPC paths. The first sample
+/// is taken when the task starts.
 fn spawn_subscription_gauge_task<P: AssignmentPolicy + Send + Sync + 'static>(
     subscribers: Arc<DashMap<String, GenericSubscriberHandler<P>>>,
     coordinator: Arc<Coordinator<P>>,
