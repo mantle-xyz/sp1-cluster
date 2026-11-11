@@ -2,11 +2,12 @@ use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use crate::metrics::CoordinatorMetrics;
 use crate::{AssignmentPolicy, ClusterInfo, Coordinator, ProofResult};
-use dashmap::{DashMap, DashSet};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use futures::StreamExt;
 use hex;
 use sp1_cluster_common::{
     client::ClusterServiceClient,
+    failure::{expired_extra_data, ProvingFailure},
     proto::{
         self, CreateProofRequest, ProofRequestGetRequest, ProofRequestListRequest,
         ProofRequestStatus, ProofRequestUpdateRequest,
@@ -108,9 +109,15 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
                 tracing::error!("Failed to serialize metadata: {}", e);
                 "null".to_string()
             });
+            let execution_result = if success {
+                None
+            } else {
+                extra_data.as_deref().and_then(execution_failure)
+            };
             let update = ProofRequestUpdateRequest {
                 proof_id: id.clone(),
                 proof_status: Some(status.into()),
+                execution_result,
                 metadata: Some(metadata_string),
                 extra_data,
                 ..Default::default()
@@ -168,10 +175,54 @@ pub fn spawn_manifest_push_task<P: AssignmentPolicy>(
     })
 }
 
+/// Pending and not handed to the fulfiller: the claimer's listing filter, minus the deadline.
+fn pending_unhandled(row: &proto::ProofRequest) -> bool {
+    row.proof_status == ProofRequestStatus::Pending as i32 && !row.handled
+}
+
 /// True when the row still matches the claimer's Pending listing filter.
 /// Then the row is alive and paging churn explains its absence from the list.
 fn still_pending(row: &proto::ProofRequest, now: u64) -> bool {
-    row.proof_status == ProofRequestStatus::Pending as i32 && !row.handled && row.deadline >= now
+    pending_unhandled(row) && row.deadline >= now
+}
+
+/// The execution result to record for a failed proof, if its failure is an execution verdict.
+///
+/// Only the request's cycle limit is mapped. The gateway reports an execution status of
+/// `Failed` as `Unexecutable`, and op-succinct splits a range on its first `Unexecutable`
+/// instead of retrying the same oversized range until it fails three times. `cycles` stays 0:
+/// the prover stops at the limit and does not report how far execution got.
+fn execution_failure(extra_data: &str) -> Option<proto::ExecutionResult> {
+    let failure = ProvingFailure::from_extra_data(extra_data)?;
+    failure
+        .exceeded_cycle_limit()
+        .then(|| proto::ExecutionResult {
+            status: proto::ExecutionStatus::Failed as i32,
+            failure_cause: proto::ExecutionFailureCause::ExceededCycleLimit as i32,
+            cycles: 0,
+            gas: 0,
+            public_values_hash: vec![],
+        })
+}
+
+/// The terminal write for a tracked proof whose row expired while still Pending.
+///
+/// The coordinator tears such a proof down without a status write, which left the row Pending
+/// forever. A row that left the filter any other way (completed, cancelled, handed to the
+/// fulfiller, deleted) already has an owner, so it gets no write.
+fn expired_update(
+    id: &str,
+    row: Option<&proto::ProofRequest>,
+    now: u64,
+) -> Option<ProofRequestUpdateRequest> {
+    let row = row?;
+    let expired = pending_unhandled(row) && row.deadline < now;
+    expired.then(|| ProofRequestUpdateRequest {
+        proof_id: id.to_string(),
+        proof_status: Some(ProofRequestStatus::Failed.into()),
+        extra_data: Some(expired_extra_data(row.deadline)),
+        ..Default::default()
+    })
 }
 
 /// How many missing-proof confirms run at once.
@@ -208,7 +259,7 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
                 .await
             {
                 Ok(Some(row)) if still_pending(&row, now) => {}
-                Ok(_) => {
+                Ok(row) => {
                     // The proof can complete during the row read and store a
                     // Terminal write that still has to land. Remove only a
                     // Pending entry.
@@ -220,6 +271,40 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
                         if let Err(e) = coordinator.fail_proof(id.clone(), None, false, None).await
                         {
                             tracing::error!("Failed to fail expired proof: {:?}", e);
+                        }
+                        if let Some(update) = expired_update(&id, row.as_ref(), now) {
+                            // The status task may have recorded a completion since the remove
+                            // above; never overwrite it, so only claim a vacant slot. (A
+                            // completion recorded after ours races it to the DB and the first
+                            // to land wins; either outcome is fine past the deadline, when the
+                            // caller has already given up.) Recording the write before attempting
+                            // it lets the claimer's sweep re-issue a lost one, as for the status
+                            // task's writes.
+                            let recorded = match task_map.entry(id.clone()) {
+                                Entry::Vacant(slot) => {
+                                    slot.insert(TaskState::Terminal(update.clone()));
+                                    true
+                                }
+                                Entry::Occupied(_) => false,
+                            };
+                            if recorded {
+                                tracing::warn!(
+                                    "Proof {} passed its deadline; marking it Failed",
+                                    id
+                                );
+                                match api_client.update_proof_request(update).await {
+                                    Ok(()) => {
+                                        task_map.remove_if(&id, |_, v| {
+                                            matches!(v, TaskState::Terminal(_))
+                                        });
+                                    }
+                                    Err(e) => tracing::error!(
+                                        "Failed to mark expired proof {} Failed: {}",
+                                        id,
+                                        e
+                                    ),
+                                }
+                            }
                         }
                     }
                 }
@@ -400,5 +485,62 @@ mod tests {
 
         let expired = pending_row(1000);
         assert!(!still_pending(&expired, expired.deadline + 1));
+    }
+
+    fn proving_failure(reason: &str) -> String {
+        ProvingFailure {
+            task_type: proto::TaskType::CoreExecute,
+            reason: reason.to_string(),
+        }
+        .to_extra_data()
+    }
+
+    /// A cycle-limit stop must reach the DB as an execution failure: that row is what the
+    /// gateway turns into `Unexecutable`, which is what makes op-succinct split the range.
+    #[test]
+    fn a_cycle_limit_stop_is_recorded_as_an_execution_failure() {
+        let result = execution_failure(&proving_failure("ExceededCycleLimit(1000)"))
+            .expect("cycle limit must produce an execution result");
+        assert_eq!(result.status, proto::ExecutionStatus::Failed as i32);
+        assert_eq!(
+            result.failure_cause,
+            proto::ExecutionFailureCause::ExceededCycleLimit as i32
+        );
+    }
+
+    #[test]
+    fn other_failures_record_no_execution_result() {
+        assert!(
+            execution_failure(&proving_failure("Redis shard 0 admission wait > 120s")).is_none()
+        );
+        assert!(execution_failure(&expired_extra_data(1000)).is_none());
+        assert!(execution_failure("").is_none());
+    }
+
+    #[test]
+    fn an_expired_pending_row_is_marked_failed() {
+        let row = pending_row(1000);
+        let update = expired_update("p", Some(&row), row.deadline + 1)
+            .expect("an expired Pending row must get a terminal write");
+        assert_eq!(update.proof_id, "p");
+        assert_eq!(update.proof_status, Some(ProofRequestStatus::Failed as i32));
+        assert_eq!(update.extra_data, Some(expired_extra_data(row.deadline)));
+    }
+
+    /// Rows that left the filter for any other reason already have an owner.
+    #[test]
+    fn only_an_expired_pending_row_is_marked_failed() {
+        let live = pending_row(1000);
+        assert!(expired_update("p", Some(&live), 1000).is_none());
+
+        let mut cancelled = pending_row(1000);
+        cancelled.proof_status = ProofRequestStatus::Cancelled as i32;
+        assert!(expired_update("p", Some(&cancelled), cancelled.deadline + 1).is_none());
+
+        let mut handled = pending_row(1000);
+        handled.handled = true;
+        assert!(expired_update("p", Some(&handled), handled.deadline + 1).is_none());
+
+        assert!(expired_update("p", None, 1000).is_none());
     }
 }
