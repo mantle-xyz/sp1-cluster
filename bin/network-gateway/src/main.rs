@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use jemallocator::Jemalloc;
 use opentelemetry_sdk::Resource;
 use sp1_cluster_artifact::{
     redis::RedisArtifactClient,
@@ -9,6 +10,30 @@ use sp1_cluster_common::auth::token_from_env;
 use sp1_cluster_common::logger;
 use sp1_cluster_network_gateway::{config::Config, run};
 use tracing::info;
+
+/// Same allocator as the coordinator and the workers. Under glibc malloc the gateway kept the
+/// freed buffers of past uploads in its arenas and never returned them; jemalloc hands freed
+/// pages back to the OS after its decay delay.
+#[global_allocator]
+static ALLOCATOR: Jemalloc = Jemalloc;
+
+/// Purge from jemalloc's background threads. Without them an arena only decays when it is used
+/// again, and the arenas of tokio workers that served a burst of uploads and then went idle
+/// would keep their pages. Only enabled for linux-gnu: jemalloc-sys does not support background
+/// threads on musl. Operators can override it at runtime with `_RJEM_MALLOC_CONF` (this build is
+/// prefixed, so a plain `MALLOC_CONF` is ignored).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[export_name = "_rjem_malloc_conf"]
+static MALLOC_CONF: MallocConf = MallocConf(c"background_thread:true".as_ptr());
+
+/// A C string pointer, which jemalloc reads at startup as `malloc_conf`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+
+// SAFETY: points at a static, immutable C string literal.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe impl Sync for MallocConf {}
 
 #[tokio::main]
 async fn main() -> Result<()> {

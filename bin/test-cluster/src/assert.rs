@@ -118,9 +118,9 @@ pub struct ExpectedExecution {
 ///
 /// The cluster-authoritative record is the `extra_data` JSON (the ExecuteOnly task
 /// completes the proof with a serialized `ExecutionResult` there; the coordinator's
-/// terminal update never sets the `execution_result` proto field — that one is written
-/// by external actors, and downstream fulfillment also parses `extra_data`, see
-/// crates/fulfillment/src/lib.rs).
+/// terminal update sets the `execution_result` proto field only for a proving-path
+/// cycle-limit stop — otherwise that one is written by external actors, and downstream
+/// fulfillment also parses `extra_data`, see crates/fulfillment/src/lib.rs).
 pub fn assert_execution_result(
     pr: &ProofRequest,
     expected: &ExpectedExecution,

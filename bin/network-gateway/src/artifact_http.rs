@@ -49,10 +49,20 @@ where
     info!(id, ?artifact_type, size = body.len(), "PUT artifact");
     state
         .client
-        .upload_raw_compressed(&id, artifact_type, body.to_vec())
+        .upload_raw_compressed(&id, artifact_type, upload_bytes(body))
         .await
         .map_err(internal)?;
     Ok(StatusCode::OK)
+}
+
+/// The upload as the `Vec` the store takes, without copying it when possible.
+///
+/// `Vec::from` reuses the body's buffer when it is the only reference, which it is for any
+/// upload axum collected from more than one frame (every stdin of real size); a single-frame
+/// body shares hyper's read buffer and is copied, as `to_vec()` always did. This saves one full
+/// copy of the upload per PUT.
+fn upload_bytes(body: Bytes) -> Vec<u8> {
+    Vec::from(body)
 }
 
 async fn get_artifact<A>(
@@ -159,5 +169,32 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `put_artifact` hands the store `upload_bytes(body)`, which must not copy a multi-frame
+    /// upload. Run it on a body from the real extractor: if the handler goes back to `to_vec()`
+    /// through `upload_bytes`, or axum/bytes stop handing over a uniquely owned buffer, each PUT
+    /// copies the whole upload again and this fails.
+    #[tokio::test]
+    async fn a_multi_frame_upload_body_converts_without_a_copy() {
+        use axum::extract::FromRequest;
+
+        const FRAME: usize = 256 * 1024;
+        let frames: Vec<Result<Bytes, std::io::Error>> =
+            (0..8u8).map(|i| Ok(Bytes::from(vec![i; FRAME]))).collect();
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/")
+            .body(Body::from_stream(futures::stream::iter(frames)))
+            .unwrap();
+
+        let body = Bytes::from_request(req, &()).await.unwrap();
+        let buffer = body.as_ptr();
+        let upload = upload_bytes(body);
+
+        assert_eq!(upload.as_ptr(), buffer, "the upload body was copied");
+        assert_eq!(upload.len(), 8 * FRAME);
+        assert!(upload[..FRAME].iter().all(|&b| b == 0));
+        assert!(upload[7 * FRAME..].iter().all(|&b| b == 7));
     }
 }

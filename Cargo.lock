@@ -8512,6 +8512,7 @@ dependencies = [
  "eyre",
  "futures",
  "hex",
+ "jemallocator",
  "mti",
  "opentelemetry_sdk",
  "prometheus-client",
