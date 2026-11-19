@@ -9,6 +9,7 @@ use crate::util::{middleware, spawn_coordinator_periodic_task, spawn_heartbeat_t
 use dashmap::DashMap;
 use jemallocator::Jemalloc;
 use mti::prelude::{MagicTypeIdExt, V7};
+use sp1_cluster_artifact::redis::RedisArtifactClient;
 use sp1_cluster_common::client::ClusterServiceClient;
 use sp1_cluster_common::logger;
 use sp1_cluster_common::proto::{
@@ -195,8 +196,10 @@ impl<P: AssignmentPolicy + Send + Sync + 'static>
         let id = tokio::spawn({
             let coordinator = self.coordinator.clone();
             async move {
+                let request = request.into_inner();
+                let worker_id = (!request.worker_id.is_empty()).then_some(request.worker_id);
                 coordinator
-                    .create_task(request.into_inner().data.unwrap())
+                    .create_task_from(worker_id.as_deref(), request.data.unwrap())
                     .await
             }
         })
@@ -621,6 +624,35 @@ pub async fn start_coordinator_server_custom<
 
     let mut service = GenericWorkerService::<P>::default();
 
+    // Delete a failed proof's artifacts, if the coordinator is told where they live.
+    if !config.redis_nodes.is_empty() {
+        let nodes: Vec<String> = config
+            .redis_nodes
+            .split(',')
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        // An optional feature: a bad URL disables it rather than keeping the coordinator down.
+        match RedisArtifactClient::try_new(nodes.clone(), config.redis_pool_max_size) {
+            Ok(client) => {
+                tracing::info!(
+                    "failed-proof artifact cleanup enabled ({} redis node(s))",
+                    nodes.len()
+                );
+                Arc::get_mut(&mut service.coordinator)
+                    .expect("We just created service, so we should have a unique reference to it")
+                    .set_artifact_cleaner(Arc::new(client));
+            }
+            Err(e) => tracing::error!(
+                "COORDINATOR_REDIS_NODES is invalid ({e:#}); failed-proof artifact cleanup is off"
+            ),
+        }
+    } else {
+        tracing::info!(
+            "COORDINATOR_REDIS_NODES unset; failed proofs' artifacts expire with the TTL"
+        );
+    }
+
     // Initialize metrics server and metrics
     let (metrics, mut metrics_server_handle, metrics_shutdown_tx) =
         initialize_metrics(metrics_addr)
@@ -648,6 +680,14 @@ pub async fn start_coordinator_server_custom<
         .coordinator
         .set_worker_heartbeat_timeout(config.worker_heartbeat_timeout_secs)
         .await;
+    service
+        .coordinator
+        .set_max_shards_per_proof(config.max_shards_per_proof)
+        .await;
+    tracing::info!(
+        "max_shards_per_proof={} (0 = no limit)",
+        config.max_shards_per_proof
+    );
 
     if !config.disable_proof_status_update {
         spawn_proof_status_task(

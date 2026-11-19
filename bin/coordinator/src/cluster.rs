@@ -7,7 +7,7 @@ use futures::StreamExt;
 use hex;
 use sp1_cluster_common::{
     client::ClusterServiceClient,
-    failure::{expired_extra_data, ProvingFailure},
+    failure::{expired_extra_data, is_shard_limit, ProvingFailure},
     proto::{
         self, CreateProofRequest, ProofRequestGetRequest, ProofRequestListRequest,
         ProofRequestStatus, ProofRequestUpdateRequest,
@@ -188,21 +188,27 @@ fn still_pending(row: &proto::ProofRequest, now: u64) -> bool {
 
 /// The execution result to record for a failed proof, if its failure is an execution verdict.
 ///
-/// Only the request's cycle limit is mapped. The gateway reports an execution status of
-/// `Failed` as `Unexecutable`, and op-succinct splits a range on its first `Unexecutable`
-/// instead of retrying the same oversized range until it fails three times. `cycles` stays 0:
-/// the prover stops at the limit and does not report how far execution got.
+/// Two failures are mapped: the request's cycle limit, and the cluster's per-proof shard limit.
+/// Both mean the range is too large to prove as one request. The gateway reports an execution
+/// status of `Failed` as `Unexecutable`, and op-succinct splits a range on its first
+/// `Unexecutable` instead of retrying the same oversized range until it fails three times.
+/// `cycles` stays 0: execution stops early and does not report how far it got. The shard limit
+/// has no cause code of its own, so it records `Unspecified` and `extra_data` says why.
 fn execution_failure(extra_data: &str) -> Option<proto::ExecutionResult> {
-    let failure = ProvingFailure::from_extra_data(extra_data)?;
-    failure
-        .exceeded_cycle_limit()
-        .then(|| proto::ExecutionResult {
-            status: proto::ExecutionStatus::Failed as i32,
-            failure_cause: proto::ExecutionFailureCause::ExceededCycleLimit as i32,
-            cycles: 0,
-            gas: 0,
-            public_values_hash: vec![],
-        })
+    let failure_cause = if is_shard_limit(extra_data) {
+        proto::ExecutionFailureCause::Unspecified
+    } else if ProvingFailure::from_extra_data(extra_data)?.exceeded_cycle_limit() {
+        proto::ExecutionFailureCause::ExceededCycleLimit
+    } else {
+        return None;
+    };
+    Some(proto::ExecutionResult {
+        status: proto::ExecutionStatus::Failed as i32,
+        failure_cause: failure_cause as i32,
+        cycles: 0,
+        gas: 0,
+        public_values_hash: vec![],
+    })
 }
 
 /// The terminal write for a tracked proof whose row expired while still Pending.
@@ -505,6 +511,19 @@ mod tests {
         assert_eq!(
             result.failure_cause,
             proto::ExecutionFailureCause::ExceededCycleLimit as i32
+        );
+    }
+
+    /// The shard limit is the cluster saying the range is too large, like the cycle limit.
+    #[test]
+    fn a_shard_limit_stop_is_recorded_as_an_execution_failure() {
+        let result =
+            execution_failure(&sp1_cluster_common::failure::shard_limit_extra_data(52_000))
+                .expect("shard limit must produce an execution result");
+        assert_eq!(result.status, proto::ExecutionStatus::Failed as i32);
+        assert_eq!(
+            result.failure_cause,
+            proto::ExecutionFailureCause::Unspecified as i32
         );
     }
 

@@ -46,6 +46,25 @@ pub fn expired_extra_data(deadline: u64) -> String {
     serde_json::json!({ "expired": { "deadline": deadline } }).to_string()
 }
 
+/// `extra_data` written when the coordinator stops a proof whose execution produced more
+/// shards than the cluster's per-proof limit. On the wire as `{"shard_limit": {"limit": <n>}}`.
+pub fn shard_limit_extra_data(limit: u64) -> String {
+    serde_json::json!({ "shard_limit": { "limit": limit } }).to_string()
+}
+
+/// Whether `extra_data` is a [`shard_limit_extra_data`] payload.
+pub fn is_shard_limit(extra_data: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Envelope {
+        shard_limit: ShardLimit,
+    }
+    #[derive(Deserialize)]
+    struct ShardLimit {
+        limit: u64,
+    }
+    serde_json::from_str::<Envelope>(extra_data).is_ok_and(|e| e.shard_limit.limit > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +94,18 @@ mod tests {
         let s = expired_extra_data(1_700_000_000);
         assert_eq!(s, r#"{"expired":{"deadline":1700000000}}"#);
         assert!(ProvingFailure::from_extra_data(&s).is_none());
+    }
+
+    #[test]
+    fn shard_limit_payload_round_trips_and_is_distinct() {
+        let s = shard_limit_extra_data(52_000);
+        assert_eq!(s, r#"{"shard_limit":{"limit":52000}}"#);
+        assert!(is_shard_limit(&s));
+        assert!(ProvingFailure::from_extra_data(&s).is_none());
+        assert!(!is_shard_limit(&expired_extra_data(1)));
+        assert!(!is_shard_limit(
+            &failure("ExceededCycleLimit(1)").to_extra_data()
+        ));
+        assert!(!is_shard_limit(""));
     }
 }
