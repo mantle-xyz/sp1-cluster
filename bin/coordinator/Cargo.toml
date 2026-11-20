@@ -5,6 +5,7 @@ version.workspace = true
 edition = "2021"
 
 [dependencies]
+sp1-cluster-artifact.workspace = true
 sp1-cluster-common.workspace = true
 sp1-prover.workspace = true
 sp1-sdk.workspace = true
