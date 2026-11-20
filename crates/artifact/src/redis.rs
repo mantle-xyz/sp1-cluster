@@ -189,15 +189,22 @@ pub struct RedisArtifactClient {
 
 impl RedisArtifactClient {
     pub fn new(node_ips: Vec<String>, pool_max_size: usize) -> Self {
+        Self::try_new(node_ips, pool_max_size).unwrap()
+    }
+
+    /// [`Self::new`] that reports a malformed node URL instead of panicking.
+    pub fn try_new(node_ips: Vec<String>, pool_max_size: usize) -> Result<Self> {
         tracing::info!("initializing redis pool");
-        let pools: Vec<_> = node_ips
+        let pools = node_ips
             .iter()
             .map(|url| {
                 let mut config = Config::from_url(url);
                 config.pool = Some(PoolConfig::new(pool_max_size));
-                config.create_pool(Some(Runtime::Tokio1)).unwrap()
+                config
+                    .create_pool(Some(Runtime::Tokio1))
+                    .map_err(|e| anyhow!("invalid redis node URL: {e}"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let backoff = ExponentialBackoffBuilder::new()
             .with_initial_interval(Duration::from_millis(100))
             .with_max_interval(Duration::from_secs(1))
@@ -205,12 +212,12 @@ impl RedisArtifactClient {
             .build();
         let node_semaphores = Arc::new((0..pools.len()).map(|_| OnceCell::new()).collect());
         let admission = Arc::new((0..pools.len()).map(|_| Admission::default()).collect());
-        Self {
+        Ok(Self {
             connection_pools: pools,
             backoff,
             node_semaphores,
             admission,
-        }
+        })
     }
 
     /// Return the per-node shard semaphore, initializing it on first call.

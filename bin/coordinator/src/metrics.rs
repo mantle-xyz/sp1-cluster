@@ -108,6 +108,68 @@ impl CoordinatorMetrics {
         counter!("coordinator_dead_worker_missing_task_total").increment(1);
     }
 
+    /// Proofs failed because one execution submitted more shards than the per-proof limit.
+    pub fn increment_proofs_over_shard_limit(&self) {
+        describe_counter!(
+            "coordinator_proofs_over_shard_limit_total",
+            "Proofs failed as unexecutable for exceeding COORDINATOR_MAX_SHARDS_PER_PROOF.",
+        );
+        counter!("coordinator_proofs_over_shard_limit_total").increment(1);
+    }
+
+    /// Shard tasks that matched no CoreExecute of their proof, so the shard limit skipped them.
+    /// Expected to stay 0; anything else means the task layout changed upstream.
+    pub fn increment_unmatched_shards(&self) {
+        describe_counter!(
+            "coordinator_unmatched_shards_total",
+            "Shard tasks the per-proof shard limit could not attribute to an execution.",
+        );
+        counter!("coordinator_unmatched_shards_total").increment(1);
+    }
+
+    /// A proof got a second CoreExecute task for the same run, from a submission retried
+    /// after a coordinator stall. Expected rare; see shards.rs on its effect on the limit.
+    pub fn increment_duplicate_executions(&self) {
+        describe_counter!(
+            "coordinator_duplicate_executions_total",
+            "CoreExecute tasks created twice for one controller run (retried submissions).",
+        );
+        counter!("coordinator_duplicate_executions_total").increment(1);
+    }
+
+    /// Shards of the largest single execution of a proof, when it completes or fails. Use it
+    /// to set COORDINATOR_MAX_SHARDS_PER_PROOF and see the headroom under it.
+    pub fn record_proof_execution_shards(&self, outcome: &'static str, shards: u64) {
+        if shards == 0 {
+            return;
+        }
+        describe_histogram!(
+            "coordinator_proof_execution_shards",
+            "Shards submitted by the largest single execution of a proof, by outcome.",
+        );
+        histogram!("coordinator_proof_execution_shards", "outcome" => outcome)
+            .record(shards as f64);
+    }
+
+    /// Artifact ids of failed proofs the coordinator sent for deletion. Counts ids in delete
+    /// calls that succeeded, not keys Redis confirmed removing.
+    pub fn increment_failed_proof_cleanup_ids(&self, count: u64) {
+        describe_counter!(
+            "coordinator_failed_proof_cleanup_ids_total",
+            "Artifact ids of failed proofs sent for deletion in delete calls that succeeded.",
+        );
+        counter!("coordinator_failed_proof_cleanup_ids_total").increment(count);
+    }
+
+    /// Delete calls for a failed proof's artifacts that failed (those ids expire with the TTL).
+    pub fn increment_failed_proof_cleanup_errors(&self) {
+        describe_counter!(
+            "coordinator_failed_proof_cleanup_errors_total",
+            "Failed deletions of a failed proof's artifacts; those artifacts expire with the TTL.",
+        );
+        counter!("coordinator_failed_proof_cleanup_errors_total").increment(1);
+    }
+
     /// Claimer re-issued a terminal status write that an earlier completion lost. A nonzero rate
     /// means completion writes are being dropped (e.g. a cluster-DB blip). Observability-only.
     pub fn increment_reissued_status_writes(&self) {

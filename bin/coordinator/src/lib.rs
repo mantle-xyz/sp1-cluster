@@ -1,9 +1,11 @@
+pub mod cleanup;
 pub mod cluster;
 pub mod config;
 pub mod latency;
 pub mod metrics;
 pub mod policy;
 pub mod server;
+pub mod shards;
 pub mod util;
 
 use dashmap::DashMap;
@@ -310,6 +312,9 @@ pub struct Coordinator<P: AssignmentPolicy> {
 
     /// Metrics for the coordinator
     pub metrics: Option<Arc<metrics::CoordinatorMetrics>>,
+
+    /// Deletes a failed proof's artifacts. `None` leaves them to the artifact store's TTL.
+    pub artifact_cleaner: Option<Arc<dyn cleanup::ArtifactCleaner>>,
 }
 
 pub trait TimeSource: Send + Sync {
@@ -335,6 +340,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                 policy: P::default(),
                 execute_only_mode: false,
                 worker_heartbeat_timeout_secs: DEFAULT_WORKER_HEARTBEAT_TIMEOUT,
+                max_shards_per_proof: 0,
                 gpu_busy_ms_total: 0,
                 gpu_available_ms_total: 0,
                 gpu_available_last_tick: std::time::Instant::now(),
@@ -343,12 +349,18 @@ impl<P: AssignmentPolicy> Coordinator<P> {
             subscribers: DashMap::new(),
             task_channels: DashMap::new(),
             metrics: None,
+            artifact_cleaner: None,
         }
     }
 
     /// Sets the metrics for the coordinator
     pub fn set_metrics(&mut self, metrics: Arc<metrics::CoordinatorMetrics>) {
         self.metrics = Some(metrics);
+    }
+
+    /// Sets the cleaner that deletes a failed proof's artifacts.
+    pub fn set_artifact_cleaner(&mut self, cleaner: Arc<dyn cleanup::ArtifactCleaner>) {
+        self.artifact_cleaner = Some(cleaner);
     }
 }
 
@@ -372,6 +384,13 @@ pub struct Proof<P: AssignmentPolicy> {
     pub expires_at: Option<SystemTime>,
     pub active_tasks: u32,
     pub extra: P::ProofState,
+    /// Shards submitted per execution of this proof, for the per-proof shard limit.
+    pub shard_streams: shards::ShardStreams,
+    /// Set by [`Coordinator::complete_proof`]. The proof stays in state until its remaining
+    /// tasks finish (e.g. a redelivered execution's duplicate shards), and can still be torn
+    /// down by `fail_proof_internal` then; its result is already decided, so that teardown
+    /// must not delete its artifacts.
+    pub completed: bool,
 }
 
 impl<P: AssignmentPolicy> Proof<P> {
@@ -383,6 +402,8 @@ impl<P: AssignmentPolicy> Proof<P> {
             expires_at,
             active_tasks: 0,
             extra,
+            shard_streams: shards::ShardStreams::default(),
+            completed: false,
         }
     }
 }
@@ -422,6 +443,10 @@ pub struct CoordinatorState<P: AssignmentPolicy> {
 
     /// Seconds a worker can be inactive before it is considered dead and its tasks requeue.
     pub worker_heartbeat_timeout_secs: u64,
+
+    /// Most shards one execution of a proof may submit before the proof is stopped; 0 = no
+    /// limit. See [`shards`].
+    pub max_shards_per_proof: u64,
 
     /// Monotonic sum of GPU busy time in GPU-milliseconds since [`Self::counters_since`].
     /// The coordinator adds `TaskMetadata::gpu_ms` one time for each assignment attempt
@@ -667,6 +692,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
         let id = self
             .create_task_internal(
                 state,
+                None,
                 TaskData {
                     task_type: task_type as i32,
                     inputs: request.inputs,
@@ -768,6 +794,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
     async fn create_task_internal(
         self: &Arc<Self>,
         mut state: OwnedRwLockWriteGuard<CoordinatorState<P>>,
+        submitter: Option<&str>,
         task: proto::TaskData,
     ) -> Result<String, Status> {
         // Generate ID
@@ -793,7 +820,8 @@ impl<P: AssignmentPolicy> Coordinator<P> {
         );
 
         // Update tasks and add task to proof
-        state.total_tasks += 1;
+        let limit = state.max_shards_per_proof;
+        let shutting_down = state.shutting_down;
         let Some(proof) = state.proofs.get_mut(&task.data.proof_id) else {
             tracing::error!("proof {} not found", task.data.proof_id);
             return Err(Status::not_found(format!(
@@ -801,8 +829,78 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                 task.data.proof_id
             )));
         };
+        let tracked = proof.shard_streams.track(&id, &task.data, submitter, limit);
+        match tracked {
+            shards::Tracked::Unmatched { first } => {
+                if first {
+                    tracing::warn!(
+                        "shard task {} of proof {} matches no CoreExecute; the shard limit is \
+                         not applied to this proof's unmatched shards",
+                        id,
+                        task.data.proof_id
+                    );
+                }
+                if let Some(metrics) = &self.metrics {
+                    metrics.increment_unmatched_shards();
+                }
+            }
+            shards::Tracked::DuplicateExecution => {
+                tracing::warn!(
+                    "proof {} has a second CoreExecute {} for the same run (a retried \
+                     submission); keeping its shard counts",
+                    task.data.proof_id,
+                    id
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.increment_duplicate_executions();
+                }
+            }
+            _ => {}
+        }
+        if let shards::Tracked::OverLimit(count) = tracked {
+            let proof_id = task.data.proof_id.clone();
+            if shutting_down {
+                // fail_proof_internal does nothing while shutting down; just refuse.
+                return Err(Status::failed_precondition("Server shutting down"));
+            }
+            tracing::warn!(
+                "proof {} submitted {} shards in one execution, over the limit of {}; failing it",
+                proof_id,
+                count,
+                limit
+            );
+            // A completed proof can still trip it from a redelivered execution's leftover
+            // shards; that is only teardown, not a rejected range.
+            if !proof.completed {
+                if let Some(metrics) = &self.metrics {
+                    metrics.increment_proofs_over_shard_limit();
+                }
+            }
+            // The refused shard's record is already uploaded. Keep the task in the proof, never
+            // queued, so the failed proof's cleanup also deletes its artifacts.
+            proof.tasks.insert(task.id.clone(), task.clone());
+            self.fail_proof_internal(
+                &mut state,
+                proof_id.clone(),
+                None,
+                true,
+                Some(sp1_cluster_common::failure::shard_limit_extra_data(limit)),
+                None,
+            )
+            .await?;
+            // The failed proof's workers are free now; hand them work without waiting for the
+            // next heartbeat. The next heartbeat retries if this fails; the refusal stands.
+            if let Err(e) = self.assign_tasks(state).await {
+                tracing::warn!("assigning tasks after a shard-limit failure: {e}");
+            }
+            // A permanent code: the worker's create_task retries transient codes forever.
+            return Err(Status::failed_precondition(format!(
+                "proof {proof_id} is over the shard limit of {limit}"
+            )));
+        }
         proof.active_tasks += 1;
         proof.tasks.insert(task.id.clone(), task.clone());
+        state.total_tasks += 1;
 
         // Queue task and assign if possible
         self.enqueue_task(&mut state, task.clone()).await;
@@ -813,6 +911,16 @@ impl<P: AssignmentPolicy> Coordinator<P> {
 
     /// Create task and enqueue / assign to a worker if possible.
     pub async fn create_task(self: &Arc<Self>, task: proto::TaskData) -> Result<String, Status> {
+        self.create_task_from(None, task).await
+    }
+
+    /// [`Self::create_task`] for a task a worker submitted. `worker_id` is the submitter, which
+    /// the per-proof shard limit uses to tell one worker's execution from another's.
+    pub async fn create_task_from(
+        self: &Arc<Self>,
+        worker_id: Option<&str>,
+        task: proto::TaskData,
+    ) -> Result<String, Status> {
         let state = self
             .state
             .clone()
@@ -820,8 +928,17 @@ impl<P: AssignmentPolicy> Coordinator<P> {
             .instrument(tracing::debug_span!("acquire_write"))
             .await;
         track_latency!("worker.create_task", {
-            self.create_task_internal(state, task).await
+            self.create_task_internal(state, worker_id, task).await
         })
+    }
+
+    /// Set the per-proof shard limit; 0 disables it.
+    pub async fn set_max_shards_per_proof(&self, limit: u64) {
+        self.state
+            .write()
+            .instrument(tracing::debug_span!("acquire_write"))
+            .await
+            .max_shards_per_proof = limit;
     }
 
     /// Mark a task as completed.
@@ -1107,6 +1224,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
 
         // Handle any tasks the worker is working on that are not tracked in the coordinator, and
         // cancel them.
+        let mut cancelled = vec![];
         for (proof_id, task_id) in active_task_proof_ids.iter().zip(active_task_ids.iter()) {
             let tuple = (proof_id.clone(), task_id.clone());
             if !worker.active_tasks.contains(&tuple) {
@@ -1115,7 +1233,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                     worker_id,
                     (proof_id, task_id)
                 );
-                if worker
+                let delivered = worker
                     .channel
                     .send(Ok(ServerMessage {
                         message: Some(server_message::Message::CancelTask(CancelTask {
@@ -1123,8 +1241,11 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                             proof_id: proof_id.to_string(),
                         })),
                     }))
-                    .is_err()
-                {
+                    .is_ok();
+                if delivered {
+                    cancelled.push(tuple.clone());
+                } else {
+                    // Not delivered, so the execution was not aborted and keeps its count.
                     tracing::error!(
                         "Failed to send CancelTask to worker {} (subscriber connection closed?)",
                         worker_id
@@ -1136,6 +1257,12 @@ impl<P: AssignmentPolicy> Coordinator<P> {
 
         // Handle any tasks the worker is not working on that it should be working on, and resend them.
         let worker = worker.clone();
+        // The cancelled execution has ended; the shard limit counts the worker's next one apart.
+        for (proof_id, task_id) in &cancelled {
+            if let Some(proof) = state.proofs.get_mut(proof_id) {
+                proof.shard_streams.note_cancelled(task_id, worker_id);
+            }
+        }
         let mut tasks_to_remove = vec![];
         for tuple in &worker.active_tasks {
             if !worker_set.contains(tuple) {
@@ -1455,6 +1582,13 @@ impl<P: AssignmentPolicy> Coordinator<P> {
             .write_owned()
             .instrument(tracing::debug_span!("acquire_write"))
             .await;
+        // This worker's execution of the task has ended, whether or not it still holds the task
+        // (a report arriving after a requeue is refused below). The shard limit counts the
+        // worker's next execution apart. Per worker: another worker may still be executing it.
+        if let Some(proof) = state.proofs.get_mut(&proof_id) {
+            proof.shard_streams.note_failed(&task_id, &worker_id);
+        }
+
         // Ensure the worker is working on this task.
         if let Some(worker) = state.workers.get(&worker_id) {
             if !worker
@@ -1707,16 +1841,25 @@ impl<P: AssignmentPolicy> Coordinator<P> {
         proof_id: String,
         extra_data: Option<String>,
     ) -> Result<(), Status> {
-        let state = self
+        let mut state = self
             .state
-            .read()
-            .instrument(tracing::debug_span!("acquire"))
+            .write()
+            .instrument(tracing::debug_span!("acquire_write"))
             .await;
         let sender = state.proofs_tx.clone();
-        let Some(proof) = state.proofs.get(&proof_id) else {
+        let Some(proof) = state.proofs.get_mut(&proof_id) else {
             tracing::error!("Proof {} not found", proof_id);
             return Err(Status::not_found(format!("Proof {proof_id} not found")));
         };
+        // A worker retries complete_proof until it gets a response; record the proof once.
+        let first_completion = !proof.completed;
+        proof.completed = true;
+        if let (true, Some(metrics)) = (first_completion, &self.metrics) {
+            metrics.record_proof_execution_shards(
+                "completed",
+                proof.shard_streams.max_execution_shards(),
+            );
+        }
         let metadata = P::get_proof_result_metadata(proof);
         drop(state);
         tracing::info!("Completed proof {}", proof_id);
@@ -1819,7 +1962,45 @@ impl<P: AssignmentPolicy> Coordinator<P> {
 
             tracing::info!("Failed proof {} ", proof_id);
 
-            if notify_sender {
+            // A completed proof's result is already decided; this only tears down its leftover
+            // tasks. Reporting a failure for it could overwrite the completion: if the
+            // Completed write was lost and is waiting to be re-issued, the status task replaces
+            // it with this Failed write.
+            let completed = proof.completed;
+            if !completed {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_proof_execution_shards(
+                        "failed",
+                        proof.shard_streams.max_execution_shards(),
+                    );
+                }
+            }
+            if completed {
+                tracing::info!(
+                    "proof {} completed before failing; not reporting the failure",
+                    proof_id
+                );
+            }
+
+            // The proof is owned here, so the cleanup takes it and collects the ids outside
+            // the lock: a large proof has hundreds of thousands of task artifacts.
+            match &self.artifact_cleaner {
+                Some(_) if completed => {
+                    tracing::info!(
+                        "proof {} completed before failing; keeping its artifacts",
+                        proof_id
+                    );
+                }
+                Some(cleaner) => cleanup::spawn_cleanup(
+                    cleaner.clone(),
+                    self.metrics.clone(),
+                    proof,
+                    cleanup::CLEANUP_DELAY,
+                ),
+                None => {}
+            }
+
+            if notify_sender && !completed {
                 if let Some(sender) = sender {
                     if let Err(e) = sender.send(ProofResult {
                         id: proof_id.clone(),
@@ -4893,3 +5074,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shard_cleanup_tests;

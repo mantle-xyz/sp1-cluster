@@ -307,3 +307,40 @@ fn test_hook_should_fail(task_type: TaskType) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sp1_cluster_common::failure::ProvingFailure;
+    use sp1_cluster_common::proto::TaskType;
+    use sp1_core_executor::ExecutionError;
+
+    /// What `try_unclaim_proof` stamps into `extra_data` for a failed task.
+    fn payload<E: std::fmt::Debug>(err: &E) -> ProvingFailure {
+        ProvingFailure {
+            task_type: TaskType::CoreExecute,
+            reason: format!("{err:?}"),
+        }
+    }
+
+    /// The coordinator recognises a cycle-limit stop from this payload's text, so pin both shapes
+    /// the prover raises it in to the real error types: a rename upstream must fail here.
+    #[test]
+    fn cycle_limit_failures_are_recognisable_from_the_payload() {
+        let per_chunk = ExecutionError::ExceededCycleLimit(1000);
+        assert!(payload(&per_chunk).exceeded_cycle_limit());
+
+        let after_run = anyhow::anyhow!("cycle limit exceeded: {} > {}", 1001, 1000);
+        assert!(payload(&after_run).exceeded_cycle_limit());
+    }
+
+    #[test]
+    fn other_execution_failures_are_not_cycle_limit() {
+        for err in [
+            ExecutionError::UnexpectedExitCode(1),
+            // A different limit: the unconstrained-mode budget, not the request's cycle limit.
+            ExecutionError::UnconstrainedCycleLimitExceeded(1000),
+        ] {
+            assert!(!payload(&err).exceeded_cycle_limit());
+        }
+    }
+}
