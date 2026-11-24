@@ -30,11 +30,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use sp1_cluster_artifact::{redis::RedisArtifactClient, ArtifactClient, ArtifactType};
 use sp1_cluster_common::proto::TaskType;
 
-use crate::{metrics::CoordinatorMetrics, AssignmentPolicy, Proof};
+use crate::{metrics::CoordinatorMetrics, store::ArtifactStore, AssignmentPolicy, Proof};
 
 /// How long to wait after a proof fails before deleting its artifacts, so the tasks it
 /// cancelled have stopped reading them.
@@ -50,20 +48,6 @@ const DELETE_PAUSE: Duration = Duration::from_millis(20);
 
 /// Prefix of the ids the artifact clients mint.
 const ARTIFACT_PREFIX: &str = "artifact_";
-
-/// Deletes artifacts by id.
-pub trait ArtifactCleaner: Send + Sync {
-    fn delete(&self, ids: Vec<String>) -> BoxFuture<'_, anyhow::Result<()>>;
-}
-
-impl ArtifactCleaner for RedisArtifactClient {
-    fn delete(&self, ids: Vec<String>) -> BoxFuture<'_, anyhow::Result<()>> {
-        Box::pin(async move {
-            self.delete_batch(&ids, ArtifactType::UnspecifiedArtifactType)
-                .await
-        })
-    }
-}
 
 fn is_root(task_type: TaskType) -> bool {
     matches!(task_type, TaskType::Controller | TaskType::ExecuteOnly)
@@ -104,7 +88,7 @@ pub fn failed_proof_artifacts<P: AssignmentPolicy>(proof: &Proof<P>) -> Vec<Stri
 /// after `delay`. Only the ids are kept through the delay; a large proof's task map is far
 /// bigger than its id list.
 pub fn spawn_cleanup<P: AssignmentPolicy>(
-    cleaner: Arc<dyn ArtifactCleaner>,
+    cleaner: Arc<dyn ArtifactStore>,
     metrics: Option<Arc<CoordinatorMetrics>>,
     proof: Proof<P>,
     delay: Duration,
@@ -158,6 +142,7 @@ pub fn spawn_cleanup<P: AssignmentPolicy>(
 mod tests {
     use super::*;
     use crate::{policy::default::DefaultPolicy, Task};
+    use futures::future::BoxFuture;
     use sp1_cluster_common::proto::{TaskData, TaskStatus};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -283,10 +268,13 @@ mod tests {
     }
 
     struct Recorder(Mutex<Vec<Vec<String>>>);
-    impl ArtifactCleaner for Recorder {
+    impl ArtifactStore for Recorder {
         fn delete(&self, ids: Vec<String>) -> BoxFuture<'_, anyhow::Result<()>> {
             self.0.lock().unwrap().push(ids);
             Box::pin(async { Ok(()) })
+        }
+        fn execution_cycles(&self, _: String) -> BoxFuture<'_, anyhow::Result<u64>> {
+            Box::pin(async { anyhow::bail!("not recorded") })
         }
     }
 

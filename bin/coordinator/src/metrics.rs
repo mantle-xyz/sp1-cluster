@@ -110,63 +110,75 @@ impl CoordinatorMetrics {
 
     /// Proofs failed because one execution submitted more shards than the per-proof limit.
     pub fn increment_proofs_over_shard_limit(&self) {
-        describe_counter!(
-            "coordinator_proofs_over_shard_limit_total",
-            "Proofs failed as unexecutable for exceeding COORDINATOR_MAX_SHARDS_PER_PROOF.",
-        );
         counter!("coordinator_proofs_over_shard_limit_total").increment(1);
     }
 
     /// Shard tasks that matched no CoreExecute of their proof, so the shard limit skipped them.
     /// Expected to stay 0; anything else means the task layout changed upstream.
     pub fn increment_unmatched_shards(&self) {
-        describe_counter!(
-            "coordinator_unmatched_shards_total",
-            "Shard tasks the per-proof shard limit could not attribute to an execution.",
-        );
         counter!("coordinator_unmatched_shards_total").increment(1);
     }
 
     /// A proof got a second CoreExecute task for the same run, from a submission retried
     /// after a coordinator stall. Expected rare; see shards.rs on its effect on the limit.
     pub fn increment_duplicate_executions(&self) {
-        describe_counter!(
-            "coordinator_duplicate_executions_total",
-            "CoreExecute tasks created twice for one controller run (retried submissions).",
-        );
         counter!("coordinator_duplicate_executions_total").increment(1);
     }
 
     /// Shards of the largest single execution of a proof, when it completes or fails. Use it
     /// to set COORDINATOR_MAX_SHARDS_PER_PROOF and see the headroom under it.
+    ///
+    /// Exported as a Prometheus histogram built from counters (`_bucket{le}`, `_sum`, `_count`),
+    /// queried with `histogram_quantile`. Not a `histogram!`: the spn-metrics recorder renders
+    /// those as summaries whose quantiles cover only the last minute or so, and proofs finish
+    /// minutes apart, so the quantiles read 0 almost always.
     pub fn record_proof_execution_shards(&self, outcome: &'static str, shards: u64) {
         if shards == 0 {
             return;
         }
-        describe_histogram!(
-            "coordinator_proof_execution_shards",
-            "Shards submitted by the largest single execution of a proof, by outcome.",
+        for le in execution_shard_buckets_at_or_above(shards) {
+            counter!(EXECUTION_SHARDS_BUCKET, "outcome" => outcome, "le" => le).increment(1);
+        }
+        counter!(EXECUTION_SHARDS_SUM, "outcome" => outcome).increment(shards);
+        counter!(EXECUTION_SHARDS_COUNT, "outcome" => outcome).increment(1);
+    }
+
+    /// Describe and export every counter at 0, so a counter's first increment is a step from 0
+    /// that `increase()`/`rate()` see (Prometheus does not count a series' first sample).
+    pub fn register(&self) {
+        for (name, help) in COUNTERS {
+            describe_counter!(*name, *help);
+            counter!(*name).increment(0);
+        }
+        describe_counter!(
+            EXECUTION_SHARDS_BUCKET,
+            "Proofs whose largest single execution submitted at most `le` shards, by outcome.",
         );
-        histogram!("coordinator_proof_execution_shards", "outcome" => outcome)
-            .record(shards as f64);
+        describe_counter!(
+            EXECUTION_SHARDS_SUM,
+            "Shards of the largest single execution, summed over proofs, by outcome.",
+        );
+        describe_counter!(
+            EXECUTION_SHARDS_COUNT,
+            "Proofs recorded in coordinator_proof_execution_shards, by outcome.",
+        );
+        for outcome in ["completed", "failed"] {
+            for (le, _) in EXECUTION_SHARD_BUCKETS {
+                counter!(EXECUTION_SHARDS_BUCKET, "outcome" => outcome, "le" => *le).increment(0);
+            }
+            counter!(EXECUTION_SHARDS_SUM, "outcome" => outcome).increment(0);
+            counter!(EXECUTION_SHARDS_COUNT, "outcome" => outcome).increment(0);
+        }
     }
 
     /// Artifact ids of failed proofs the coordinator sent for deletion. Counts ids in delete
     /// calls that succeeded, not keys Redis confirmed removing.
     pub fn increment_failed_proof_cleanup_ids(&self, count: u64) {
-        describe_counter!(
-            "coordinator_failed_proof_cleanup_ids_total",
-            "Artifact ids of failed proofs sent for deletion in delete calls that succeeded.",
-        );
         counter!("coordinator_failed_proof_cleanup_ids_total").increment(count);
     }
 
     /// Delete calls for a failed proof's artifacts that failed (those ids expire with the TTL).
     pub fn increment_failed_proof_cleanup_errors(&self) {
-        describe_counter!(
-            "coordinator_failed_proof_cleanup_errors_total",
-            "Failed deletions of a failed proof's artifacts; those artifacts expire with the TTL.",
-        );
         counter!("coordinator_failed_proof_cleanup_errors_total").increment(1);
     }
 
@@ -199,6 +211,64 @@ impl CoordinatorMetrics {
         gauge!("coordinator_subscribers").set(subscribers as f64);
     }
 }
+
+const EXECUTION_SHARDS_BUCKET: &str = "coordinator_proof_execution_shards_bucket";
+const EXECUTION_SHARDS_SUM: &str = "coordinator_proof_execution_shards_sum";
+const EXECUTION_SHARDS_COUNT: &str = "coordinator_proof_execution_shards_count";
+
+/// Upper bounds of `coordinator_proof_execution_shards_bucket`, as (`le` label, bound). Finer
+/// where a shard limit is likely to sit: ranges run around 3k shards, the planned limit is 52k.
+const EXECUTION_SHARD_BUCKETS: &[(&str, u64)] = &[
+    ("1000", 1_000),
+    ("2000", 2_000),
+    ("3000", 3_000),
+    ("4000", 4_000),
+    ("6000", 6_000),
+    ("8000", 8_000),
+    ("10000", 10_000),
+    ("15000", 15_000),
+    ("20000", 20_000),
+    ("30000", 30_000),
+    ("40000", 40_000),
+    ("52000", 52_000),
+    ("70000", 70_000),
+    ("100000", 100_000),
+    ("+Inf", u64::MAX),
+];
+
+/// The `le` labels a value of `shards` counts in: every bucket whose bound is at least it
+/// (Prometheus buckets are cumulative).
+fn execution_shard_buckets_at_or_above(shards: u64) -> impl Iterator<Item = &'static str> {
+    EXECUTION_SHARD_BUCKETS
+        .iter()
+        .filter(move |(_, bound)| shards <= *bound)
+        .map(|(le, _)| *le)
+}
+
+/// Counters exported at 0 from startup by [`CoordinatorMetrics::register`]. The alert rules on
+/// these use `increase()`, which needs a sample before the first increment.
+const COUNTERS: &[(&str, &str)] = &[
+    (
+        "coordinator_proofs_over_shard_limit_total",
+        "Proofs failed as unexecutable for exceeding COORDINATOR_MAX_SHARDS_PER_PROOF.",
+    ),
+    (
+        "coordinator_unmatched_shards_total",
+        "Shard tasks the per-proof shard limit could not attribute to an execution.",
+    ),
+    (
+        "coordinator_duplicate_executions_total",
+        "CoreExecute tasks created twice for one controller run (retried submissions).",
+    ),
+    (
+        "coordinator_failed_proof_cleanup_ids_total",
+        "Artifact ids of failed proofs sent for deletion in delete calls that succeeded.",
+    ),
+    (
+        "coordinator_failed_proof_cleanup_errors_total",
+        "Failed deletions of a failed proof's artifacts; those artifacts expire with the TTL.",
+    ),
+];
 
 pub async fn initialize_metrics(
     addr: SocketAddr,
@@ -247,6 +317,98 @@ pub async fn initialize_metrics(
 
     // Initialize metrics after server is ready
     let metrics = Arc::new(CoordinatorMetrics::new());
+    metrics.register();
 
     Ok((metrics, metrics_server_handle, shutdown_tx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    /// Render what `f` records through the exporter spn-metrics installs.
+    fn render(f: impl FnOnce(&CoordinatorMetrics)) -> String {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || f(&CoordinatorMetrics::new()));
+        handle.render()
+    }
+
+    fn line<'a>(rendered: &'a str, prefix: &str) -> &'a str {
+        rendered
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no line {prefix} in\n{rendered}"))
+    }
+
+    #[test]
+    fn buckets_are_cumulative() {
+        let le: Vec<_> = execution_shard_buckets_at_or_above(10_001).collect();
+        assert_eq!(le.first(), Some(&"15000"));
+        assert_eq!(le.last(), Some(&"+Inf"));
+        assert_eq!(
+            execution_shard_buckets_at_or_above(10_000).next(),
+            Some("10000"),
+            "a value on a bound counts in that bucket"
+        );
+        assert_eq!(execution_shard_buckets_at_or_above(u64::MAX).count(), 1);
+        assert!(EXECUTION_SHARD_BUCKETS.windows(2).all(|w| w[0].1 < w[1].1));
+    }
+
+    /// The shape `histogram_quantile` needs: `_bucket{le}` cumulative, `_sum`, `_count`, kept
+    /// as counters (no rolling window).
+    #[test]
+    fn execution_shards_render_as_a_prometheus_histogram() {
+        let out = render(|m| {
+            m.register();
+            m.record_proof_execution_shards("completed", 3_000);
+            m.record_proof_execution_shards("completed", 10_001);
+        });
+        let bucket = |le: &str| {
+            line(
+                &out,
+                &format!(
+                    "coordinator_proof_execution_shards_bucket{{outcome=\"completed\",le=\"{le}\"}}"
+                ),
+            )
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .to_string()
+        };
+        assert_eq!(bucket("2000"), "0".to_string(), "{out}");
+        assert_eq!(bucket("3000"), "1");
+        assert_eq!(bucket("10000"), "1");
+        assert_eq!(bucket("15000"), "2");
+        assert_eq!(bucket("+Inf"), "2");
+        // `register()` also exports the "failed" series, and the exporter's order is not fixed:
+        // match the full label set.
+        assert!(line(
+            &out,
+            "coordinator_proof_execution_shards_sum{outcome=\"completed\"}"
+        )
+        .ends_with(" 13001"));
+        assert!(line(
+            &out,
+            "coordinator_proof_execution_shards_count{outcome=\"completed\"}"
+        )
+        .ends_with(" 2"));
+        assert!(!out.contains("quantile="), "{out}");
+    }
+
+    /// Every alerted counter is exported at 0 before anything happens.
+    #[test]
+    fn registered_counters_start_at_zero() {
+        let out = render(|m| m.register());
+        for (name, _) in COUNTERS {
+            assert!(
+                out.lines().any(|l| l == format!("{name} 0")),
+                "{name} missing in\n{out}"
+            );
+        }
+        assert!(out.contains(
+            "coordinator_proof_execution_shards_bucket{outcome=\"failed\",le=\"+Inf\"} 0"
+        ));
+    }
 }

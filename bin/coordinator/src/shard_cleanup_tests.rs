@@ -390,17 +390,20 @@ async fn a_retried_execution_does_not_add_up_to_the_shard_limit() {
 // ---- failed-proof cleanup ----
 
 struct RecordingCleaner(std::sync::Mutex<Vec<String>>);
-impl cleanup::ArtifactCleaner for RecordingCleaner {
+impl store::ArtifactStore for RecordingCleaner {
     fn delete(&self, ids: Vec<String>) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
         self.0.lock().unwrap().extend(ids);
         Box::pin(async { Ok(()) })
+    }
+    fn execution_cycles(&self, _: String) -> futures::future::BoxFuture<'_, anyhow::Result<u64>> {
+        Box::pin(async { anyhow::bail!("not recorded") })
     }
 }
 
 fn with_cleaner() -> (Arc<Coordinator<DefaultPolicy>>, Arc<RecordingCleaner>) {
     let recorder = Arc::new(RecordingCleaner(std::sync::Mutex::new(vec![])));
     let mut c = Coordinator::<DefaultPolicy>::new();
-    c.set_artifact_cleaner(recorder.clone());
+    c.set_artifact_store(recorder.clone());
     (Arc::new(c), recorder)
 }
 
@@ -545,4 +548,148 @@ async fn without_a_cleaner_failing_a_proof_deletes_nothing() {
     start_proof(&c, "w1").await;
     c.fail_proof("p1".into(), None, false, None).await.unwrap();
     assert!(!c.state.read().await.proofs.contains_key("p1"));
+}
+
+// ---- proofs running side by side ----
+
+/// A second proof on the same program, with its own run (another range, or the aggregation
+/// proof that runs while a range proves). Returns its CoreExecute task id.
+async fn start_other_proof<P: AssignmentPolicy>(c: &Arc<Coordinator<P>>, worker: &str) -> String {
+    c.state.write().await.proofs.insert(
+        "p2".into(),
+        Proof::new("p2".into(), None, P::ProofState::default()),
+    );
+    let mut controller = controller_task("p2");
+    controller.inputs[1] = "artifact_stdin_p2".into();
+    controller.outputs = vec!["artifact_final_proof_p2".into()];
+    c.create_task_from(None, controller).await.unwrap();
+    let mut exec = core_execute_task("p2");
+    exec.inputs[1] = "artifact_stdin_p2".into();
+    exec.inputs[2] = "artifact_ci_p2".into();
+    exec.outputs = vec!["artifact_exec_out_p2".into()];
+    let exec_id = c.create_task_from(Some(worker), exec).await.unwrap();
+    let mut shard = prove_shard_task("p2", 0);
+    shard.inputs[1] = "artifact_ci_p2".into();
+    shard.inputs[2] = "artifact_record_p2_0".into();
+    shard.outputs = vec!["artifact_shard_proof_p2_0".into()];
+    c.create_task_from(Some(worker), shard).await.unwrap();
+    exec_id
+}
+
+/// Failing one proof deletes only its own run: nothing the other proof created, and not the
+/// program they share.
+#[tokio::test(start_paused = true)]
+async fn failing_a_proof_deletes_nothing_of_a_proof_running_alongside() {
+    let (c, recorder) = with_cleaner();
+    start_proof(&c, "w1").await;
+    submit_shards(&c, "w1", 0..1).await.unwrap();
+    start_other_proof(&c, "w1").await;
+
+    c.fail_proof("p1".into(), None, false, None).await.unwrap();
+
+    let deleted = deleted_after_delay(&recorder).await;
+    assert_eq!(deleted, run_artifacts(), "only p1's run artifacts");
+    let p2: Vec<String> = {
+        let state = c.state.read().await;
+        state.proofs["p2"]
+            .tasks
+            .values()
+            .flat_map(|t| t.data.inputs.iter().chain(t.data.outputs.iter()).cloned())
+            .collect()
+    };
+    for id in &p2 {
+        assert!(!deleted.contains(id), "deleted {id}, which p2 uses");
+    }
+}
+
+// ---- what a completed proof records ----
+
+/// An artifact store that knows the cycles of p1's execution output.
+struct CyclesStore(u64);
+impl store::ArtifactStore for CyclesStore {
+    fn delete(&self, _: Vec<String>) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn execution_cycles(&self, id: String) -> futures::future::BoxFuture<'_, anyhow::Result<u64>> {
+        let cycles = self.0;
+        Box::pin(async move {
+            anyhow::ensure!(id == "artifact_exec_out", "unexpected output {id}");
+            Ok(cycles)
+        })
+    }
+}
+
+async fn wait_for_cycles<P: AssignmentPolicy>(c: &Arc<Coordinator<P>>) -> Option<u64> {
+    for _ in 0..100 {
+        if let Some(cycles) = c.state.read().await.proofs["p1"].execution_cycles {
+            return Some(cycles);
+        }
+        tokio::task::yield_now().await;
+    }
+    None
+}
+
+/// The execution's cycles, read when its CoreExecute task completes, and its shards reach the
+/// status task with the completion.
+#[tokio::test]
+async fn a_completed_proof_reports_its_cycles_and_shards() {
+    let mut c = Coordinator::<DefaultPolicy>::new();
+    c.set_artifact_store(Arc::new(CyclesStore(4_200_000_000)));
+    let c = Arc::new(c);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    c.set_proofs_tx(tx).await;
+    let exec = start_proof(&c, "w1").await;
+    submit_shards(&c, "w1", 0..3).await.unwrap();
+
+    c.complete_task("w1".into(), "p1".into(), exec, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(wait_for_cycles(&c).await, Some(4_200_000_000));
+    c.complete_proof("p1".into(), None).await.unwrap();
+
+    let result = rx.try_recv().expect("the completion is reported");
+    assert!(result.success);
+    assert_eq!(result.execution_cycles, Some(4_200_000_000));
+    assert_eq!(
+        result.extra_data.as_deref(),
+        Some(r#"{"execution_shards":3}"#)
+    );
+}
+
+/// Without an artifact store there are no cycles, and the shards are still recorded.
+#[tokio::test]
+async fn without_a_store_a_completion_has_shards_but_no_cycles() {
+    let c = Arc::new(Coordinator::<DefaultPolicy>::new());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    c.set_proofs_tx(tx).await;
+    let exec = start_proof(&c, "w1").await;
+    submit_shards(&c, "w1", 0..2).await.unwrap();
+    c.complete_task("w1".into(), "p1".into(), exec, Default::default())
+        .await
+        .unwrap();
+    c.complete_proof("p1".into(), None).await.unwrap();
+
+    let result = rx.try_recv().unwrap();
+    assert_eq!(result.execution_cycles, None);
+    assert_eq!(
+        result.extra_data.as_deref(),
+        Some(r#"{"execution_shards":2}"#)
+    );
+}
+
+/// A completion that carries its own payload (execute-only) keeps it.
+#[tokio::test]
+async fn a_completion_payload_is_not_replaced() {
+    let c = Arc::new(Coordinator::<DefaultPolicy>::new());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    c.set_proofs_tx(tx).await;
+    start_proof(&c, "w1").await;
+    submit_shards(&c, "w1", 0..2).await.unwrap();
+    c.complete_proof("p1".into(), Some("{\"status\":2}".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        rx.try_recv().unwrap().extra_data.as_deref(),
+        Some("{\"status\":2}")
+    );
 }

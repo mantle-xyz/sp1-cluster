@@ -34,6 +34,7 @@ Tags are cut on this repo and built by `.github/workflows/release-ghcr.yml` into
 
 | Tag | Commit | Upstream baseline | Contents |
 |---|---|---|---|
+| `mantle-v2.9.0-fix.1-rc.4` | _to be tagged_ | `v2.9.0` | rc.3 + execution shards as a fixed-bucket histogram, counters exported at 0, cycles and shards recorded for completed proofs (§3.8d). Coordinator only. |
 | `mantle-v2.9.0-fix.1-rc.3` | `d5a3c34` | `v2.9.0` | rc.2 + per-execution shard limit and failed-proof cleanup (§3.8c). Branch `fix/proof-expiry-and-unexecutable`, PR #15. |
 | `mantle-v2.9.0-fix.1-rc.2` | `6b45f5d` | `v2.9.0` | rc.1 + gateway jemalloc and one less upload copy (§3.8b). |
 | `mantle-v2.9.0-fix.1-rc.1` | `73a82d6` | `v2.9.0` | Expired proofs → Failed, cycle-limit stop → Unexecutable (§3.8a). |
@@ -184,7 +185,7 @@ Move these into the sections above when PR #15 merges.
 | `bin/coordinator/src/lib.rs` | Hooks: `Proof.shard_streams` / `completed`, `create_task_from(worker_id, …)`, over-limit branch in task creation, `note_failed` in `fail_task` (before the holder checks), `note_cancelled` in heartbeat reconcile (only when delivered), cleanup in `fail_proof_internal`, `complete_proof` takes the write lock and records the histogram once. |
 | `bin/coordinator/src/server.rs` | Passes the submitting worker id; builds the Redis cleaner with `RedisArtifactClient::try_new` (cleanup off on error). |
 | `bin/coordinator/src/config.rs` | `COORDINATOR_MAX_SHARDS_PER_PROOF` (0 = off), `COORDINATOR_REDIS_NODES` (unset = no cleanup), `COORDINATOR_REDIS_POOL_MAX_SIZE` (default 4). |
-| `bin/coordinator/src/metrics.rs` | `coordinator_proofs_over_shard_limit_total`, `coordinator_unmatched_shards_total`, `coordinator_duplicate_executions_total`, `coordinator_proof_execution_shards{outcome}`, `coordinator_failed_proof_cleanup_{ids,errors}_total`. |
+| `bin/coordinator/src/metrics.rs` | `coordinator_proofs_over_shard_limit_total`, `coordinator_unmatched_shards_total`, `coordinator_duplicate_executions_total`, `coordinator_proof_execution_shards{outcome}` (a histogram from rc.4, §3.8d), `coordinator_failed_proof_cleanup_{ids,errors}_total`. |
 | `bin/coordinator/src/cluster.rs` | `execution_failure` maps `{"shard_limit":…}` to Failed / Unspecified. |
 | `crates/common/src/failure.rs` | `shard_limit_extra_data`, `is_shard_limit`. |
 | `crates/artifact/src/redis.rs` | `RedisArtifactClient::try_new` (fallible constructor; `new` unchanged). |
@@ -193,6 +194,36 @@ Move these into the sections above when PR #15 merges.
 `ProveShard` `inputs[1]` = `common_input`); `the_shard_layout_matches_sp1_prover` pins it to
 sp1-prover's own `ProveShardTaskRequest::into_raw`, and `coordinator_unmatched_shards_total`
 going non-zero in production means the layout moved.
+
+#### 3.8d Execution shards histogram, zero-exported counters, cycles and shards of completed proofs (rc.4)
+
+| File | Change |
+|---|---|
+| `bin/coordinator/src/metrics.rs` | `coordinator_proof_execution_shards` is exported as a Prometheus histogram built from counters: `_bucket{outcome,le}` (1k … 100k, `+Inf`), `_sum`, `_count`; query it with `histogram_quantile`. `register()` exports the alerted counters and every bucket at 0 at startup. |
+| `bin/coordinator/src/store.rs` | **Mantle-only.** `ArtifactStore` (was `cleanup::ArtifactCleaner`): `delete` plus `execution_cycles`, which reads the `ExecutionOutput` a `CoreExecute` task uploaded to its only output. |
+| `bin/coordinator/src/lib.rs` | `Proof.execution_cycles`; `complete_task` reads a finished `CoreExecute`'s cycles in the background (the controller deletes that output when the proof completes); `complete_proof` passes them on and, when the worker sent no `extra_data`, writes `{"execution_shards": N}`. Field and setter renamed to `artifact_store` / `set_artifact_store`. |
+| `bin/coordinator/src/cluster.rs` | A completed proof with known cycles is written with `ExecutionResult { Executed, cycles, gas: 0 }`, so `execution_cycles` is filled and the gateway returns `cycles` to the SDK. |
+| `crates/common/src/failure.rs` | `execution_shards_extra_data`. |
+| `bin/coordinator/Cargo.toml` | `sp1-core-machine` (for `ExecutionOutput`), dev `metrics-exporter-prometheus` (render test). |
+
+Why not a `histogram!`: spn-metrics installs `metrics-exporter-prometheus` with default settings,
+which renders histograms as summaries over a rolling window of about a minute. Proofs finish
+minutes apart, so the quantiles read 0. The bucket counters accumulate for the process lifetime.
+
+`execution_gas` is written as **0, meaning "not computed"** (the API writes status, cycles and gas
+together, so it cannot stay NULL once cycles are written): the proving path runs the plain
+executor, which does not estimate gas, and a second gas-estimating execution per proof is not
+worth its cost. Cycles need `COORDINATOR_REDIS_NODES`, as the cleanup does; the read is bounded by
+30s, and a completion without cycles logs `completed without its execution cycles`.
+
+The histogram's top quantile is a bucket bound, not the exact maximum: a proof failed by the shard
+limit (limit + 1 shards) lands in the next bucket up, e.g. 70000 for a 52000 limit.
+
+**On every SP1 bump** check that the worker image and this build agree on `ExecutionOutput`
+(`store::tests` only pins the type and read path, both ends use this build). The output id is read
+as the task's only output, as `CoreExecuteTaskRequest::from_raw` (`let [execution_output] =
+outputs`) has it; recheck that if the layout changes. A wrong id shows as a
+`could not read the execution cycles` warning per proof and empty `execution_cycles`.
 
 ## 4. Removed or upstreamed
 
