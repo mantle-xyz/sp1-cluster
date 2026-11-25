@@ -24,7 +24,10 @@
 //!   coordinator refused because the proof was already gone;
 //! - cleanups still waiting out the delay when the coordinator stops, and proofs failed while
 //!   it is shutting down (`fail_proof_internal` does nothing then);
-//! - proofs that failed under a previous coordinator process.
+//! - proofs that failed under a previous coordinator process;
+//! - ids in a delete call that failed, and those not tried after the cleanup gave up on a
+//!   stalled store;
+//! - `refs:<id>` keys (the delete removes `<id>` and `<id>:chunks`).
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -45,6 +48,11 @@ const DELETE_BATCH: usize = 200;
 
 /// Pause between delete calls.
 const DELETE_PAUSE: Duration = Duration::from_millis(20);
+
+/// Consecutive timed-out delete calls ([`crate::store::STORE_OP_TIMEOUT`]) after which a cleanup
+/// gives up: the store is stalled, and every further call would wait out the timeout and leave
+/// its UNLINKs running detached. A refused call fails fast and does not count.
+const MAX_CONSECUTIVE_TIMEOUTS: usize = 3;
 
 /// Prefix of the ids the artifact clients mint.
 const ARTIFACT_PREFIX: &str = "artifact_";
@@ -107,31 +115,52 @@ pub fn spawn_cleanup<P: AssignmentPolicy>(
             return;
         }
         tokio::time::sleep(delay).await;
-        let (mut requested, mut failed_batches) = (0usize, 0usize);
+        // A failed batch is skipped (its ids expire with the TTL) and the rest still go: a Redis
+        // that refuses connections (restarting, failing over) fails each call fast, and the
+        // batches after it recovers are deleted. Only a stalled Redis is given up on.
+        let (mut sent, mut failed, mut timeouts) = (0usize, 0usize, 0usize);
+        let mut last_error = None;
         for (n, batch) in ids.chunks(DELETE_BATCH).enumerate() {
             if n > 0 {
                 tokio::time::sleep(DELETE_PAUSE).await;
             }
             match cleaner.delete(batch.to_vec()).await {
-                Ok(()) => requested += batch.len(),
+                Ok(()) => {
+                    sent += batch.len();
+                    timeouts = 0;
+                }
                 Err(e) => {
-                    failed_batches += 1;
-                    tracing::warn!(
-                        "failed to delete {} artifacts of failed proof {proof_id}: {e:#}; \
-                         they expire with the TTL",
-                        batch.len()
-                    );
+                    failed += batch.len();
+                    timeouts = if crate::store::is_timeout(&e) {
+                        timeouts + 1
+                    } else {
+                        0
+                    };
+                    last_error = Some(e);
+                    if timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                        break;
+                    }
                 }
             }
         }
-        tracing::info!(
-            "cleanup of failed proof {proof_id}: {requested} of {} artifact ids sent for \
-             deletion, {failed_batches} batch(es) failed",
-            ids.len()
-        );
+        // `sent` counts ids in delete calls that succeeded, not keys Redis removed: UNLINK of an
+        // absent key also succeeds (e.g. COORDINATOR_REDIS_NODES ordered differently from the
+        // workers' NODE_REDIS_NODES, which routes each id to the wrong node).
+        match &last_error {
+            None => tracing::info!(
+                "cleanup of failed proof {proof_id}: {sent} artifact ids sent for deletion"
+            ),
+            // "failed to delete" is what the cleanup-errors alert tells operators to grep for.
+            Some(e) => tracing::warn!(
+                "failed to delete artifacts of failed proof {proof_id}: {e:#}; {sent} of {} ids \
+                 sent, {failed} failed, {} not tried; those expire with the TTL",
+                ids.len(),
+                ids.len() - sent - failed
+            ),
+        }
         if let Some(m) = &metrics {
-            m.increment_failed_proof_cleanup_ids(requested as u64);
-            for _ in 0..failed_batches {
+            m.increment_failed_proof_cleanup_ids(sent as u64);
+            if last_error.is_some() {
                 m.increment_failed_proof_cleanup_errors();
             }
         }
@@ -276,6 +305,100 @@ mod tests {
         fn execution_cycles(&self, _: String) -> BoxFuture<'_, anyhow::Result<u64>> {
             Box::pin(async { anyhow::bail!("not recorded") })
         }
+    }
+
+    /// Counts delete calls; `fail(n)` decides call n (1-based): `Some(true)` times out,
+    /// `Some(false)` is refused, `None` succeeds.
+    struct Flaky {
+        calls: Mutex<usize>,
+        fail: fn(usize) -> Option<bool>,
+    }
+    impl Flaky {
+        fn new(fail: fn(usize) -> Option<bool>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(0),
+                fail,
+            })
+        }
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+    impl ArtifactStore for Flaky {
+        fn delete(&self, _: Vec<String>) -> BoxFuture<'_, anyhow::Result<()>> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let outcome = (self.fail)(*calls);
+            Box::pin(async move {
+                match outcome {
+                    Some(true) => Err(anyhow::Error::new(crate::store::StoreTimeout)),
+                    Some(false) => anyhow::bail!("connection refused"),
+                    None => Ok(()),
+                }
+            })
+        }
+        fn execution_cycles(&self, _: String) -> BoxFuture<'_, anyhow::Result<u64>> {
+            Box::pin(async { anyhow::bail!("not recorded") })
+        }
+    }
+
+    /// 2506 ids in batches of 200.
+    const BATCHES: usize = 2506usize.div_ceil(DELETE_BATCH);
+
+    async fn run(store: Arc<Flaky>, metrics: Option<Arc<CoordinatorMetrics>>) {
+        spawn_cleanup(store, metrics, many_records(), CLEANUP_DELAY);
+        tokio::time::sleep(CLEANUP_DELAY + Duration::from_secs(5)).await;
+    }
+
+    /// A stalled store is given up on instead of costing a timeout per remaining batch.
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_gives_up_on_a_stalled_store() {
+        let store = Flaky::new(|_| Some(true));
+        run(store.clone(), None).await;
+        assert_eq!(store.calls(), MAX_CONSECUTIVE_TIMEOUTS);
+    }
+
+    /// A store refusing connections (restarting, failing over) fails fast; every batch is still
+    /// tried, so those after it recovers are deleted.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusing_store_is_tried_for_every_batch() {
+        let store = Flaky::new(|n| (n <= 5).then_some(false));
+        run(store.clone(), None).await;
+        assert_eq!(store.calls(), BATCHES);
+    }
+
+    /// Only consecutive timeouts give up: a success in between starts the count again.
+    #[tokio::test(start_paused = true)]
+    async fn timeouts_with_successes_between_do_not_give_up() {
+        let store = Flaky::new(|n| (n % 3 != 0).then_some(true));
+        run(store.clone(), None).await;
+        assert_eq!(store.calls(), BATCHES);
+    }
+
+    /// However many batches fail, a proof's cleanup counts one error.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_cleanup_counts_one_error() {
+        let recorder: &'static _ = Box::leak(Box::new(
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder(),
+        ));
+        let handle = recorder.handle();
+        let _guard = spn_metrics::metrics::set_default_local_recorder(recorder);
+        let store = Flaky::new(|_| Some(false));
+        run(store.clone(), Some(Arc::new(CoordinatorMetrics::new()))).await;
+        assert_eq!(store.calls(), BATCHES);
+        assert!(handle
+            .render()
+            .lines()
+            .any(|l| l == "coordinator_failed_proof_cleanup_errors_total 1"));
+    }
+
+    /// The production-shaped tasks plus one task naming 2500 records: 2506 ids.
+    fn many_records() -> Proof<DefaultPolicy> {
+        let mut tasks = production_shaped("artifact_stdin");
+        let records: Vec<String> = (0..2500).map(|n| format!("artifact_rec_{n:05}")).collect();
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        tasks.push(task("many", TaskType::ProveShard, &refs, &[]));
+        proof(tasks)
     }
 
     #[tokio::test(start_paused = true)]

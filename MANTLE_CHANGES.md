@@ -34,7 +34,8 @@ Tags are cut on this repo and built by `.github/workflows/release-ghcr.yml` into
 
 | Tag | Commit | Upstream baseline | Contents |
 |---|---|---|---|
-| `mantle-v2.9.0-fix.1-rc.4` | _to be tagged_ | `v2.9.0` | rc.3 + execution shards as a fixed-bucket histogram, counters exported at 0, cycles and shards recorded for completed proofs (§3.8d). Coordinator only. |
+| `mantle-v2.9.0-fix.1-rc.5` | _to be tagged_ | `v2.9.0` | rc.4 + review fixes (§3.8e): the status-update switch also stops the expired write, artifact-store calls bounded, cleanup gives up on a stalled Redis (3 consecutive timeouts) and reports once per proof, orphan shards after a restart no longer count as unmatched. Coordinator only. |
+| `mantle-v2.9.0-fix.1-rc.4` | `3c67f49` | `v2.9.0` | rc.3 + execution shards as a fixed-bucket histogram, counters exported at 0, cycles and shards recorded for completed proofs (§3.8d). Coordinator only. |
 | `mantle-v2.9.0-fix.1-rc.3` | `d5a3c34` | `v2.9.0` | rc.2 + per-execution shard limit and failed-proof cleanup (§3.8c). Branch `fix/proof-expiry-and-unexecutable`, PR #15. |
 | `mantle-v2.9.0-fix.1-rc.2` | `6b45f5d` | `v2.9.0` | rc.1 + gateway jemalloc and one less upload copy (§3.8b). |
 | `mantle-v2.9.0-fix.1-rc.1` | `73a82d6` | `v2.9.0` | Expired proofs → Failed, cycle-limit stop → Unexecutable (§3.8a). |
@@ -168,6 +169,27 @@ Move these into the sections above when PR #15 merges.
 **On every SP1 bump** run the worker tests: `exceeded_cycle_limit` matches the `Debug` text of
 `ExecutionError::ExceededCycleLimit` and the `"cycle limit exceeded:"` message.
 
+Known residuals, both on the record only (op-succinct judges the deadline itself, and past it
+has already given up):
+- Only proofs this coordinator is tracking are marked expired. A row whose deadline passed while
+  no coordinator was tracking it (coordinator down or restarting, a row the claimer skipped, a
+  row claimed by an older coordinator) stays Pending. To clear such rows:
+
+  ```sql
+  UPDATE proof_requests
+  SET proof_status = 3,
+      extra_data = json_build_object('expired', json_build_object('deadline', deadline))::text,
+      updated_at = now()
+  WHERE proof_status = 1 AND NOT handled AND deadline < extract(epoch FROM now())::bigint;
+  ```
+- A proof that completed just before its deadline, while its Completed write was still queued in
+  the status task (a slow API), can be recorded Failed: the claimer's expired write goes straight
+  to the API and the first write to land wins. Checking the coordinator's state first does not
+  help (the proof is removed from it as soon as its last task completes), and skipping the
+  expired write would drop the queued Completed too (the status task skips proofs the claimer
+  stopped tracking), leaving the row Pending. A real fix routes the expired write through the
+  status task's queue.
+
 #### 3.8b Gateway memory (`6b45f5d`)
 
 | File | Change |
@@ -191,9 +213,29 @@ Move these into the sections above when PR #15 merges.
 | `crates/artifact/src/redis.rs` | `RedisArtifactClient::try_new` (fallible constructor; `new` unchanged). |
 
 **On every SP1 bump** check the task input layout `shards.rs` reads (`CoreExecute` `inputs[2]`,
-`ProveShard` `inputs[1]` = `common_input`); `the_shard_layout_matches_sp1_prover` pins it to
-sp1-prover's own `ProveShardTaskRequest::into_raw`, and `coordinator_unmatched_shards_total`
-going non-zero in production means the layout moved.
+`ProveShard` `inputs[1]` = `common_input`). `the_shard_layout_matches_sp1_prover` pins only the
+`ProveShard` side to sp1-prover's own `ProveShardTaskRequest::into_raw`; the `CoreExecute` side
+is a hand-written fixture. In production `coordinator_unmatched_shards_total` going non-zero
+means the layout moved: it counts only shards submitted by the holder of one of the proof's
+`CoreExecute` tasks (an execution running across a coordinator restart is not counted, §3.8e).
+That classification assumes a shard is submitted by the worker holding its `CoreExecute` task
+(sp1-prover 6.10.0 submits `ProveShard` only from the executor, `controller/core.rs`); if an
+upgrade moves shard submission elsewhere, unmatched shards are all taken for orphans and the
+counter stays 0, so recheck it on every SP1 bump.
+
+**On every upstream merge** keep `server.rs`'s `create_task` passing the request's `worker_id` to
+`create_task_from`: without it every worker's shards add up as one execution
+(`the_handler_attributes_shards_to_the_submitting_worker`).
+
+A proof that cannot be split stays over the limit: op-succinct resubmits a one-block range (and
+an aggregation proof) unchanged, so it fails again each time. The limit must stay above the
+shards of any single block (~4100 measured); if it trips repeatedly on one block, raise
+`COORDINATOR_MAX_SHARDS_PER_PROOF` (or set 0) and restart the coordinator.
+
+`coordinator_failed_proof_cleanup_ids_total` counts ids in delete calls that succeeded, not keys
+removed: with `COORDINATOR_REDIS_NODES` in a different order from the workers' `NODE_REDIS_NODES`
+each id is routed to the wrong node and the delete succeeds without removing anything (the
+per-proof `could not read the execution cycles` warning is then the visible sign).
 
 #### 3.8d Execution shards histogram, zero-exported counters, cycles and shards of completed proofs (rc.4)
 
@@ -213,17 +255,32 @@ minutes apart, so the quantiles read 0. The bucket counters accumulate for the p
 `execution_gas` is written as **0, meaning "not computed"** (the API writes status, cycles and gas
 together, so it cannot stay NULL once cycles are written): the proving path runs the plain
 executor, which does not estimate gas, and a second gas-estimating execution per proof is not
-worth its cost. Cycles need `COORDINATOR_REDIS_NODES`, as the cleanup does; the read is bounded by
-30s, and a completion without cycles logs `completed without its execution cycles`.
+worth its cost. Cycles need `COORDINATOR_REDIS_NODES`, as the cleanup does; every store call is
+bounded by `store::STORE_OP_TIMEOUT` (30s), and a completion without cycles logs `completed
+without its execution cycles`.
 
 The histogram's top quantile is a bucket bound, not the exact maximum: a proof failed by the shard
-limit (limit + 1 shards) lands in the next bucket up, e.g. 70000 for a 52000 limit.
+limit (limit + 1 shards) lands in the next bucket up, e.g. 70000 for a 52000 limit. The bounds are
+fixed in `metrics.rs`; when `COORDINATOR_MAX_SHARDS_PER_PROOF` moves, keep a bound at the new limit.
 
 **On every SP1 bump** check that the worker image and this build agree on `ExecutionOutput`
 (`store::tests` only pins the type and read path, both ends use this build). The output id is read
 as the task's only output, as `CoreExecuteTaskRequest::from_raw` (`let [execution_output] =
 outputs`) has it; recheck that if the layout changes. A wrong id shows as a
 `could not read the execution cycles` warning per proof and empty `execution_cycles`.
+
+#### 3.8e Review fixes (rc.5)
+
+From a three-way review of PR #15. Each fix is at the root of its finding; nothing new runs.
+
+| File | Change |
+|---|---|
+| `bin/coordinator/src/cluster.rs` | `COORDINATOR_DISABLE_PROOF_STATUS_UPDATE` now also stops the claimer's expired write (it only stopped the status task). `status_update` builds the status task's write (was inline), so it is tested. The completed-before-deadline race is documented in §3.8a, not fixed. |
+| `bin/coordinator/src/store.rs` | Every artifact-store call returns within `STORE_OP_TIMEOUT` (30s; the Redis pool and connections have no timeouts); replaces the cycles read's own bound. The caller is bounded, not the store: a timed-out `delete_batch` leaves its spawned per-node UNLINKs (and their pooled connections) running, and the delete may still land. |
+| `bin/coordinator/src/cleanup.rs` | As before, a failed delete skips that batch and the cleanup goes on, so a Redis that refuses connections for a while (restart, failover) costs only the batches tried meanwhile. New: 3 consecutive timed-out calls (`store::StoreTimeout`) give up on the rest, since each further call against a stalled Redis would wait 30s and leave its UNLINKs running detached. One warning (still containing "failed to delete") and one `cleanup_errors` count per proof with any failed delete; was one of each per failed batch, ~1250 for a large proof against a dead Redis. |
+| `bin/coordinator/src/lib.rs`, `shards.rs` | An unmatched shard counts in `coordinator_unmatched_shards_total` (and warns, once per proof) only if its submitter holds one of the proof's `CoreExecute` tasks; otherwise it is an orphan from an execution this coordinator never assigned (logged at debug). Every deploy with a proof in flight used to fire the alert. A `CoreExecute` without `common_input` at the read position is still recorded, so that layout change is still counted. Residual: if the new run's `CoreExecute` is assigned to the worker still running the pre-restart execution, that execution's shards count until the next heartbeat cancels it. |
+| `bin/coordinator/src/server.rs` | `COORDINATOR_REDIS_POOL_MAX_SIZE` floored at 1 (0 waited forever). Handler-level test of the submitter attribution. |
+| `bin/coordinator/src/shard_cleanup_tests.rs` | Through an exporter: a completed proof is recorded once and never as over the limit; orphan vs layout unmatched shards. |
 
 ## 4. Removed or upstreamed
 
