@@ -9,6 +9,7 @@ use crate::util::{middleware, spawn_coordinator_periodic_task, spawn_heartbeat_t
 use dashmap::DashMap;
 use jemallocator::Jemalloc;
 use mti::prelude::{MagicTypeIdExt, V7};
+use sp1_cluster_artifact::redis::RedisArtifactClient;
 use sp1_cluster_common::client::ClusterServiceClient;
 use sp1_cluster_common::logger;
 use sp1_cluster_common::proto::{
@@ -195,8 +196,10 @@ impl<P: AssignmentPolicy + Send + Sync + 'static>
         let id = tokio::spawn({
             let coordinator = self.coordinator.clone();
             async move {
+                let request = request.into_inner();
+                let worker_id = (!request.worker_id.is_empty()).then_some(request.worker_id);
                 coordinator
-                    .create_task(request.into_inner().data.unwrap())
+                    .create_task_from(worker_id.as_deref(), request.data.unwrap())
                     .await
             }
         })
@@ -621,6 +624,40 @@ pub async fn start_coordinator_server_custom<
 
     let mut service = GenericWorkerService::<P>::default();
 
+    // Delete a failed proof's artifacts and record execution cycles, if the coordinator is told
+    // where the artifacts live.
+    if !config.redis_nodes.is_empty() {
+        let nodes: Vec<String> = config
+            .redis_nodes
+            .split(',')
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        // An optional feature: a bad URL disables it rather than keeping the coordinator down.
+        // A pool of 0 would wait forever for a connection; at least one.
+        match RedisArtifactClient::try_new(nodes.clone(), config.redis_pool_max_size.max(1)) {
+            Ok(client) => {
+                tracing::info!(
+                    "failed-proof artifact cleanup enabled ({} redis node(s)); \
+                     execution cycles are recorded",
+                    nodes.len()
+                );
+                Arc::get_mut(&mut service.coordinator)
+                    .expect("We just created service, so we should have a unique reference to it")
+                    .set_artifact_store(Arc::new(client));
+            }
+            Err(e) => tracing::error!(
+                "COORDINATOR_REDIS_NODES is invalid ({e:#}); failed-proof artifact cleanup \
+                 and execution cycles are off"
+            ),
+        }
+    } else {
+        tracing::info!(
+            "COORDINATOR_REDIS_NODES unset; failed proofs' artifacts expire with the TTL \
+             and no execution cycles are recorded"
+        );
+    }
+
     // Initialize metrics server and metrics
     let (metrics, mut metrics_server_handle, metrics_shutdown_tx) =
         initialize_metrics(metrics_addr)
@@ -648,6 +685,14 @@ pub async fn start_coordinator_server_custom<
         .coordinator
         .set_worker_heartbeat_timeout(config.worker_heartbeat_timeout_secs)
         .await;
+    service
+        .coordinator
+        .set_max_shards_per_proof(config.max_shards_per_proof)
+        .await;
+    tracing::info!(
+        "max_shards_per_proof={} (0 = no limit)",
+        config.max_shards_per_proof
+    );
 
     if !config.disable_proof_status_update {
         spawn_proof_status_task(
@@ -667,6 +712,7 @@ pub async fn start_coordinator_server_custom<
         service.coordinator.clone(),
         task_map.clone(),
         metrics.clone(),
+        !config.disable_proof_status_update,
         token.clone(),
     );
 
@@ -942,5 +988,80 @@ mod subscriber_reconnect_tests {
         let result = next_task_result(&mut stream).await;
         assert_eq!(result.task_id, TASK);
         assert_eq!(result.task_status, TaskStatus::Succeeded as i32);
+    }
+}
+
+#[cfg(test)]
+mod create_task_tests {
+    use super::*;
+    use policy::default::DefaultPolicy;
+    use sp1_cluster_common::proto::worker_service_server::WorkerService;
+    use sp1_cluster_common::proto::{CreateTaskRequest, TaskData, TaskType};
+
+    fn shard(n: usize) -> TaskData {
+        TaskData {
+            task_type: TaskType::ProveShard as i32,
+            proof_id: "p1".into(),
+            inputs: vec![
+                "program_ab".into(),
+                "artifact_ci".into(),
+                format!("artifact_record_{n}"),
+                "task_marker".into(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn submit(
+        service: &GenericWorkerService<DefaultPolicy>,
+        worker: &str,
+        n: usize,
+    ) -> Result<(), Status> {
+        service
+            .create_task(Request::new(CreateTaskRequest {
+                worker_id: worker.into(),
+                data: Some(shard(n)),
+            }))
+            .await
+            .map(|_| ())
+    }
+
+    /// The handler must pass the submitting worker on: the shard limit counts each worker's
+    /// execution apart, and without it every worker's shards would add up as one execution.
+    #[tokio::test]
+    async fn the_handler_attributes_shards_to_the_submitting_worker() {
+        let service = GenericWorkerService::<DefaultPolicy>::default();
+        let c = &service.coordinator;
+        c.set_max_shards_per_proof(1).await;
+        c.state
+            .write()
+            .await
+            .proofs
+            .insert("p1".into(), Proof::new("p1".into(), None, ()));
+        c.create_task_from(
+            None,
+            TaskData {
+                task_type: TaskType::CoreExecute as i32,
+                proof_id: "p1".into(),
+                inputs: vec![
+                    "program_ab".into(),
+                    "artifact_stdin".into(),
+                    "artifact_ci".into(),
+                    "{}".into(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        submit(&service, "w1", 0).await.expect("w1's first shard");
+        submit(&service, "w2", 1)
+            .await
+            .expect("w2's execution counts apart from w1's");
+        let err = submit(&service, "w1", 2)
+            .await
+            .expect_err("w1's second shard is over the limit of 1");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }

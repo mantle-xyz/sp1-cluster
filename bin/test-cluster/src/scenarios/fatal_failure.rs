@@ -8,7 +8,7 @@ use crate::cluster::Cluster;
 use crate::programs;
 use crate::request::request_with_cycle_limit;
 use crate::scenario::{Scenario, ScenarioFuture, Tier};
-use sp1_cluster_common::proto::ProofRequestStatus;
+use sp1_cluster_common::proto::{ExecutionFailureCause, ExecutionStatus, ProofRequestStatus};
 
 pub fn scenario() -> Scenario {
     Scenario {
@@ -54,6 +54,23 @@ async fn run() -> anyhow::Result<()> {
         "failed proof has empty failure metadata"
     );
     tracing::info!("proof failed fatally with metadata: {extra_data}");
+
+    // The gateway reports this row's execution status to the SDK; `Failed` becomes
+    // `Unexecutable`, which is what lets op-succinct split an oversized range at once.
+    let er = pr
+        .execution_result
+        .as_ref()
+        .context("cycle-limit failure recorded no execution_result")?;
+    anyhow::ensure!(
+        er.status() == ExecutionStatus::Failed,
+        "cycle-limit failure has execution status {:?}, want Failed",
+        er.status()
+    );
+    anyhow::ensure!(
+        er.failure_cause() == ExecutionFailureCause::ExceededCycleLimit,
+        "cycle-limit failure has cause {:?}, want ExceededCycleLimit",
+        er.failure_cause()
+    );
 
     cluster.shutdown().await;
     Ok(())

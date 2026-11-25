@@ -2,11 +2,12 @@ use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use crate::metrics::CoordinatorMetrics;
 use crate::{AssignmentPolicy, ClusterInfo, Coordinator, ProofResult};
-use dashmap::{DashMap, DashSet};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use futures::StreamExt;
 use hex;
 use sp1_cluster_common::{
     client::ClusterServiceClient,
+    failure::{expired_extra_data, is_shard_limit, ProvingFailure},
     proto::{
         self, CreateProofRequest, ProofRequestGetRequest, ProofRequestListRequest,
         ProofRequestStatus, ProofRequestUpdateRequest,
@@ -76,15 +77,10 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
                 next = completed_rx.recv() => next,
                 _ = token.cancelled() => break,
             };
-            let Some(ProofResult {
-                id,
-                success,
-                metadata,
-                extra_data,
-            }) = next
-            else {
+            let Some(result) = next else {
                 break;
             };
+            let id = result.id.clone();
             match task_map.get(&id).map(|s| matches!(*s, TaskState::Pending)) {
                 None => {
                     tracing::error!("proof {} not found", id);
@@ -98,23 +94,12 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
                 }
                 Some(true) => {}
             }
-            let status = if success {
-                ProofRequestStatus::Completed
-            } else {
-                ProofRequestStatus::Failed
-            };
-            tracing::info!("Setting proof status to {:?} for {}", status, id);
-            let metadata_string = serde_json::to_string(&metadata).unwrap_or_else(|e| {
-                tracing::error!("Failed to serialize metadata: {}", e);
-                "null".to_string()
-            });
-            let update = ProofRequestUpdateRequest {
-                proof_id: id.clone(),
-                proof_status: Some(status.into()),
-                metadata: Some(metadata_string),
-                extra_data,
-                ..Default::default()
-            };
+            let update = status_update(result);
+            tracing::info!(
+                "Setting proof status to {:?} for {}",
+                update.proof_status(),
+                id
+            );
             // Record the write before attempting it; the claimer re-issues it if it's lost.
             task_map.insert(id.clone(), TaskState::Terminal(update.clone()));
             match api_client.update_proof_request(update).await {
@@ -127,6 +112,39 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
             }
         }
     })
+}
+
+/// The terminal write for a proof's result.
+fn status_update<P: AssignmentPolicy>(result: ProofResult<P>) -> ProofRequestUpdateRequest {
+    let ProofResult {
+        id,
+        success,
+        metadata,
+        extra_data,
+        execution_cycles,
+    } = result;
+    let status = if success {
+        ProofRequestStatus::Completed
+    } else {
+        ProofRequestStatus::Failed
+    };
+    let metadata_string = serde_json::to_string(&metadata).unwrap_or_else(|e| {
+        tracing::error!("Failed to serialize metadata: {}", e);
+        "null".to_string()
+    });
+    let execution_result = if success {
+        execution_cycles.map(completed_execution)
+    } else {
+        extra_data.as_deref().and_then(execution_failure)
+    };
+    ProofRequestUpdateRequest {
+        proof_id: id,
+        proof_status: Some(status.into()),
+        execution_result,
+        metadata: Some(metadata_string),
+        extra_data,
+        ..Default::default()
+    }
 }
 
 /// How often the coordinator pushes its cluster component build manifest to the API.
@@ -168,10 +186,73 @@ pub fn spawn_manifest_push_task<P: AssignmentPolicy>(
     })
 }
 
+/// Pending and not handed to the fulfiller: the claimer's listing filter, minus the deadline.
+fn pending_unhandled(row: &proto::ProofRequest) -> bool {
+    row.proof_status == ProofRequestStatus::Pending as i32 && !row.handled
+}
+
 /// True when the row still matches the claimer's Pending listing filter.
 /// Then the row is alive and paging churn explains its absence from the list.
 fn still_pending(row: &proto::ProofRequest, now: u64) -> bool {
-    row.proof_status == ProofRequestStatus::Pending as i32 && !row.handled && row.deadline >= now
+    pending_unhandled(row) && row.deadline >= now
+}
+
+/// The execution result to record for a completed proof whose execution's cycles are known.
+/// Gas stays 0: the proving path runs the plain executor, which does not estimate gas. The API
+/// writes status, cycles and gas together, so this is the only shape a completed row gets.
+fn completed_execution(cycles: u64) -> proto::ExecutionResult {
+    proto::ExecutionResult {
+        status: proto::ExecutionStatus::Executed as i32,
+        failure_cause: proto::ExecutionFailureCause::Unspecified as i32,
+        cycles,
+        gas: 0,
+        public_values_hash: vec![],
+    }
+}
+
+/// The execution result to record for a failed proof, if its failure is an execution verdict.
+///
+/// Two failures are mapped: the request's cycle limit, and the cluster's per-proof shard limit.
+/// Both mean the range is too large to prove as one request. The gateway reports an execution
+/// status of `Failed` as `Unexecutable`, and op-succinct splits a range on its first
+/// `Unexecutable` instead of retrying the same oversized range until it fails three times.
+/// `cycles` stays 0: execution stops early and does not report how far it got. The shard limit
+/// has no cause code of its own, so it records `Unspecified` and `extra_data` says why.
+fn execution_failure(extra_data: &str) -> Option<proto::ExecutionResult> {
+    let failure_cause = if is_shard_limit(extra_data) {
+        proto::ExecutionFailureCause::Unspecified
+    } else if ProvingFailure::from_extra_data(extra_data)?.exceeded_cycle_limit() {
+        proto::ExecutionFailureCause::ExceededCycleLimit
+    } else {
+        return None;
+    };
+    Some(proto::ExecutionResult {
+        status: proto::ExecutionStatus::Failed as i32,
+        failure_cause: failure_cause as i32,
+        cycles: 0,
+        gas: 0,
+        public_values_hash: vec![],
+    })
+}
+
+/// The terminal write for a tracked proof whose row expired while still Pending.
+///
+/// The coordinator tears such a proof down without a status write, which left the row Pending
+/// forever. A row that left the filter any other way (completed, cancelled, handed to the
+/// fulfiller, deleted) already has an owner, so it gets no write.
+fn expired_update(
+    id: &str,
+    row: Option<&proto::ProofRequest>,
+    now: u64,
+) -> Option<ProofRequestUpdateRequest> {
+    let row = row?;
+    let expired = pending_unhandled(row) && row.deadline < now;
+    expired.then(|| ProofRequestUpdateRequest {
+        proof_id: id.to_string(),
+        proof_status: Some(ProofRequestStatus::Failed.into()),
+        extra_data: Some(expired_extra_data(row.deadline)),
+        ..Default::default()
+    })
 }
 
 /// How many missing-proof confirms run at once.
@@ -187,6 +268,7 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
     coordinator: &Arc<Coordinator<P>>,
     task_map: &DashMap<String, TaskState>,
     seen: &HashSet<String>,
+    write_status: bool,
 ) {
     let missing: Vec<String> = task_map
         .iter()
@@ -208,7 +290,7 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
                 .await
             {
                 Ok(Some(row)) if still_pending(&row, now) => {}
-                Ok(_) => {
+                Ok(row) => {
                     // The proof can complete during the row read and store a
                     // Terminal write that still has to land. Remove only a
                     // Pending entry.
@@ -220,6 +302,43 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
                         if let Err(e) = coordinator.fail_proof(id.clone(), None, false, None).await
                         {
                             tracing::error!("Failed to fail expired proof: {:?}", e);
+                        }
+                        let update = write_status
+                            .then(|| expired_update(&id, row.as_ref(), now))
+                            .flatten();
+                        if let Some(update) = update {
+                            // The status task may have recorded a completion since the remove
+                            // above; never overwrite it, so only claim a vacant slot. (A
+                            // completion recorded after ours races it to the DB and the first
+                            // to land wins; either outcome is fine past the deadline, when the
+                            // caller has already given up.) Recording the write before attempting
+                            // it lets the claimer's sweep re-issue a lost one, as for the status
+                            // task's writes.
+                            let recorded = match task_map.entry(id.clone()) {
+                                Entry::Vacant(slot) => {
+                                    slot.insert(TaskState::Terminal(update.clone()));
+                                    true
+                                }
+                                Entry::Occupied(_) => false,
+                            };
+                            if recorded {
+                                tracing::warn!(
+                                    "Proof {} passed its deadline; marking it Failed",
+                                    id
+                                );
+                                match api_client.update_proof_request(update).await {
+                                    Ok(()) => {
+                                        task_map.remove_if(&id, |_, v| {
+                                            matches!(v, TaskState::Terminal(_))
+                                        });
+                                    }
+                                    Err(e) => tracing::error!(
+                                        "Failed to mark expired proof {} Failed: {}",
+                                        id,
+                                        e
+                                    ),
+                                }
+                            }
                         }
                     }
                 }
@@ -233,11 +352,15 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
 }
 
 /// Spawn a task to claim proofs from the cluster API. Stops when `token` fires.
+///
+/// `write_status` false (COORDINATOR_DISABLE_PROOF_STATUS_UPDATE) also stops the claimer's own
+/// terminal write, the Failed write for a proof that expired while running.
 pub fn spawn_proof_claimer_task<P: AssignmentPolicy>(
     api_client: Arc<ClusterServiceClient>,
     coordinator: Arc<Coordinator<P>>,
     task_map: Arc<DashMap<String, TaskState>>,
     metrics: Arc<CoordinatorMetrics>,
+    write_status: bool,
     token: tokio_util::sync::CancellationToken,
 ) -> JoinHandle<()> {
     tokio::task::spawn({
@@ -334,7 +457,14 @@ pub fn spawn_proof_claimer_task<P: AssignmentPolicy>(
                                 }
                             }
                         }
-                        fail_missing_proofs(&api_client, &coordinator, &task_map, &seen_set).await;
+                        fail_missing_proofs(
+                            &api_client,
+                            &coordinator,
+                            &task_map,
+                            &seen_set,
+                            write_status,
+                        )
+                        .await;
 
                         // Sweep all unconfirmed terminal writes (not just this page), so a lost write
                         // beyond the 1000-row page still recovers.
@@ -372,6 +502,53 @@ pub fn spawn_proof_claimer_task<P: AssignmentPolicy>(
 mod tests {
     use super::*;
 
+    fn result(
+        success: bool,
+        extra_data: Option<String>,
+        execution_cycles: Option<u64>,
+    ) -> ProofResult<crate::policy::default::DefaultPolicy> {
+        ProofResult {
+            id: "p".into(),
+            success,
+            metadata: None,
+            extra_data,
+            execution_cycles,
+        }
+    }
+
+    /// What the status task writes: the shape the API, the gateway and the claimer's re-issue
+    /// all read.
+    #[test]
+    fn the_status_write_carries_the_proof_result() {
+        let done = status_update(result(
+            true,
+            Some("{\"execution_shards\":3}".into()),
+            Some(42),
+        ));
+        assert_eq!(done.proof_status(), ProofRequestStatus::Completed);
+        let execution = done.execution_result.expect("cycles are written");
+        assert_eq!(execution.status(), proto::ExecutionStatus::Executed);
+        assert_eq!(execution.cycles, 42);
+        assert_eq!(done.extra_data.as_deref(), Some("{\"execution_shards\":3}"));
+
+        let no_cycles = status_update(result(true, None, None));
+        assert!(
+            no_cycles.execution_result.is_none(),
+            "no partial execution result: the API reads cycles back with unwrap()"
+        );
+
+        let limited = status_update(result(
+            false,
+            Some(sp1_cluster_common::failure::shard_limit_extra_data(52_000)),
+            None,
+        ));
+        assert_eq!(limited.proof_status(), ProofRequestStatus::Failed);
+        assert_eq!(
+            limited.execution_result.unwrap().status(),
+            proto::ExecutionStatus::Failed
+        );
+    }
+
     fn pending_row(now: u64) -> proto::ProofRequest {
         proto::ProofRequest {
             proof_status: ProofRequestStatus::Pending as i32,
@@ -400,5 +577,89 @@ mod tests {
 
         let expired = pending_row(1000);
         assert!(!still_pending(&expired, expired.deadline + 1));
+    }
+
+    fn proving_failure(reason: &str) -> String {
+        ProvingFailure {
+            task_type: proto::TaskType::CoreExecute,
+            reason: reason.to_string(),
+        }
+        .to_extra_data()
+    }
+
+    /// A cycle-limit stop must reach the DB as an execution failure: that row is what the
+    /// gateway turns into `Unexecutable`, which is what makes op-succinct split the range.
+    #[test]
+    fn a_cycle_limit_stop_is_recorded_as_an_execution_failure() {
+        let result = execution_failure(&proving_failure("ExceededCycleLimit(1000)"))
+            .expect("cycle limit must produce an execution result");
+        assert_eq!(result.status, proto::ExecutionStatus::Failed as i32);
+        assert_eq!(
+            result.failure_cause,
+            proto::ExecutionFailureCause::ExceededCycleLimit as i32
+        );
+    }
+
+    /// The shard limit is the cluster saying the range is too large, like the cycle limit.
+    #[test]
+    fn a_shard_limit_stop_is_recorded_as_an_execution_failure() {
+        let result =
+            execution_failure(&sp1_cluster_common::failure::shard_limit_extra_data(52_000))
+                .expect("shard limit must produce an execution result");
+        assert_eq!(result.status, proto::ExecutionStatus::Failed as i32);
+        assert_eq!(
+            result.failure_cause,
+            proto::ExecutionFailureCause::Unspecified as i32
+        );
+    }
+
+    #[test]
+    fn other_failures_record_no_execution_result() {
+        assert!(
+            execution_failure(&proving_failure("Redis shard 0 admission wait > 120s")).is_none()
+        );
+        assert!(execution_failure(&expired_extra_data(1000)).is_none());
+        assert!(execution_failure("").is_none());
+    }
+
+    /// The gateway reports `execution_result.cycles` to the SDK and maps `Executed` to the SDK's
+    /// `Executed`; the API reads cycles back with `unwrap()` whenever a status is set.
+    #[test]
+    fn a_completed_execution_records_its_cycles() {
+        let result = completed_execution(4_200_000_000);
+        assert_eq!(result.status(), proto::ExecutionStatus::Executed);
+        assert_eq!(result.cycles, 4_200_000_000);
+        assert_eq!(result.gas, 0);
+        assert_eq!(
+            result.failure_cause(),
+            proto::ExecutionFailureCause::Unspecified
+        );
+    }
+
+    #[test]
+    fn an_expired_pending_row_is_marked_failed() {
+        let row = pending_row(1000);
+        let update = expired_update("p", Some(&row), row.deadline + 1)
+            .expect("an expired Pending row must get a terminal write");
+        assert_eq!(update.proof_id, "p");
+        assert_eq!(update.proof_status, Some(ProofRequestStatus::Failed as i32));
+        assert_eq!(update.extra_data, Some(expired_extra_data(row.deadline)));
+    }
+
+    /// Rows that left the filter for any other reason already have an owner.
+    #[test]
+    fn only_an_expired_pending_row_is_marked_failed() {
+        let live = pending_row(1000);
+        assert!(expired_update("p", Some(&live), 1000).is_none());
+
+        let mut cancelled = pending_row(1000);
+        cancelled.proof_status = ProofRequestStatus::Cancelled as i32;
+        assert!(expired_update("p", Some(&cancelled), cancelled.deadline + 1).is_none());
+
+        let mut handled = pending_row(1000);
+        handled.handled = true;
+        assert!(expired_update("p", Some(&handled), handled.deadline + 1).is_none());
+
+        assert!(expired_update("p", None, 1000).is_none());
     }
 }

@@ -459,6 +459,9 @@ impl ClusterBuilder {
             disable_proof_status_update: false,
             execute_only_mode: self.coordinator == CoordinatorKind::ExecuteOnly,
             worker_heartbeat_timeout_secs: self.worker_heartbeat_timeout_secs,
+            max_shards_per_proof: 0,
+            redis_nodes: String::new(),
+            redis_pool_max_size: 4,
             auth: test_auth(),
         };
         let coordinator_process = if self.process_isolated_coordinator {

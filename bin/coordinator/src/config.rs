@@ -21,9 +21,29 @@ pub struct Settings {
     /// requeue (`COORDINATOR_WORKER_HEARTBEAT_TIMEOUT_SECS`, default 30).
     #[serde(default = "default_worker_heartbeat_timeout_secs")]
     pub worker_heartbeat_timeout_secs: u64,
+    /// Most shards one execution of a proof may submit before the proof fails as unexecutable
+    /// (`COORDINATOR_MAX_SHARDS_PER_PROOF`, default 0 = no limit). Counted per execution: a
+    /// retried execution starts again from zero instead of adding to the earlier one. See
+    /// `shards.rs` for how to choose it.
+    #[serde(default)]
+    pub max_shards_per_proof: u64,
+    /// Comma-separated Redis URLs of the artifact store, in the same order the workers use
+    /// (`COORDINATOR_REDIS_NODES`). When set, a failed proof's artifacts are deleted instead of
+    /// waiting for their TTL, and a completed proof's execution cycles are recorded. Default
+    /// empty = off.
+    #[serde(default)]
+    pub redis_nodes: String,
+    /// Connection pool size per Redis node for those uses (`COORDINATOR_REDIS_POOL_MAX_SIZE`,
+    /// at least 1).
+    #[serde(default = "default_redis_pool_max_size")]
+    pub redis_pool_max_size: usize,
     /// Set in `Settings::new`, because the token falls back to unprefixed `CLUSTER_ACCESS_TOKEN`.
     #[serde(skip)]
     pub auth: AuthConfig,
+}
+
+fn default_redis_pool_max_size() -> usize {
+    4
 }
 
 fn default_worker_heartbeat_timeout_secs() -> u64 {

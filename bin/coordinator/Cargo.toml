@@ -5,7 +5,9 @@ version.workspace = true
 edition = "2021"
 
 [dependencies]
+sp1-cluster-artifact.workspace = true
 sp1-cluster-common.workspace = true
+sp1-core-machine.workspace = true
 sp1-prover.workspace = true
 sp1-sdk.workspace = true
 spn-metrics.workspace = true
@@ -37,4 +39,6 @@ tracing.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+# The exporter spn-metrics installs, to check what the coordinator's metrics render as.
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 tokio = { workspace = true, features = ["test-util"] }
