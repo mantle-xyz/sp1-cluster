@@ -416,9 +416,6 @@ impl<P: AssignmentPolicy> Proof<P> {
     }
 }
 
-/// Bound on reading an execution's cycles, so a stalled artifact store cannot pile up reads.
-const EXECUTION_CYCLES_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub struct ProofResult<P: AssignmentPolicy> {
     pub id: String,
     pub success: bool,
@@ -844,17 +841,33 @@ impl<P: AssignmentPolicy> Coordinator<P> {
         };
         let tracked = proof.shard_streams.track(&id, &task.data, submitter, limit);
         match tracked {
-            shards::Tracked::Unmatched { first } => {
-                if first {
-                    tracing::warn!(
-                        "shard task {} of proof {} matches no CoreExecute; the shard limit is \
-                         not applied to this proof's unmatched shards",
+            shards::Tracked::Unmatched => {
+                // From one of this proof's executions (its submitter holds a CoreExecute task
+                // of the proof): the task layout no longer lines up, and the limit is off.
+                // Otherwise an orphan from an execution this coordinator never assigned (one
+                // running across a coordinator restart), which the next heartbeat cancels.
+                let from_assigned_execution = proof.shard_streams.execution_tasks().any(|exec| {
+                    proof.tasks.get(exec).and_then(|t| t.worker.as_deref()) == submitter
+                });
+                if from_assigned_execution {
+                    if proof.shard_streams.note_layout_mismatch() {
+                        tracing::warn!(
+                            "shard task {} of proof {} matches no CoreExecute; the shard limit \
+                             is not applied to this proof's unmatched shards",
+                            id,
+                            task.data.proof_id
+                        );
+                    }
+                    if let Some(metrics) = &self.metrics {
+                        metrics.increment_unmatched_shards();
+                    }
+                } else {
+                    tracing::debug!(
+                        "shard task {} of proof {} comes from an execution this coordinator \
+                         did not assign",
                         id,
                         task.data.proof_id
                     );
-                }
-                if let Some(metrics) = &self.metrics {
-                    metrics.increment_unmatched_shards();
                 }
             }
             shards::Tracked::DuplicateExecution => {
@@ -1926,13 +1939,8 @@ impl<P: AssignmentPolicy> Coordinator<P> {
     ) {
         let this = self.clone();
         tokio::spawn(async move {
-            let read = tokio::time::timeout(
-                EXECUTION_CYCLES_READ_TIMEOUT,
-                store.execution_cycles(execution_output),
-            )
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
-            match read {
+            // Bounded by the store (`store::STORE_OP_TIMEOUT`).
+            match store.execution_cycles(execution_output).await {
                 Ok(cycles) => {
                     let mut state = this.state.write().await;
                     if let Some(proof) = state.proofs.get_mut(&proof_id) {

@@ -634,7 +634,8 @@ pub async fn start_coordinator_server_custom<
             .filter(|n| !n.is_empty())
             .collect();
         // An optional feature: a bad URL disables it rather than keeping the coordinator down.
-        match RedisArtifactClient::try_new(nodes.clone(), config.redis_pool_max_size) {
+        // A pool of 0 would wait forever for a connection; at least one.
+        match RedisArtifactClient::try_new(nodes.clone(), config.redis_pool_max_size.max(1)) {
             Ok(client) => {
                 tracing::info!(
                     "failed-proof artifact cleanup enabled ({} redis node(s)); \
@@ -711,6 +712,7 @@ pub async fn start_coordinator_server_custom<
         service.coordinator.clone(),
         task_map.clone(),
         metrics.clone(),
+        !config.disable_proof_status_update,
         token.clone(),
     );
 
@@ -986,5 +988,80 @@ mod subscriber_reconnect_tests {
         let result = next_task_result(&mut stream).await;
         assert_eq!(result.task_id, TASK);
         assert_eq!(result.task_status, TaskStatus::Succeeded as i32);
+    }
+}
+
+#[cfg(test)]
+mod create_task_tests {
+    use super::*;
+    use policy::default::DefaultPolicy;
+    use sp1_cluster_common::proto::worker_service_server::WorkerService;
+    use sp1_cluster_common::proto::{CreateTaskRequest, TaskData, TaskType};
+
+    fn shard(n: usize) -> TaskData {
+        TaskData {
+            task_type: TaskType::ProveShard as i32,
+            proof_id: "p1".into(),
+            inputs: vec![
+                "program_ab".into(),
+                "artifact_ci".into(),
+                format!("artifact_record_{n}"),
+                "task_marker".into(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn submit(
+        service: &GenericWorkerService<DefaultPolicy>,
+        worker: &str,
+        n: usize,
+    ) -> Result<(), Status> {
+        service
+            .create_task(Request::new(CreateTaskRequest {
+                worker_id: worker.into(),
+                data: Some(shard(n)),
+            }))
+            .await
+            .map(|_| ())
+    }
+
+    /// The handler must pass the submitting worker on: the shard limit counts each worker's
+    /// execution apart, and without it every worker's shards would add up as one execution.
+    #[tokio::test]
+    async fn the_handler_attributes_shards_to_the_submitting_worker() {
+        let service = GenericWorkerService::<DefaultPolicy>::default();
+        let c = &service.coordinator;
+        c.set_max_shards_per_proof(1).await;
+        c.state
+            .write()
+            .await
+            .proofs
+            .insert("p1".into(), Proof::new("p1".into(), None, ()));
+        c.create_task_from(
+            None,
+            TaskData {
+                task_type: TaskType::CoreExecute as i32,
+                proof_id: "p1".into(),
+                inputs: vec![
+                    "program_ab".into(),
+                    "artifact_stdin".into(),
+                    "artifact_ci".into(),
+                    "{}".into(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        submit(&service, "w1", 0).await.expect("w1's first shard");
+        submit(&service, "w2", 1)
+            .await
+            .expect("w2's execution counts apart from w1's");
+        let err = submit(&service, "w1", 2)
+            .await
+            .expect_err("w1's second shard is over the limit of 1");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }

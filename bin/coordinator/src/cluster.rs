@@ -77,16 +77,10 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
                 next = completed_rx.recv() => next,
                 _ = token.cancelled() => break,
             };
-            let Some(ProofResult {
-                id,
-                success,
-                metadata,
-                extra_data,
-                execution_cycles,
-            }) = next
-            else {
+            let Some(result) = next else {
                 break;
             };
+            let id = result.id.clone();
             match task_map.get(&id).map(|s| matches!(*s, TaskState::Pending)) {
                 None => {
                     tracing::error!("proof {} not found", id);
@@ -100,29 +94,12 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
                 }
                 Some(true) => {}
             }
-            let status = if success {
-                ProofRequestStatus::Completed
-            } else {
-                ProofRequestStatus::Failed
-            };
-            tracing::info!("Setting proof status to {:?} for {}", status, id);
-            let metadata_string = serde_json::to_string(&metadata).unwrap_or_else(|e| {
-                tracing::error!("Failed to serialize metadata: {}", e);
-                "null".to_string()
-            });
-            let execution_result = if success {
-                execution_cycles.map(completed_execution)
-            } else {
-                extra_data.as_deref().and_then(execution_failure)
-            };
-            let update = ProofRequestUpdateRequest {
-                proof_id: id.clone(),
-                proof_status: Some(status.into()),
-                execution_result,
-                metadata: Some(metadata_string),
-                extra_data,
-                ..Default::default()
-            };
+            let update = status_update(result);
+            tracing::info!(
+                "Setting proof status to {:?} for {}",
+                update.proof_status(),
+                id
+            );
             // Record the write before attempting it; the claimer re-issues it if it's lost.
             task_map.insert(id.clone(), TaskState::Terminal(update.clone()));
             match api_client.update_proof_request(update).await {
@@ -135,6 +112,39 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
             }
         }
     })
+}
+
+/// The terminal write for a proof's result.
+fn status_update<P: AssignmentPolicy>(result: ProofResult<P>) -> ProofRequestUpdateRequest {
+    let ProofResult {
+        id,
+        success,
+        metadata,
+        extra_data,
+        execution_cycles,
+    } = result;
+    let status = if success {
+        ProofRequestStatus::Completed
+    } else {
+        ProofRequestStatus::Failed
+    };
+    let metadata_string = serde_json::to_string(&metadata).unwrap_or_else(|e| {
+        tracing::error!("Failed to serialize metadata: {}", e);
+        "null".to_string()
+    });
+    let execution_result = if success {
+        execution_cycles.map(completed_execution)
+    } else {
+        extra_data.as_deref().and_then(execution_failure)
+    };
+    ProofRequestUpdateRequest {
+        proof_id: id,
+        proof_status: Some(status.into()),
+        execution_result,
+        metadata: Some(metadata_string),
+        extra_data,
+        ..Default::default()
+    }
 }
 
 /// How often the coordinator pushes its cluster component build manifest to the API.
@@ -258,6 +268,7 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
     coordinator: &Arc<Coordinator<P>>,
     task_map: &DashMap<String, TaskState>,
     seen: &HashSet<String>,
+    write_status: bool,
 ) {
     let missing: Vec<String> = task_map
         .iter()
@@ -292,7 +303,10 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
                         {
                             tracing::error!("Failed to fail expired proof: {:?}", e);
                         }
-                        if let Some(update) = expired_update(&id, row.as_ref(), now) {
+                        let update = write_status
+                            .then(|| expired_update(&id, row.as_ref(), now))
+                            .flatten();
+                        if let Some(update) = update {
                             // The status task may have recorded a completion since the remove
                             // above; never overwrite it, so only claim a vacant slot. (A
                             // completion recorded after ours races it to the DB and the first
@@ -338,11 +352,15 @@ async fn fail_missing_proofs<P: AssignmentPolicy>(
 }
 
 /// Spawn a task to claim proofs from the cluster API. Stops when `token` fires.
+///
+/// `write_status` false (COORDINATOR_DISABLE_PROOF_STATUS_UPDATE) also stops the claimer's own
+/// terminal write, the Failed write for a proof that expired while running.
 pub fn spawn_proof_claimer_task<P: AssignmentPolicy>(
     api_client: Arc<ClusterServiceClient>,
     coordinator: Arc<Coordinator<P>>,
     task_map: Arc<DashMap<String, TaskState>>,
     metrics: Arc<CoordinatorMetrics>,
+    write_status: bool,
     token: tokio_util::sync::CancellationToken,
 ) -> JoinHandle<()> {
     tokio::task::spawn({
@@ -439,7 +457,14 @@ pub fn spawn_proof_claimer_task<P: AssignmentPolicy>(
                                 }
                             }
                         }
-                        fail_missing_proofs(&api_client, &coordinator, &task_map, &seen_set).await;
+                        fail_missing_proofs(
+                            &api_client,
+                            &coordinator,
+                            &task_map,
+                            &seen_set,
+                            write_status,
+                        )
+                        .await;
 
                         // Sweep all unconfirmed terminal writes (not just this page), so a lost write
                         // beyond the 1000-row page still recovers.
@@ -476,6 +501,53 @@ pub fn spawn_proof_claimer_task<P: AssignmentPolicy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn result(
+        success: bool,
+        extra_data: Option<String>,
+        execution_cycles: Option<u64>,
+    ) -> ProofResult<crate::policy::default::DefaultPolicy> {
+        ProofResult {
+            id: "p".into(),
+            success,
+            metadata: None,
+            extra_data,
+            execution_cycles,
+        }
+    }
+
+    /// What the status task writes: the shape the API, the gateway and the claimer's re-issue
+    /// all read.
+    #[test]
+    fn the_status_write_carries_the_proof_result() {
+        let done = status_update(result(
+            true,
+            Some("{\"execution_shards\":3}".into()),
+            Some(42),
+        ));
+        assert_eq!(done.proof_status(), ProofRequestStatus::Completed);
+        let execution = done.execution_result.expect("cycles are written");
+        assert_eq!(execution.status(), proto::ExecutionStatus::Executed);
+        assert_eq!(execution.cycles, 42);
+        assert_eq!(done.extra_data.as_deref(), Some("{\"execution_shards\":3}"));
+
+        let no_cycles = status_update(result(true, None, None));
+        assert!(
+            no_cycles.execution_result.is_none(),
+            "no partial execution result: the API reads cycles back with unwrap()"
+        );
+
+        let limited = status_update(result(
+            false,
+            Some(sp1_cluster_common::failure::shard_limit_extra_data(52_000)),
+            None,
+        ));
+        assert_eq!(limited.proof_status(), ProofRequestStatus::Failed);
+        assert_eq!(
+            limited.execution_result.unwrap().status(),
+            proto::ExecutionStatus::Failed
+        );
+    }
 
     fn pending_row(now: u64) -> proto::ProofRequest {
         proto::ProofRequest {

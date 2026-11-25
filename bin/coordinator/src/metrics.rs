@@ -177,7 +177,7 @@ impl CoordinatorMetrics {
         counter!("coordinator_failed_proof_cleanup_ids_total").increment(count);
     }
 
-    /// Delete calls for a failed proof's artifacts that failed (those ids expire with the TTL).
+    /// A failed proof's cleanup had at least one failed delete (those ids expire with the TTL).
     pub fn increment_failed_proof_cleanup_errors(&self) {
         counter!("coordinator_failed_proof_cleanup_errors_total").increment(1);
     }
@@ -266,7 +266,7 @@ const COUNTERS: &[(&str, &str)] = &[
     ),
     (
         "coordinator_failed_proof_cleanup_errors_total",
-        "Failed deletions of a failed proof's artifacts; those artifacts expire with the TTL.",
+        "Failed-proof cleanups with at least one failed delete; those ids expire with the TTL.",
     ),
 ];
 

@@ -54,7 +54,11 @@
 //!   - a `CoreExecute` submission retried after a stall creates two `CoreExecute` tasks for one
 //!     `common_input`. They share the stream (counts are kept), and a failure or cancel of one
 //!     on a worker also splits the other's execution there. Counted in
-//!     `coordinator_duplicate_executions_total`.
+//!     `coordinator_duplicate_executions_total`;
+//!   - a `fail_task` report retried after a stall arrives twice; the second also moves the
+//!     worker's failure count, splitting the execution that started in between.
+//! - Not counted at all: shards from an execution this coordinator never assigned (one running
+//!   across a coordinator restart, until the worker's next heartbeat cancels it).
 //! - Worker ids are random per process only outside ECS; on ECS the id is the task id, and an
 //!   in-place container restart keeps it, merging the two executions (overcount).
 
@@ -97,8 +101,9 @@ pub struct ShardStreams {
     streams: HashMap<String, Stream>,
     /// `CoreExecute` task id to its stream's `common_input`.
     by_execute_task: HashMap<String, String>,
-    /// Shards that matched no stream.
-    unmatched: u64,
+    /// Shards that matched no stream though their submitter holds one of the proof's
+    /// `CoreExecute` tasks.
+    layout_mismatches: u64,
 }
 
 /// What [`ShardStreams::track`] decided about a new task.
@@ -106,10 +111,12 @@ pub struct ShardStreams {
 pub enum Tracked {
     /// Not a shard.
     Ignored,
-    /// A shard whose `common_input` matches no `CoreExecute` task of the proof. Never expected:
-    /// a non-zero count means the task layout changed and the limit is not being applied.
-    /// `first` is set for the proof's first such shard.
-    Unmatched { first: bool },
+    /// A shard whose `common_input` matches no `CoreExecute` task of the proof. Either the task
+    /// layout changed (the submitter holds one of the proof's `CoreExecute` tasks), or the shard
+    /// comes from an execution this coordinator never assigned, such as one still running from
+    /// before a coordinator restart until the worker's next heartbeat cancels it. The caller
+    /// tells them apart and calls [`ShardStreams::note_layout_mismatch`] for the former.
+    Unmatched,
     /// A second `CoreExecute` task for a `common_input` already tracked (its submission was
     /// retried). The stream and its counts are kept.
     DuplicateExecution,
@@ -131,7 +138,11 @@ impl ShardStreams {
     ) -> Tracked {
         match task.task_type() {
             TaskType::CoreExecute => {
+                // Recorded even without a `common_input` at the expected position (the layout
+                // moved): its holder's shards then match nothing and count as a layout change.
                 let Some(common_input) = task.inputs.get(CORE_EXECUTE_COMMON_INPUT) else {
+                    self.by_execute_task
+                        .insert(task_id.to_string(), String::new());
                     return Tracked::Ignored;
                 };
                 self.by_execute_task
@@ -148,10 +159,7 @@ impl ShardStreams {
                     .get(PROVE_SHARD_COMMON_INPUT)
                     .and_then(|common_input| self.streams.get_mut(common_input))
                 else {
-                    self.unmatched += 1;
-                    return Tracked::Unmatched {
-                        first: self.unmatched == 1,
-                    };
+                    return Tracked::Unmatched;
                 };
                 let worker = submitter.unwrap_or_default().to_string();
                 let failures = stream.failures.get(&worker).copied().unwrap_or_default();
@@ -189,6 +197,17 @@ impl ShardStreams {
         if let Some(stream) = self.stream_of(task_id) {
             *stream.failures.entry(worker.to_string()).or_default() += 1;
         }
+    }
+
+    /// Record an unmatched shard from one of the proof's own executions; true for the first.
+    pub fn note_layout_mismatch(&mut self) -> bool {
+        self.layout_mismatches += 1;
+        self.layout_mismatches == 1
+    }
+
+    /// The proof's `CoreExecute` task ids.
+    pub fn execution_tasks(&self) -> impl Iterator<Item = &str> {
+        self.by_execute_task.keys().map(String::as_str)
     }
 
     /// The stream of a `CoreExecute` task, if `task_id` is one.
@@ -341,9 +360,22 @@ mod tests {
     fn a_shard_of_no_known_execution_is_unmatched() {
         let mut s = streams_with("artifact_ci");
         let t = s.track("s", &shard("artifact_other"), Some("w1"), 1);
-        assert_eq!(t, Tracked::Unmatched { first: true });
-        let t = s.track("s2", &shard("artifact_other"), Some("w1"), 1);
-        assert_eq!(t, Tracked::Unmatched { first: false });
+        assert_eq!(t, Tracked::Unmatched);
+        assert!(s.note_layout_mismatch(), "the first layout mismatch");
+        assert!(!s.note_layout_mismatch());
+    }
+
+    /// A CoreExecute whose `common_input` is not where it is read from (the layout moved) is
+    /// still one of the proof's executions, so its holder's shards can be classified.
+    #[test]
+    fn a_core_execute_without_common_input_is_still_an_execution() {
+        let mut s = ShardStreams::default();
+        let mut exec = core_execute("artifact_ci");
+        exec.inputs.truncate(2);
+        s.track("exec", &exec, None, 0);
+        assert_eq!(s.execution_tasks().collect::<Vec<_>>(), vec!["exec"]);
+        let t = s.track("s", &shard("artifact_ci"), Some("w1"), 1);
+        assert_eq!(t, Tracked::Unmatched);
     }
 
     /// A retried CoreExecute submission creates a second task for the same run; the counts

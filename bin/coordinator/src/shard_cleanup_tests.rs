@@ -693,3 +693,96 @@ async fn a_completion_payload_is_not_replaced() {
         Some("{\"status\":2}")
     );
 }
+
+// ---- what the alerts and dashboard read ----
+
+/// A coordinator with metrics, recorded into an exporter local to this (current-thread) test.
+fn with_metrics() -> (
+    Arc<Coordinator<DefaultPolicy>>,
+    metrics_exporter_prometheus::PrometheusHandle,
+    spn_metrics::metrics::LocalRecorderGuard<'static>,
+) {
+    let recorder: &'static _ = Box::leak(Box::new(
+        metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder(),
+    ));
+    let handle = recorder.handle();
+    let guard = spn_metrics::metrics::set_default_local_recorder(recorder);
+    let m = Arc::new(metrics::CoordinatorMetrics::new());
+    m.register();
+    let mut c = Coordinator::<DefaultPolicy>::new();
+    c.set_metrics(m);
+    (Arc::new(c), handle, guard)
+}
+
+fn value(rendered: &str, series: &str) -> String {
+    rendered
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(series)?
+                .strip_prefix(' ')
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("no {series} in\n{rendered}"))
+}
+
+/// A completed proof is recorded once however often the worker retries `complete_proof`, and
+/// tearing it down later (a redelivered execution's leftover shards push it over the limit)
+/// neither fires the over-limit alert nor records a failure.
+#[tokio::test]
+async fn a_completed_proof_is_recorded_once_and_never_as_over_the_limit() {
+    let (c, handle, _guard) = with_metrics();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    c.set_proofs_tx(tx).await;
+    c.set_max_shards_per_proof(2).await;
+    start_proof(&c, "w1").await;
+    submit_shards(&c, "w1", 0..2).await.unwrap();
+
+    c.complete_proof("p1".into(), None).await.unwrap();
+    c.complete_proof("p1".into(), None).await.unwrap();
+    assert!(submit_shards(&c, "w1", 2..3).await.is_err());
+
+    let out = handle.render();
+    assert_eq!(
+        value(&out, "coordinator_proofs_over_shard_limit_total"),
+        "0"
+    );
+    assert_eq!(
+        value(
+            &out,
+            "coordinator_proof_execution_shards_count{outcome=\"completed\"}"
+        ),
+        "1"
+    );
+    assert_eq!(
+        value(
+            &out,
+            "coordinator_proof_execution_shards_count{outcome=\"failed\"}"
+        ),
+        "0"
+    );
+}
+
+/// After a coordinator restart an execution it never assigned keeps submitting until the next
+/// heartbeat cancels it; its shards match no run but are not a layout change, so they must not
+/// fire the alert. A shard from the proof's own execution that matches nothing is one.
+#[tokio::test]
+async fn only_unmatched_shards_from_an_assigned_execution_are_a_layout_change() {
+    let (c, handle, _guard) = with_metrics();
+    start_proof(&c, "w1").await;
+    let mut orphan = prove_shard_task("p1", 0);
+    orphan.inputs[1] = "artifact_ci_of_the_previous_run".into();
+
+    c.create_task_from(Some("w_old"), orphan.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        value(&handle.render(), "coordinator_unmatched_shards_total"),
+        "0"
+    );
+
+    c.create_task_from(Some("w1"), orphan).await.unwrap();
+    assert_eq!(
+        value(&handle.render(), "coordinator_unmatched_shards_total"),
+        "1"
+    );
+}

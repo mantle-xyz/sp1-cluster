@@ -1,14 +1,24 @@
 //! The coordinator's optional access to the artifact store, set from `COORDINATOR_REDIS_NODES`.
 //!
-//! Two uses, both best effort (a failure is logged and changes nothing else):
+//! Two uses, both best effort (a failure is logged and changes nothing else). Each call returns
+//! within [`STORE_OP_TIMEOUT`], so a stalled store cannot hold the caller (and what it captured)
+//! forever. The bound is on the caller only: `delete_batch` runs its per-node UNLINKs in spawned
+//! tasks, which a timeout does not abort, so they (and the pooled connections they hold) can
+//! outlive it; a delete that times out may still land.
 //! - deleting a failed proof's artifacts ([`crate::cleanup`]);
 //! - reading the cycles of a finished execution, recorded with the proof's completion
 //!   ([`crate::Coordinator::complete_task`]). The proving path computes them but no component
 //!   writes them: the worker drops the controller's `ExecutionOutput`.
 
+use std::{future::Future, time::Duration};
+
 use futures::future::BoxFuture;
 use sp1_cluster_artifact::{redis::RedisArtifactClient, ArtifactClient, ArtifactType};
 use sp1_core_machine::executor::ExecutionOutput;
+
+/// Bound on how long a caller waits for one artifact-store call. The Redis pool and connections
+/// have no timeouts of their own.
+pub const STORE_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The artifact store, as far as the coordinator uses it.
 pub trait ArtifactStore: Send + Sync {
@@ -22,15 +32,41 @@ pub trait ArtifactStore: Send + Sync {
 
 impl ArtifactStore for RedisArtifactClient {
     fn delete(&self, ids: Vec<String>) -> BoxFuture<'_, anyhow::Result<()>> {
-        Box::pin(async move {
+        Box::pin(bounded(async move {
             self.delete_batch(&ids, ArtifactType::UnspecifiedArtifactType)
                 .await
-        })
+        }))
     }
 
     fn execution_cycles(&self, execution_output: String) -> BoxFuture<'_, anyhow::Result<u64>> {
-        Box::pin(read_execution_cycles(self, execution_output))
+        Box::pin(bounded(read_execution_cycles(self, execution_output)))
     }
+}
+
+/// A call that hit [`STORE_OP_TIMEOUT`]: the store is stalled rather than refusing.
+#[derive(Debug)]
+pub struct StoreTimeout;
+
+impl std::fmt::Display for StoreTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "artifact store call timed out after {STORE_OP_TIMEOUT:?}"
+        )
+    }
+}
+
+impl std::error::Error for StoreTimeout {}
+
+/// Whether `error` is a [`StoreTimeout`].
+pub fn is_timeout(error: &anyhow::Error) -> bool {
+    error.is::<StoreTimeout>()
+}
+
+async fn bounded<T>(op: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    tokio::time::timeout(STORE_OP_TIMEOUT, op)
+        .await
+        .map_err(|_| anyhow::Error::new(StoreTimeout))?
 }
 
 /// Read an `ExecutionOutput` the way sp1-prover's controller does (`ArtifactClient::download`).
@@ -65,6 +101,13 @@ mod tests {
             read_execution_cycles(&client, id).await.unwrap(),
             123_456_789
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_call_times_out() {
+        let stalled = bounded(std::future::pending::<anyhow::Result<()>>());
+        let err = stalled.await.expect_err("a stalled call must not hang");
+        assert!(is_timeout(&err), "{err}");
     }
 
     #[tokio::test]
