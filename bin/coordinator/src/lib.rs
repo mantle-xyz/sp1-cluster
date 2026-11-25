@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod policy;
 pub mod server;
 pub mod shards;
+pub mod store;
 pub mod util;
 
 use dashmap::DashMap;
@@ -313,8 +314,10 @@ pub struct Coordinator<P: AssignmentPolicy> {
     /// Metrics for the coordinator
     pub metrics: Option<Arc<metrics::CoordinatorMetrics>>,
 
-    /// Deletes a failed proof's artifacts. `None` leaves them to the artifact store's TTL.
-    pub artifact_cleaner: Option<Arc<dyn cleanup::ArtifactCleaner>>,
+    /// The artifact store (`COORDINATOR_REDIS_NODES`): deletes a failed proof's artifacts and
+    /// reads an execution's cycles. `None` leaves artifacts to the store's TTL and records no
+    /// cycles.
+    pub artifact_store: Option<Arc<dyn store::ArtifactStore>>,
 }
 
 pub trait TimeSource: Send + Sync {
@@ -349,7 +352,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
             subscribers: DashMap::new(),
             task_channels: DashMap::new(),
             metrics: None,
-            artifact_cleaner: None,
+            artifact_store: None,
         }
     }
 
@@ -358,9 +361,9 @@ impl<P: AssignmentPolicy> Coordinator<P> {
         self.metrics = Some(metrics);
     }
 
-    /// Sets the cleaner that deletes a failed proof's artifacts.
-    pub fn set_artifact_cleaner(&mut self, cleaner: Arc<dyn cleanup::ArtifactCleaner>) {
-        self.artifact_cleaner = Some(cleaner);
+    /// Sets the artifact store (see [`Coordinator::artifact_store`]).
+    pub fn set_artifact_store(&mut self, store: Arc<dyn store::ArtifactStore>) {
+        self.artifact_store = Some(store);
     }
 }
 
@@ -391,6 +394,10 @@ pub struct Proof<P: AssignmentPolicy> {
     /// down by `fail_proof_internal` then; its result is already decided, so that teardown
     /// must not delete its artifacts.
     pub completed: bool,
+    /// Cycles of the proof's execution, read from the artifact store when its `CoreExecute`
+    /// task completes and reported with the proof's completion. `None` without an artifact
+    /// store, or if the read failed or has not finished.
+    pub execution_cycles: Option<u64>,
 }
 
 impl<P: AssignmentPolicy> Proof<P> {
@@ -404,15 +411,21 @@ impl<P: AssignmentPolicy> Proof<P> {
             extra,
             shard_streams: shards::ShardStreams::default(),
             completed: false,
+            execution_cycles: None,
         }
     }
 }
+
+/// Bound on reading an execution's cycles, so a stalled artifact store cannot pile up reads.
+const EXECUTION_CYCLES_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ProofResult<P: AssignmentPolicy> {
     pub id: String,
     pub success: bool,
     pub metadata: Option<P::ProofResultMetadata>,
     pub extra_data: Option<String>,
+    /// Cycles of the proof's execution, for a completed proof (see [`Proof::execution_cycles`]).
+    pub execution_cycles: Option<u64>,
 }
 
 /// The current state of the coordinator.
@@ -1005,6 +1018,12 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                 }
                 Some(std::mem::take(&mut task.subscribers))
             };
+            // A finished execution's cycles are in the output it uploaded before completing;
+            // the controller deletes that output when the proof completes, so read it now.
+            let execution_output = (!already_succeeded
+                && task.data.task_type() == TaskType::CoreExecute)
+                .then(|| task.data.outputs.first().cloned())
+                .flatten();
             // Update task status.
             task.status = TaskStatus::Succeeded;
 
@@ -1109,6 +1128,10 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                 self.assign_tasks(state).await?;
             } else {
                 drop(state);
+            }
+
+            if let (Some(output), Some(store)) = (execution_output, &self.artifact_store) {
+                self.spawn_record_execution_cycles(store.clone(), proof_id.clone(), output);
             }
 
             // Notify subscribers of this task status update.
@@ -1854,10 +1877,25 @@ impl<P: AssignmentPolicy> Coordinator<P> {
         // A worker retries complete_proof until it gets a response; record the proof once.
         let first_completion = !proof.completed;
         proof.completed = true;
+        let shards = proof.shard_streams.max_execution_shards();
         if let (true, Some(metrics)) = (first_completion, &self.metrics) {
-            metrics.record_proof_execution_shards(
-                "completed",
-                proof.shard_streams.max_execution_shards(),
+            metrics.record_proof_execution_shards("completed", shards);
+        }
+        // The controller completes a proof with no extra data; record the execution's shards
+        // there so they can be read per request. An execute-only proof has its own payload and
+        // no shards.
+        let extra_data = extra_data.or_else(|| {
+            (shards > 0).then(|| sp1_cluster_common::failure::execution_shards_extra_data(shards))
+        });
+        let execution_cycles = proof.execution_cycles;
+        if first_completion
+            && execution_cycles.is_none()
+            && shards > 0
+            && self.artifact_store.is_some()
+        {
+            tracing::warn!(
+                "proof {proof_id} completed without its execution cycles \
+                 (the read failed or has not finished)"
             );
         }
         let metadata = P::get_proof_result_metadata(proof);
@@ -1869,11 +1907,45 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                 success: true,
                 metadata: Some(metadata),
                 extra_data,
+                execution_cycles,
             }) {
                 tracing::error!("Failed to send completed proof: {}", e);
             }
         }
         Ok(())
+    }
+
+    /// In the background: read the cycles of a finished execution and keep them on its proof
+    /// for [`Coordinator::complete_proof`]. Off the lock while reading; a missing proof (failed
+    /// meanwhile) or a failed read records nothing.
+    fn spawn_record_execution_cycles(
+        self: &Arc<Self>,
+        store: Arc<dyn store::ArtifactStore>,
+        proof_id: String,
+        execution_output: String,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let read = tokio::time::timeout(
+                EXECUTION_CYCLES_READ_TIMEOUT,
+                store.execution_cycles(execution_output),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
+            match read {
+                Ok(cycles) => {
+                    let mut state = this.state.write().await;
+                    if let Some(proof) = state.proofs.get_mut(&proof_id) {
+                        // A retried CoreExecute submission runs the same range: same cycles.
+                        proof.execution_cycles.get_or_insert(cycles);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "could not read the execution cycles of proof {proof_id}: {e:#}; \
+                     its completion is recorded without them"
+                ),
+            }
+        });
     }
 
     /// Get all proof IDs.
@@ -1984,7 +2056,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
 
             // The proof is owned here, so the cleanup takes it and collects the ids outside
             // the lock: a large proof has hundreds of thousands of task artifacts.
-            match &self.artifact_cleaner {
+            match &self.artifact_store {
                 Some(_) if completed => {
                     tracing::info!(
                         "proof {} completed before failing; keeping its artifacts",
@@ -2007,6 +2079,7 @@ impl<P: AssignmentPolicy> Coordinator<P> {
                         success: false,
                         metadata: None,
                         extra_data,
+                        execution_cycles: None,
                     }) {
                         tracing::error!("Failed to send failed proof: {}", e);
                     }

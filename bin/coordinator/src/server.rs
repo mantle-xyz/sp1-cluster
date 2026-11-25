@@ -624,7 +624,8 @@ pub async fn start_coordinator_server_custom<
 
     let mut service = GenericWorkerService::<P>::default();
 
-    // Delete a failed proof's artifacts, if the coordinator is told where they live.
+    // Delete a failed proof's artifacts and record execution cycles, if the coordinator is told
+    // where the artifacts live.
     if !config.redis_nodes.is_empty() {
         let nodes: Vec<String> = config
             .redis_nodes
@@ -636,20 +637,23 @@ pub async fn start_coordinator_server_custom<
         match RedisArtifactClient::try_new(nodes.clone(), config.redis_pool_max_size) {
             Ok(client) => {
                 tracing::info!(
-                    "failed-proof artifact cleanup enabled ({} redis node(s))",
+                    "failed-proof artifact cleanup enabled ({} redis node(s)); \
+                     execution cycles are recorded",
                     nodes.len()
                 );
                 Arc::get_mut(&mut service.coordinator)
                     .expect("We just created service, so we should have a unique reference to it")
-                    .set_artifact_cleaner(Arc::new(client));
+                    .set_artifact_store(Arc::new(client));
             }
             Err(e) => tracing::error!(
-                "COORDINATOR_REDIS_NODES is invalid ({e:#}); failed-proof artifact cleanup is off"
+                "COORDINATOR_REDIS_NODES is invalid ({e:#}); failed-proof artifact cleanup \
+                 and execution cycles are off"
             ),
         }
     } else {
         tracing::info!(
-            "COORDINATOR_REDIS_NODES unset; failed proofs' artifacts expire with the TTL"
+            "COORDINATOR_REDIS_NODES unset; failed proofs' artifacts expire with the TTL \
+             and no execution cycles are recorded"
         );
     }
 

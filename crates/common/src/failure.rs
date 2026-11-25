@@ -65,6 +65,13 @@ pub fn is_shard_limit(extra_data: &str) -> bool {
     serde_json::from_str::<Envelope>(extra_data).is_ok_and(|e| e.shard_limit.limit > 0)
 }
 
+/// `extra_data` the coordinator writes when a proof completes: how many shards its execution
+/// submitted, so they can be read per request. On the wire as `{"execution_shards": <n>}`, a key
+/// none of the failure payloads use.
+pub fn execution_shards_extra_data(shards: u64) -> String {
+    serde_json::json!({ "execution_shards": shards }).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +101,16 @@ mod tests {
         let s = expired_extra_data(1_700_000_000);
         assert_eq!(s, r#"{"expired":{"deadline":1700000000}}"#);
         assert!(ProvingFailure::from_extra_data(&s).is_none());
+    }
+
+    /// Read back by SQL as `extra_data::json->>'execution_shards'`, and must not be taken for a
+    /// failure by anything that parses failure payloads.
+    #[test]
+    fn execution_shards_payload_is_not_a_failure() {
+        let s = execution_shards_extra_data(3125);
+        assert_eq!(s, r#"{"execution_shards":3125}"#);
+        assert!(ProvingFailure::from_extra_data(&s).is_none());
+        assert!(!is_shard_limit(&s));
     }
 
     #[test]

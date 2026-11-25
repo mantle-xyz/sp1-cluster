@@ -82,6 +82,7 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
                 success,
                 metadata,
                 extra_data,
+                execution_cycles,
             }) = next
             else {
                 break;
@@ -110,7 +111,7 @@ pub fn spawn_proof_status_task<P: AssignmentPolicy>(
                 "null".to_string()
             });
             let execution_result = if success {
-                None
+                execution_cycles.map(completed_execution)
             } else {
                 extra_data.as_deref().and_then(execution_failure)
             };
@@ -184,6 +185,19 @@ fn pending_unhandled(row: &proto::ProofRequest) -> bool {
 /// Then the row is alive and paging churn explains its absence from the list.
 fn still_pending(row: &proto::ProofRequest, now: u64) -> bool {
     pending_unhandled(row) && row.deadline >= now
+}
+
+/// The execution result to record for a completed proof whose execution's cycles are known.
+/// Gas stays 0: the proving path runs the plain executor, which does not estimate gas. The API
+/// writes status, cycles and gas together, so this is the only shape a completed row gets.
+fn completed_execution(cycles: u64) -> proto::ExecutionResult {
+    proto::ExecutionResult {
+        status: proto::ExecutionStatus::Executed as i32,
+        failure_cause: proto::ExecutionFailureCause::Unspecified as i32,
+        cycles,
+        gas: 0,
+        public_values_hash: vec![],
+    }
 }
 
 /// The execution result to record for a failed proof, if its failure is an execution verdict.
@@ -534,6 +548,20 @@ mod tests {
         );
         assert!(execution_failure(&expired_extra_data(1000)).is_none());
         assert!(execution_failure("").is_none());
+    }
+
+    /// The gateway reports `execution_result.cycles` to the SDK and maps `Executed` to the SDK's
+    /// `Executed`; the API reads cycles back with `unwrap()` whenever a status is set.
+    #[test]
+    fn a_completed_execution_records_its_cycles() {
+        let result = completed_execution(4_200_000_000);
+        assert_eq!(result.status(), proto::ExecutionStatus::Executed);
+        assert_eq!(result.cycles, 4_200_000_000);
+        assert_eq!(result.gas, 0);
+        assert_eq!(
+            result.failure_cause(),
+            proto::ExecutionFailureCause::Unspecified
+        );
     }
 
     #[test]
