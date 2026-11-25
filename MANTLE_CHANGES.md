@@ -12,6 +12,7 @@ Mantle-only line exists.
 |---|---|
 | Upstream tracking point | `succinctlabs/sp1-cluster` tag `v2.9.0` @ `3249344` (merged in PR #13, `98bd0ae`) |
 | Upstream ahead, not synced | git tag `v2.9.1` @ `8c284e6` (2026-11-10, no GitHub Release yet): `d310bdf` page cancel queries and skip repeat cancels (#213), plus docs. |
+| Latest Mantle release | `mantle-v2.9.1` @ `cb9af35` (on upstream `v2.9.0`, see §1.1) |
 | Mantle branch | `mantle_develop` (`origin` = `mantle-xyz/sp1-cluster`). Feature branches are cut from it and merged back by PR. `main` mirrors upstream (currently at `v2.9.0`) and carries no Mantle code. |
 | SP1 | `6.10.0` (comes with upstream `v2.9.0`; circuits `v6.1.0`) |
 | Workers | Run the **official** images `ghcr.io/succinctlabs/sp1-cluster:{node-gpu,base}-v2.9.0`. No Mantle code runs in a worker, so worker-side changes here (e.g. tests in `crates/worker`) never need a worker image. |
@@ -22,8 +23,13 @@ Tags are cut on this repo and built by `.github/workflows/release-ghcr.yml` into
 `ghcr.io/mantle-xyz/sp1-cluster:<component>-<tag>` for the three components this fork changes:
 `gateway`, `coordinator`, `api`.
 
-- Tag scheme: `mantle-v<upstream>` for a release on an upstream baseline,
-  `mantle-v<upstream>-fix.<n>` for Mantle fixes on the same baseline, `-rc.<n>` for pre-releases.
+- Tag scheme: `mantle-vX.Y.Z` is **Mantle's own version line**, `-rc.<n>` for pre-releases.
+  The number does not name the upstream baseline: `mantle-v2.9.1` is built on upstream `v2.9.0`
+  and does not contain upstream's own `v2.9.1`. The baseline of every tag is in the version map
+  below and in the tag annotation.
+- Before `mantle-v2.9.1` the number followed the upstream baseline (`mantle-v2.9.0`), and Mantle
+  fixes on it were pre-released as `mantle-v2.9.0-fix.1-rc.<n>`; those rcs became
+  `mantle-v2.9.1`.
 - `<component>-latest` moves only on tags without `-rc` / `-alpha` / `-beta`.
 - **Deploy api and gateway from the same tag** (the gateway needs the api's
   `QueryProofRequests`, §3.3). The coordinator may run a different tag.
@@ -34,12 +40,13 @@ Tags are cut on this repo and built by `.github/workflows/release-ghcr.yml` into
 
 | Tag | Commit | Upstream baseline | Contents |
 |---|---|---|---|
-| `mantle-v2.9.0-fix.1-rc.5` | _to be tagged_ | `v2.9.0` | rc.4 + review fixes (§3.8e): the status-update switch also stops the expired write, artifact-store calls bounded, cleanup gives up on a stalled Redis (3 consecutive timeouts) and reports once per proof, orphan shards after a restart no longer count as unmatched. Coordinator only. |
+| `mantle-v2.9.1` | `cb9af35` | `v2.9.0` | Release of `mantle-v2.9.0-fix.1-rc.5` (same code), PR #15 merged into `mantle_develop`: everything in §3.8. Images: coordinator `sha256:cda4201b727c…`, gateway `sha256:ddad9ed52f78…`, api `sha256:fe3f9f4f4803…`. |
+| `mantle-v2.9.0-fix.1-rc.5` | `beead44` | `v2.9.0` | rc.4 + review fixes (§3.8e): the status-update switch also stops the expired write, artifact-store calls bounded, cleanup gives up on a stalled Redis (3 consecutive timeouts) and reports once per proof, orphan shards after a restart no longer count as unmatched. Coordinator only. |
 | `mantle-v2.9.0-fix.1-rc.4` | `3c67f49` | `v2.9.0` | rc.3 + execution shards as a fixed-bucket histogram, counters exported at 0, cycles and shards recorded for completed proofs (§3.8d). Coordinator only. |
 | `mantle-v2.9.0-fix.1-rc.3` | `d5a3c34` | `v2.9.0` | rc.2 + per-execution shard limit and failed-proof cleanup (§3.8c). Branch `fix/proof-expiry-and-unexecutable`, PR #15. |
 | `mantle-v2.9.0-fix.1-rc.2` | `6b45f5d` | `v2.9.0` | rc.1 + gateway jemalloc and one less upload copy (§3.8b). |
 | `mantle-v2.9.0-fix.1-rc.1` | `73a82d6` | `v2.9.0` | Expired proofs → Failed, cycle-limit stop → Unexecutable (§3.8a). |
-| `mantle-v2.9.0` (= `-rc.1`) | `6fff81a` | `v2.9.0` | First release on the `mantle-` tag line. Everything in §3.1–§3.7. |
+| `mantle-v2.9.0` (= `-rc.1`) | `6fff81a` | `v2.9.0` | First release on the `mantle-` tag line. Everything in §3.1–§3.7. Its number still followed the upstream baseline. |
 | `v2.8.4-admission-gate-2-rc.1` | `ccadc077` | `v2.8.4` | Old naming scheme (`v<upstream>-admission-gate-<n>`). |
 | `v2.7.2-admission-gate-1` | `965df34d` | `v2.7.2` | Old naming scheme. |
 | `v2.2.0-admission-gate[-2..5]` | `aceea29`… | `v2.2.0` | Old naming scheme; admission gate development. |
@@ -153,9 +160,11 @@ signal, not a gate.
 `bin/test-cluster/src/cluster.rs`: new gateway / coordinator config fields filled with defaults.
 Every new config field in §3 must be added here or the test cluster stops compiling.
 
-### 3.8 Pending: on `fix/proof-expiry-and-unexecutable` (PR #15), not yet in `mantle_develop`
+### 3.8 Coordinator limits, failed-proof cleanup and metrics; gateway memory (`mantle-v2.9.1`)
 
-Move these into the sections above when PR #15 merges.
+From the 2026-11 stress tests (Redis full stall, oversized ranges). PR #15 into `mantle_develop`
+(`cb9af35`), with #16, #18 and #19 merged into it; pre-released as
+`mantle-v2.9.0-fix.1-rc.1`…`rc.5`. Subsections follow the order the changes landed.
 
 #### 3.8a Expired proofs → Failed; cycle-limit stop → Unexecutable (`73a82d6`)
 
